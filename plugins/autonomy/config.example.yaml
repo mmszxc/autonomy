@@ -1,0 +1,28 @@
+# autonomy 配置示例：把 autonomy 段并入 Hermes 的配置/档案即可生效。
+# 这里只放行为与额度参数，绝不放任何密钥（密钥仍由 Hermes 的 provider 配置管理）。
+autonomy:
+  # 自主思考使用的模型；null 表示继承 Hermes 主模型（只有一个模型时对话优先）
+  model: null
+  # 外置记忆插件名；null 表示使用 Hermes 当前的 memory.provider
+  memory_provider: null
+  # 是否在插件进程内跑常驻循环；false 表示由外部 timer/service 单次拉起
+  in_process_loop: false
+  # 运行数据目录：STOP_AUTONOMY / LAST_USER_ACTIVITY / PREEMPT_NOW 等标记都放这里
+  data_dir: /var/lib/hermes/autonomy_data
+  # 可在 data_dir/extra_rules.txt 每行写一条部署现场的附加约束；文件不存在时不追加约束。
+  # 示例：不要修改 /srv/protected-service 下的文件
+  # 只读思考日志（文本块且写后 0444），网页下线后靠它观察自主思考
+  thought_log: /var/lib/hermes/autonomy_data/thoughts.log
+  # 静默窗口秒数：用户最后一次活动距今不足该秒数时不启动自主思考
+  quiet_s: 300
+  # 宽松熔断额度：只约束资源，不约束思考内容与输出格式
+  limits:
+    # 单日 token 预算；0 或负数表示不限
+    daily_tokens: 2000000
+    # 连续失败达到该次数即打开熔断
+    circuit_threshold: 3
+    # 熔断打开后的冷却秒数；冷却结束后允许一次半开探测
+    circuit_cooldown_s: 1800
+    # 内存治理由 systemd cgroup 的 MemoryMax= 负责；此兼容字段不再设置 RLIMIT_AS。
+    memory_max: 1G
+    # 可选降耗限制（未填写时默认）：prefetch_max_chars=3000，prefetch_timeout_s=20，run_soft_wrap_seconds=1080，run_max_seconds=2400，max_turns=30

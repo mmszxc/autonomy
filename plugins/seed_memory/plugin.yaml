@@ -1,0 +1,4 @@
+name: seed_memory
+version: "0.1.0"
+description: Structured emotional seed memory for Hermes Agent
+entry_point: __init__.py

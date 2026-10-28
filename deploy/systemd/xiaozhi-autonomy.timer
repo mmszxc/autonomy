@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Hermes autonomy hourly for <PROFILE>
+
+[Timer]
+OnCalendar=*-*-* *:20:00
+RandomizedDelaySec=120
+Persistent=false
+Unit=xiaozhi-autonomy.service
+
+[Install]
+WantedBy=timers.target

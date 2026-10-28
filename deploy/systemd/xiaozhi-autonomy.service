@@ -1,0 +1,10 @@
+[Unit]
+Description=Hermes autonomy tick for <PROFILE>
+
+[Service]
+Type=oneshot
+Environment=PATH=<HERMES_BIN_DIR>:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONIOENCODING=utf-8
+Environment=LANG=C.UTF-8
+ExecStart=<HERMES_BIN_DIR>/hermes -p <PROFILE> autonomy tick --hermes-home <HERMES_HOME>
+TimeoutStartSec=3000

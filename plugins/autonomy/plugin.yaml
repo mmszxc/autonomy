@@ -1,0 +1,8 @@
+# autonomy 插件清单（Hermes standalone 插件）
+name: autonomy
+version: 0.1.0
+kind: standalone
+# 中文一句话说明：这个插件是 Hermes 的自主思考大脑
+description: 自主思考大脑插件
+# 插件入口文件（相对本目录）
+entry_point: __init__.py
