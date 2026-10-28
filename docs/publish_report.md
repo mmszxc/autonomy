@@ -27,17 +27,17 @@ deploy/systemd/
 ## 文件树与大小
 
 ```text
-autonomy-repo/                       # 65 files, 337507 bytes
+autonomy-repo/                       # 69 files, 345331 bytes
 ├── (root files)                     # 4 files, 8995 bytes
 ├── identity/                        # 2 files, 8971 bytes
 │   ├── SOUL.md
 │   └── LICENSE.md
-├── plugins/                         # 34 files, 222122 bytes
+├── plugins/                         # 36 files, 227459 bytes
 │   ├── autonomy/                    # 25 个源码/配置/说明文件
-│   └── seed_memory/                 # 9 个源码/配置/最小核心文件
-├── tests/                           # 14 files, 46965 bytes
-├── tools/                           # 5 files, 20915 bytes
-├── docs/                            # 4 files, 29032 bytes（含本报告）
+│   └── seed_memory/                 # 11 个源码/配置/最小核心文件
+├── tests/                           # 14 files, 47014 bytes
+├── tools/                           # 7 files, 23196 bytes
+├── docs/                            # 4 files, 29187 bytes（含本报告）
 └── deploy/systemd/                  # 2 files, 509 bytes
 ```
 
@@ -103,7 +103,7 @@ PASS tests/test_tick_exit_status.py
 Ubuntu 24 测试机使用 Hermes 自带 CPython 3.14，并把 pytest 与 PyYAML 安装到独立临时 `--target` 目录：
 
 ```text
-119 passed in 2.22s
+119 passed in 2.21s
 ```
 
 测试目录随后已删除，没有修改目标 profile 的生产依赖、配置或数据。
@@ -111,7 +111,7 @@ Ubuntu 24 测试机使用 Hermes 自带 CPython 3.14，并把 pytest 与 PyYAML 
 Windows 本机结果：
 
 ```text
-118 passed, 1 skipped in 6.13s
+118 passed, 1 skipped in 5.88s
 ```
 
 跳过项为 Linux 专有行为；没有弱化断言。
@@ -168,6 +168,8 @@ plugins/seed_memory/README.md
 plugins/seed_memory/__init__.py
 plugins/seed_memory/plugin.yaml
 plugins/seed_memory/seed_src/hermes/__init__.py
+plugins/seed_memory/seed_src/hermes/emotion/__init__.py
+plugins/seed_memory/seed_src/hermes/emotion/tagger.py
 plugins/seed_memory/seed_src/hermes/memory/__init__.py
 plugins/seed_memory/seed_src/hermes/memory/retrieval.py
 plugins/seed_memory/seed_src/hermes/memory/schema.py
@@ -188,13 +190,15 @@ tests/test_autonomy_quiet_start.py
 tests/test_gateway_runs.py
 tests/test_tick_exit_status.py
 tools/build_bundle.sh
+tools/e2e_worker.sh
 tools/export_seeds_archive.py
+tools/run_222_pytest.sh
 tools/soak/run_soak.py
 tools/verify_208.sh
 tools/view_thoughts.ps1
 ```
 
-共 65 个文件。
+共 69 个文件。
 
 ## Git 与推送策略
 

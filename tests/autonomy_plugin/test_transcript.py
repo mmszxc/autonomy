@@ -103,7 +103,7 @@ def test_redacts_secret_keys_assignments_and_sk_tokens(tmp_path):
     conn = make_db(db)
     add_session(conn, messages=3)
     calls = [{"id": "c", "function": {"name": "exec", "arguments": json.dumps({
-        "api_key": "fakekey", "command": "password=fakepass sk-abcdefghijkl"
+        "api_key": "fakekey", "command": "password:fakepass sk-abcdefghijkl"
     })}}]
     add_message(conn, "s1", "assistant", "token=faketoken", 102, tool_calls=json.dumps(calls))
     add_message(conn, "s1", "tool", "secret: fakesecret", 103, tool_call_id="c", tool_name="exec")

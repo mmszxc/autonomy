@@ -9,7 +9,8 @@ PLUGIN_PARENT = ROOT / "plugins"
 
 def run_isolated(code):
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(PLUGIN_PARENT) + os.pathsep + env.get("PYTHONPATH", "")
+    inherited = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(PLUGIN_PARENT) + (os.pathsep + inherited if inherited else "")
     prefix = f"import sys; sys.path.insert(0, {str(PLUGIN_PARENT)!r})\n"
     result = subprocess.run([sys.executable, "-c", prefix + code], cwd=ROOT, env=env, text=True, capture_output=True)
     assert result.returncode == 0, result.stdout + result.stderr
