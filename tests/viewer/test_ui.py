@@ -12,21 +12,22 @@ def test_modular_offline_hud_and_hash_tabs() -> None:
     assert "#050b14" in styles and "#00e5ff" in styles and "conic-gradient" in styles
     assert "prefers-reduced-motion" in styles and "visibilitychange" in scripts
     assert "location.hash" in scripts and "history.replaceState(null,'','#seeds')" in scripts
-    assert "startPoller" in scripts and "xiaozhi.viewer.paused" in scripts
-    assert "['15','30','60','manual']" in scripts and "viewer:updated" in scripts
-    assert 'id="pauseToggle"' in page and 'id="lastUpdated"' in page
+    assert "startRefresh" in scripts and "viewer:updated" in scripts
+    assert 'id="refreshNow"' in page and 'id="lastUpdated"' in page
+    assert 'id="pauseToggle"' not in page and 'id="pollInterval"' not in page
     assert "new Map" in scripts and "requestAnimationFrame" in scripts
     assert "http://" not in page + styles + scripts and "https://" not in page + styles + scripts
     assert "<script src=" not in page and "type=\"module\"" in page
 
 
-def test_poller_pause_persistence_and_incremental_rendering() -> None:
-    poller = (STATIC_ROOT / "js/poller.js").read_text(encoding="utf-8")
+def test_manual_refresh_only_and_incremental_rendering() -> None:
+    refresh = (STATIC_ROOT / "js/refresh.js").read_text(encoding="utf-8")
+    app = (STATIC_ROOT / "js/app.js").read_text(encoding="utf-8")
     seeds = (STATIC_ROOT / "js/seed-map.js").read_text(encoding="utf-8")
     thoughts = (STATIC_ROOT / "js/thought-stream.js").read_text(encoding="utf-8")
-    assert "localStorage" in poller and "viewer:pause" in poller
-    assert "details[open]" in poller and "classList.contains('open')" in poller
-    assert "interval==='manual'" in poller and "request(true)" in poller
+    assert "refreshNow" in refresh and "viewer:refresh" in refresh
+    assert "setTimeout" not in refresh + app and "setInterval" not in refresh + app
+    assert "localStorage" not in refresh and "viewer:pause" not in refresh + app
     assert "dataset.signature" in seeds and "dataset.signature" in thoughts
     assert "root.children[index]!==node" in seeds and "root.children[index]!==node" in thoughts
 

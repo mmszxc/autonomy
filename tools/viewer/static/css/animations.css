@@ -1,4 +1,3 @@
 @keyframes scan{to{transform:translateY(50%)}}@keyframes spin{to{transform:rotate(360deg)}}@keyframes spinReverse{to{transform:rotate(-360deg)}}@keyframes breathe{50%{transform:scale(.88);opacity:.52}}@keyframes arrive{from{opacity:0;transform:translateY(18px)}}@keyframes flash{20%{box-shadow:0 0 30px rgba(0,229,255,.45)}}@keyframes digitPulse{50%{text-shadow:0 0 16px var(--cyan);transform:scale(1.05)}}@keyframes fadeIn{from{opacity:0}to{opacity:1}}
 .arrive{animation:arrive .7s cubic-bezier(.2,.8,.2,1),flash 1s ease}
-html[data-viewer-paused="true"] *,html[data-viewer-paused="true"] *:before,html[data-viewer-paused="true"] *:after{animation-play-state:paused!important;transition:none!important}
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.001ms!important;animation-iteration-count:1!important;scroll-behavior:auto!important}#stars{display:none}.glass,.drawer{transition:none}}
