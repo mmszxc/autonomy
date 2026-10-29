@@ -51,6 +51,21 @@ def _safe_session_name(value: str) -> str:
     return clean + "_" + hashlib.sha256(raw.encode()).hexdigest()[:8]
 
 
+def _quarantine_queue_file(path: Path, queue_dir: Path, payload: Dict[str, Any]) -> Path:
+    """Atomically isolate a poison transcript while retaining diagnostics."""
+    failed = queue_dir / "_failed"
+    failed.mkdir(mode=0o700, exist_ok=True)
+    target = failed / path.name
+    if target.exists():
+        target = failed / (path.stem + ".%d" % int(time.time()) + path.suffix)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    os.replace(path, target)
+    return target
+
+
 @contextmanager
 def _session_lock(path: Path):
     lock = Path(str(path) + ".lock")
@@ -446,34 +461,40 @@ class SeedMemoryProvider(MemoryProvider):
         if not self._queue_dir or not any(self._queue_dir.glob("*.json")):
             return
         import subprocess, sys
-        lock_path = self._queue_dir / "worker.lock"
-        with open(lock_path, "a+") as probe:
+        unit_state = self._queue_dir / ".worker.unit"
+        launch_lock = self._queue_dir / ".worker.launch.lock"
+        with open(launch_lock, "a+") as probe:
             try:
-                import fcntl; fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB); fcntl.flock(probe, fcntl.LOCK_UN)
-            except BlockingIOError:
-                # A worker already owns the queue lock. Report explicitly so
-                # callers can distinguish busy from a successful launch.
-                logger.info("worker_busy queue_dir=%s", self._queue_dir)
-                return
+                import fcntl; fcntl.flock(probe, fcntl.LOCK_EX)
             except ImportError:
                 pass
-        log_path = self._queue_dir / "worker.log"
-        log = open(log_path, "ab", buffering=0)
-        env = os.environ.copy()  # LAN_QWEN_API_KEY is inherited, never serialized.
-        env["HERMES_HOME"] = str(self._hermes_home)
-        worker_script = Path(__file__).with_name("worker.py").resolve()
-        logger.info("worker argv=%s cwd=%s PYTHONPATH=%s HERMES_HOME=%s key_set=%s", [sys.executable, str(worker_script), "--once"], worker_script.parent.parent, env.get("PYTHONPATH", ""), env["HERMES_HOME"], bool(env.get("LAN_QWEN_API_KEY")))
-        try:
-            self._worker_proc = subprocess.Popen(
-                [sys.executable, str(worker_script), "--once"],
-                cwd=str(worker_script.parent.parent), env=env,
-                stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                start_new_session=True, close_fds=True,
-            )
-            logger.info("queue worker launched pid=%s poll=%s", self._worker_proc.pid, self._worker_proc.poll())
-        except Exception:
-            log.close()
-            logger.exception("queue worker launch failed")
+            previous = unit_state.read_text(encoding="utf-8").strip() if unit_state.exists() else ""
+            active = bool(previous) and subprocess.run(["systemctl", "--user", "is-active", "--quiet", previous], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+            if active:
+                logger.info("worker_busy unit=%s queue_dir=%s", previous, self._queue_dir)
+                return
+            profile = re.sub(r"[^A-Za-z0-9_-]", "-", self._hermes_home.name) or "default"
+            unit = "hermes-seed-worker-%s-%d" % (profile, int(time.time()))
+            worker_script = Path(__file__).with_name("worker.py").resolve()
+            log_path = self._queue_dir / "worker.log"
+            command = ["systemd-run", "--user", "--collect", "--quiet", "--unit", unit, "--property=RuntimeMaxSec=900s", "--property=StandardOutput=append:%s" % log_path, "--property=StandardError=append:%s" % log_path, "--setenv=HERMES_HOME=%s" % self._hermes_home, "--working-directory=%s" % worker_script.parent.parent, sys.executable, str(worker_script), "--once"]
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+            except FileNotFoundError:
+                logger.warning("systemd-run unavailable; falling back to foreground seed worker")
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                logger.warning("systemd-run submit failed type=%s; falling back to foreground seed worker", type(exc).__name__)
+            else:
+                if result.returncode == 0:
+                    tmp = unit_state.with_suffix(".tmp"); tmp.write_text(unit, encoding="utf-8"); os.replace(tmp, unit_state)
+                    logger.info("queue worker submitted unit=%s", unit)
+                    return
+                logger.warning("systemd-run submit failed rc=%s; falling back to foreground seed worker", result.returncode)
+            try:
+                self._worker_proc = subprocess.Popen([sys.executable, str(worker_script), "--once"], cwd=str(worker_script.parent.parent), env={**os.environ, "HERMES_HOME": str(self._hermes_home)}, stdin=subprocess.DEVNULL, stdout=open(log_path, "ab", buffering=0), stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
+                logger.warning("queue worker launched foreground fallback pid=%s", self._worker_proc.pid)
+            except Exception:
+                logger.exception("queue worker launch failed")
 
     def _user_active(self) -> bool:
         import time
@@ -598,8 +619,8 @@ class SeedMemoryProvider(MemoryProvider):
                         if time.time() - float(payload.get("created_at", time.time())) > float(self._config.get("retry_window_s", 86400)):
                             payload["retries"] = int(self._config.get("max_retries", 3)) + 1
                         if payload["retries"] > int(self._config.get("max_retries", 3)):
-                            failed = self._queue_dir / "failed"; failed.mkdir(mode=0o700, exist_ok=True)
-                            os.replace(path, failed / path.name); os.chmod(failed / path.name, 0o600)
+                            target = _quarantine_queue_file(path, self._queue_dir, payload)
+                            logger.warning("queue file moved to _failed after parse retries path=%s retries=%d target=%s", path.name, payload["retries"], target)
                         else:
                             payload["next_retry_at"] = time.time() + float(self._config.get("retry_backoff_s", 5)) * (2 ** (payload["retries"] - 1))
                             tmp=path.with_suffix(".json.tmp"); tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8"); os.chmod(tmp,0o600); os.replace(tmp,path)
@@ -619,8 +640,14 @@ class SeedMemoryProvider(MemoryProvider):
                         continue
                     if transient:
                         payload["transient_failures"] = int(payload.get("transient_failures", 0)) + 1
-                        payload["next_retry_at"] = time.time() + min(1800, float(self._config.get("retry_backoff_s", 5)) * (2 ** min(8, payload["transient_failures"] - 1)))
-                        tmp=path.with_suffix(".json.tmp"); tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8"); os.chmod(tmp,0o600); os.replace(tmp,path)
+                        payload["retries"] = int(payload.get("retries", 0)) + 1
+                        max_retries = int(self._config.get("max_retries", 3))
+                        if payload["retries"] > max_retries:
+                            target = _quarantine_queue_file(path, self._queue_dir, payload)
+                            logger.warning("queue file moved to _failed after transient retries path=%s retries=%d target=%s", path.name, payload["retries"], target)
+                        else:
+                            payload["next_retry_at"] = time.time() + min(1800, float(self._config.get("retry_backoff_s", 5)) * (2 ** min(8, payload["transient_failures"] - 1)))
+                            tmp=path.with_suffix(".json.tmp"); tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8"); os.chmod(tmp,0o600); os.replace(tmp,path)
                         continue
                     if time.time() - float(payload.get("created_at", time.time())) > float(self._config.get("retry_window_s", 86400)):
                         payload["retries"] = int(self._config.get("max_retries", 3)) + 1
@@ -629,9 +656,8 @@ class SeedMemoryProvider(MemoryProvider):
                     payload["last_error"] = type(exc).__name__
                     max_retries = int(self._config.get("max_retries", 3))
                     if payload["retries"] > max_retries:
-                        failed = self._queue_dir / "failed"; failed.mkdir(mode=0o700, exist_ok=True)
-                        target = failed / path.name; os.replace(path, target); os.chmod(target, 0o600)
-                        logger.warning("queue file moved to failed after retries path=%s retries=%d", path.name, payload["retries"])
+                        target = _quarantine_queue_file(path, self._queue_dir, payload)
+                        logger.warning("queue file moved to _failed after retries path=%s retries=%d target=%s", path.name, payload["retries"], target)
                     else:
                         import time as _time
                         backoff = float(self._config.get("retry_backoff_s", 5))

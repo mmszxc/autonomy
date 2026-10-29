@@ -20,7 +20,28 @@ import json
 import os
 import re
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
+
+
+@contextmanager
+def _file_lock(path):
+    """Serialize transient worker submission per profile."""
+    path = Path(path)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fh = open(path, "a+")
+    try:
+        if fcntl:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+    finally:
+        if fcntl:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        fh.close()
+
 
 from .prompt import build_tick_prompt, load_extra_rules
 from .proposals import parse
@@ -246,14 +267,32 @@ class Runner:
             # makes a queued-but-never-consumed session impossible to diagnose.
             worker_log = queue_dir / "worker.log"
             self._rotate_log(worker_log)
-            log_handle = open(worker_log, "ab", buffering=0)
-            kwargs = {"cwd": str(worker.parent.parent), "env": env, "stdin": subprocess.DEVNULL,
-                      "stdout": log_handle, "stderr": log_handle}
-            if os.name != "nt": kwargs["start_new_session"] = True
-            # A systemd oneshot service kills its remaining cgroup when tick
-            # returns. Wait for queue drain here so the worker is not orphaned
-            # halfway through an embedding/model request.
             started = time.monotonic()
+            if os.name != "nt":
+                unit_state = queue_dir / ".worker.unit"
+                launch_lock = queue_dir / ".worker.launch.lock"
+                with _file_lock(launch_lock):
+                    previous = unit_state.read_text(encoding="utf-8").strip() if unit_state.exists() else ""
+                    active = bool(previous) and subprocess.run(["systemctl", "--user", "is-active", "--quiet", previous], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+                    if active:
+                        return {"queued": True, "path": str(target), "worker": "submitted(" + previous + ")", "unit": previous, "elapsed_s": round(time.monotonic() - started, 3)}
+                    profile = re.sub(r"[^A-Za-z0-9_-]", "-", self.hermes_home.name) or "default"
+                    unit = "hermes-seed-worker-%s-%d" % (profile, int(time.time()))
+                    command = ["systemd-run", "--user", "--collect", "--quiet", "--unit", unit, "--property=RuntimeMaxSec=900s", "--property=StandardOutput=append:%s" % worker_log, "--property=StandardError=append:%s" % worker_log, "--setenv=HERMES_HOME=%s" % self.hermes_home, "--working-directory=%s" % worker.parent.parent, sys.executable, str(worker), "--once"]
+                    try:
+                        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+                    except FileNotFoundError:
+                        logger.warning("systemd-run unavailable; falling back to foreground seed worker")
+                    except (OSError, subprocess.TimeoutExpired) as exc:
+                        logger.warning("systemd-run submit failed type=%s; falling back to foreground seed worker", type(exc).__name__)
+                    else:
+                        if result.returncode == 0:
+                            tmp = unit_state.with_suffix(".tmp"); tmp.write_text(unit, encoding="utf-8"); os.replace(tmp, unit_state)
+                            return {"queued": True, "path": str(target), "worker": "submitted(" + unit + ")", "unit": unit, "elapsed_s": round(time.monotonic() - started, 3)}
+                        logger.warning("systemd-run submit failed rc=%s; falling back to foreground seed worker", result.returncode)
+            log_handle = open(worker_log, "ab", buffering=0)
+            kwargs = {"cwd": str(worker.parent.parent), "env": env, "stdin": subprocess.DEVNULL, "stdout": log_handle, "stderr": log_handle}
+            if os.name != "nt": kwargs["start_new_session"] = True
             proc = subprocess.Popen([sys.executable, str(worker), "--once"], **kwargs)
             try:
                 returncode = proc.wait(timeout=getattr(self, "worker_timeout_s", 360))
@@ -261,13 +300,11 @@ class Runner:
                 if os.name != "nt":
                     try: os.killpg(proc.pid, signal.SIGTERM)
                     except OSError: pass
-                else:
-                    proc.terminate()
+                else: proc.terminate()
                 try: proc.wait(timeout=10)
                 except subprocess.TimeoutExpired: proc.kill()
                 return {"queued": True, "path": str(target), "worker": "timeout", "elapsed_s": round(time.monotonic() - started, 3)}
-            finally:
-                log_handle.close()
+            finally: log_handle.close()
             return {"queued": True, "path": str(target), "worker": "ok" if returncode == 0 else "exit_%s" % returncode, "elapsed_s": round(time.monotonic() - started, 3)}
         except Exception as exc:
             return {"queued": False, "reason": type(exc).__name__}
