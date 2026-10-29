@@ -118,6 +118,22 @@ journalctl --user -u xiaozhi-autonomy.service -n 50 --no-pager
 
 模板名称只是示例，可以按 profile 重命名。需要注销后继续运行时，请由管理员按发行版策略启用 linger。
 
+## 只读网页查看器
+
+`tools/viewer/viewer.py` 是独立的 Python 标准库小程序，不导入插件、不连接模型，也不写 profile 数据。它只读展示最近自主思考、工具调用、种子、预算、熔断、timer 和队列状态。
+
+```bash
+python3 tools/viewer/viewer.py --profile xiaozhi
+```
+
+默认监听 `0.0.0.0:8765`，可用 `--host`、`--port` 或 `HERMES_VIEWER_HOST`、`HERMES_VIEWER_PORT` 修改。默认无鉴权，**只应在可信局域网中开放**；需要简单口令时使用：
+
+```bash
+python3 tools/viewer/viewer.py --profile xiaozhi --token '自行生成的长随机口令'
+```
+
+客户端可用 `Authorization: Bearer <口令>`，浏览器也可在 URL 查询参数中传入 `token`。查询参数可能被浏览器历史记录保存，优先使用反向代理或 Bearer header。数据接口为 `/api/thoughts?n=20`、`/api/seeds?limit=20&q=` 和 `/api/status`，页面每 15 秒自动刷新。生产部署前请确认端口未被占用，并结合主机防火墙限制来源地址。
+
 ## 示例身份文件
 
 `identity/SOUL.md` 是作者 **mmszxc** 提供的示例身份文件，不是插件运行所必需，也不会由安装步骤自动覆盖到 profile。你可以阅读、采用或替换为自己的身份文件。
