@@ -59,100 +59,25 @@ deploy/systemd/                   通用用户级 systemd 模板
 
 插件仍会兼容检测旧的 `seeds/`、`seed_queue/` 和 `autonomy/` 位置；新部署应使用上面的统一布局。数据库、日志和队列均不应提交到 Git。
 
-## 安装
+## 安装：3 步完成
 
-### 1. 复制插件
-
-```bash
-cp -a plugins/autonomy <HERMES_HOME>/plugins/
-cp -a plugins/seed_memory <HERMES_HOME>/plugins/
-```
-
-### 2. 准备依赖
-
-依赖和模型体积较大且与平台/Python 版本相关，因此不进入仓库。
-
-给 autonomy 准备轻量依赖：
+安装器只接受已经存在的 Hermes profile；不会创建 profile，也不会修改数据库、`SOUL.md`、auth 文件或 `.env`。
 
 ```bash
-python3 -m pip install --target <HERMES_HOME>/plugins/autonomy/_vendor \
-  PyYAML numpy
+# 1. 获取代码
+git clone https://github.com/mmszxc/autonomy.git && cd autonomy
+
+# 2. 安装两个插件、固定版本的 CPU ML 依赖/模型，以及用户级定时器
+./install.sh --profile xiaozhi
+
+# 3. 验证
+hermes -p xiaozhi autonomy status && systemctl --user status xiaozhi-autonomy.timer
 ```
 
-给 seed_memory 准备通用依赖：
+第 2 步的大体积下载默认要求交互确认；自动化环境可加 `--yes`。仅安装插件可加 `--skip-ml`，不写或启用 timer 可加 `--no-timer`。已有同名 systemd unit 默认保持不变；确认备份并替换时才使用 `--force`。
 
-```bash
-python3 -m pip install --target <HERMES_HOME>/plugins/seed_memory/_vendor \
-  PyYAML numpy
-```
+手工 Git URL 安装、固定模型 revision、目录布局、离线验证、systemd 与回滚说明见 [`docs/install_ubuntu24_profile_xiaozhi.md`](docs/install_ubuntu24_profile_xiaozhi.md)。本仓库不包含模型权重或大体积 Python vendor。
 
-安装 CPU 版 PyTorch，再安装 sentence-transformers：
-
-```bash
-python3 -m pip install --target <HERMES_HOME>/plugins/seed_memory/_vendor_ml \
-  torch --index-url https://download.pytorch.org/whl/cpu
-python3 -m pip install --target <HERMES_HOME>/plugins/seed_memory/_vendor_ml \
-  sentence-transformers
-```
-
-请使用 Hermes 自带 Python，并确认 wheel 与 Python 版本、Linux 和 CPU 架构匹配。
-
-### 3. 准备嵌入模型
-
-模型名称：
-
-```text
-sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-```
-
-从 Hugging Face 官方模型页下载完整快照，放到：
-
-```text
-<HERMES_HOME>/plugins/seed_memory/seed_src/hermes/model/paraphrase-multilingual-MiniLM-L12-v2/
-```
-
-联网环境也可以先由 sentence-transformers 下载，再把完整目录复制到离线机器。仓库不含模型权重。
-
-### 4. 配置 profile
-
-示例：
-
-```yaml
-plugins:
-  enabled: [autonomy]
-
-memory:
-  provider: seed_memory
-  seed_memory:
-    source_root: <HERMES_HOME>/plugins/seed_memory/seed_src
-    data_dir: <HERMES_HOME>/seed_data
-    db_path: <HERMES_HOME>/seed_data/seeds/seeds.db
-    queue_dir: <HERMES_HOME>/seed_data/seed_queue
-    embedding_model_path: <HERMES_HOME>/plugins/seed_memory/seed_src/hermes/model/paraphrase-multilingual-MiniLM-L12-v2
-    prefetch_limit: 5
-    write_enabled: true
-
-autonomy:
-  model: null
-  memory_provider: seed_memory
-  data_dir: <HERMES_HOME>/autonomy_data
-  thought_log: <HERMES_HOME>/autonomy_data/thoughts.log
-```
-
-完整字段见 `plugins/autonomy/config.example.yaml` 和 `docs/`。
-
-### 5. 初始化和检查
-
-```bash
-hermes -p <PROFILE> plugins doctor autonomy
-hermes -p <PROFILE> plugins doctor seed_memory
-hermes -p <PROFILE> autonomy init
-hermes -p <PROFILE> autonomy status
-hermes -p <PROFILE> autonomy tick
-hermes -p <PROFILE> autonomy log -n 1 --tools --seeds
-```
-
-先手工执行一轮，确认 provider、模型、中文日志和数据路径都正常，再启用 timer。
 
 ## 常用命令
 
