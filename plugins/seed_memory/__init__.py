@@ -451,6 +451,9 @@ class SeedMemoryProvider(MemoryProvider):
             try:
                 import fcntl; fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB); fcntl.flock(probe, fcntl.LOCK_UN)
             except BlockingIOError:
+                # A worker already owns the queue lock. Report explicitly so
+                # callers can distinguish busy from a successful launch.
+                logger.info("worker_busy queue_dir=%s", self._queue_dir)
                 return
             except ImportError:
                 pass

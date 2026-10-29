@@ -136,6 +136,8 @@ def main(argv=None, *, hermes_home=None):
         run_max_seconds=run_max_seconds,
         run_soft_wrap_seconds=run_soft_wrap_seconds,
         workspace=auto_cfg.get("workspace") if isinstance(auto_cfg.get("workspace"), str) else None,
+        worker_timeout_s=int(limits_cfg.get("worker_timeout_s", 360) or 360),
+        seed_queue_dir=((raw_cfg.get("memory") or {}).get("seed_memory") or {}).get("queue_dir"),
     )
 
     if a.resume_if_idle:

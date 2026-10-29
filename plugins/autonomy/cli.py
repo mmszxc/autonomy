@@ -145,7 +145,12 @@ def _seed_details(raw_cfg, hermes_home, seed_ids):
 def cmd_log(hermes_home: Optional[str | Path] = None, count: int = 3, full: bool = False, as_json: bool = False, seeds: bool = False, tools: bool = False) -> Dict[str, Any]:
     raw_cfg = load_raw_config(hermes_home)
     path = resolve_paths(raw_cfg, hermes_home=hermes_home)["thought_log"]
-    entries = parse_thought_entries(path)
+    # Archives are newest-first by suffix (.1, .2 ...); combine chronologically
+    # so `-n` remains meaningful across controlled rotation.
+    paths = [Path(path).with_name(Path(path).name + ".%d" % i) for i in range(3, 0, -1)] + [Path(path)]
+    entries = []
+    for candidate in paths:
+        entries.extend(parse_thought_entries(candidate))
     selected = entries[-max(0, int(count)):]
     for entry in selected:
         body = entry.get("body", "")

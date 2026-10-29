@@ -115,6 +115,8 @@ class Runner:
         run_max_seconds=2400,
         run_soft_wrap_seconds=1080,
         workspace=None,
+        worker_timeout_s=360,
+        seed_queue_dir=None,
     ):
         self.db = db
         self.budget = budget
@@ -125,6 +127,8 @@ class Runner:
         self.lock_path = lock_path or str(getattr(db, "path", "autonomy.db")) + ".run.lock"
         self.data_dir = os.path.dirname(self.lock_path) or "."
         self.workspace = workspace
+        self.worker_timeout_s = max(1, int(worker_timeout_s or 360))
+        self.seed_queue_dir = Path(seed_queue_dir).expanduser() if seed_queue_dir else None
         self.active_run_file = os.path.join(os.path.dirname(self.lock_path), "AUTONOMY_REMOTE_RUN")
         self.preempt_file = os.path.join(os.path.dirname(self.lock_path), "PREEMPT_NOW")
         self.stop_wait_s = 600
@@ -193,6 +197,20 @@ class Runner:
             return result
         return {"text": "", "error": result.get("error", "transcript unavailable")}
 
+    @staticmethod
+    def _rotate_log(path, max_bytes=2 * 1024 * 1024, keep=3):
+        """Bound diagnostics growth; newest archive is ``.1``."""
+        path = Path(path)
+        if not path.exists() or path.stat().st_size < max_bytes:
+            return
+        for i in range(keep, 0, -1):
+            src = path.with_name(path.name + ".%d" % i)
+            dst = path.with_name(path.name + ".%d" % (i + 1))
+            if src.exists():
+                if i == keep: src.unlink(missing_ok=True)
+                else: os.replace(src, dst)
+        os.replace(path, path.with_name(path.name + ".1"))
+
     def _enqueue_completed_turn(self, run_id, summary, assistant_text):
         """Bridge standalone autonomy ticks into seed_memory's queue protocol.
 
@@ -201,7 +219,7 @@ class Runner:
         shape that seed_memory consumes, then invoke its detached worker.  Queue
         creation must never turn an otherwise successful thought into a failure.
         """
-        queue_dir = Path(self.hermes_home) / "seed_data" / "seed_queue"
+        queue_dir = getattr(self, "seed_queue_dir", None) or (Path(self.hermes_home) / "seed_data" / "seed_queue")
         worker = Path(self.hermes_home) / "plugins" / "seed_memory" / "worker.py"
         if not worker.is_file():
             return {"queued": False, "reason": "worker_missing"}
@@ -227,6 +245,7 @@ class Runner:
             # Preserve worker diagnostics next to the queue; discarding stderr
             # makes a queued-but-never-consumed session impossible to diagnose.
             worker_log = queue_dir / "worker.log"
+            self._rotate_log(worker_log)
             log_handle = open(worker_log, "ab", buffering=0)
             kwargs = {"cwd": str(worker.parent.parent), "env": env, "stdin": subprocess.DEVNULL,
                       "stdout": log_handle, "stderr": log_handle}
@@ -234,9 +253,10 @@ class Runner:
             # A systemd oneshot service kills its remaining cgroup when tick
             # returns. Wait for queue drain here so the worker is not orphaned
             # halfway through an embedding/model request.
+            started = time.monotonic()
             proc = subprocess.Popen([sys.executable, str(worker), "--once"], **kwargs)
             try:
-                returncode = proc.wait(timeout=300)
+                returncode = proc.wait(timeout=getattr(self, "worker_timeout_s", 360))
             except subprocess.TimeoutExpired:
                 if os.name != "nt":
                     try: os.killpg(proc.pid, signal.SIGTERM)
@@ -245,10 +265,10 @@ class Runner:
                     proc.terminate()
                 try: proc.wait(timeout=10)
                 except subprocess.TimeoutExpired: proc.kill()
-                return {"queued": True, "path": str(target), "worker": "timeout"}
+                return {"queued": True, "path": str(target), "worker": "timeout", "elapsed_s": round(time.monotonic() - started, 3)}
             finally:
                 log_handle.close()
-            return {"queued": True, "path": str(target), "worker": "ok" if returncode == 0 else "exit_%s" % returncode}
+            return {"queued": True, "path": str(target), "worker": "ok" if returncode == 0 else "exit_%s" % returncode, "elapsed_s": round(time.monotonic() - started, 3)}
         except Exception as exc:
             return {"queued": False, "reason": type(exc).__name__}
 
@@ -642,7 +662,7 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 self.db.append_event(
                     run_id=run, goal_id=goal_id, kind="seed_queue",
                     exit_reason="queued" if queue_result.get("queued") else "degraded",
-                    summary=str(queue_result.get("path") or queue_result.get("reason") or "unknown")[:1200],
+                    summary=("path=%s worker=%s elapsed_s=%s" % (queue_result.get("path") or queue_result.get("reason") or "unknown", queue_result.get("worker", "not_started"), queue_result.get("elapsed_s", 0)))[:1200],
                 )
                 append_thought_log(
                     self.thought_log_path,

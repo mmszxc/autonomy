@@ -66,6 +66,22 @@ def append_thought_log(
     body_lines.append("")
     entry = "\n".join(body_lines) + "\n"
 
+    # Controlled rotation is the sole exception to the externally read-only log.
+    # Archives are also restored to 0444; retain three 2MiB generations.
+    if path.exists() and path.stat().st_size + len(entry.encode("utf-8")) > 2 * 1024 * 1024:
+        try:
+            os.chmod(path, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+            for i in range(3, 0, -1):
+                src = path.with_name(path.name + f".{i}")
+                dst = path.with_name(path.name + f".{i + 1}")
+                if src.exists():
+                    if i == 3: src.unlink()
+                    else: os.replace(src, dst)
+            os.replace(path, path.with_name(path.name + ".1"))
+            os.chmod(path.with_name(path.name + ".1"), stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+        except OSError:
+            pass
+
     # Unlock read-only attribute temporarily so the plugin can append, then restore 0o444 (read-only).
     if path.exists():
         try:

@@ -30,4 +30,6 @@ autonomy:
     circuit_cooldown_s: 1800
     # 内存治理由 systemd cgroup 的 MemoryMax= 负责；此兼容字段不再设置 RLIMIT_AS。
     memory_max: 1G
+    # 队列 worker 最长等待秒数；超时后会终止进程组并记录 worker_timeout
+    worker_timeout_s: 360
     # 可选降耗限制（未填写时默认）：prefetch_max_chars=3000，prefetch_timeout_s=20，run_soft_wrap_seconds=1080，run_max_seconds=2400，max_turns=30
