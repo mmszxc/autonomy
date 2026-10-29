@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>XIAOZHI · 自主意识监控</title>
+  <link rel="stylesheet" href="/static/css/base.css">
+  <link rel="stylesheet" href="/static/css/hud.css">
+  <link rel="stylesheet" href="/static/css/animations.css">
+</head>
+<body>
+  <canvas id="stars" aria-hidden="true"></canvas>
+  <header class="hud">
+    <div class="hud-top">
+      <div><div class="eyebrow">JARVIS // READ-ONLY LINK</div><h1>XIAOZHI · 自主意识监控</h1></div>
+      <div id="clock" class="clock">--:--:--<small>LOCAL SYSTEM TIME</small></div>
+    </div>
+    <div class="telemetry">
+      <div id="timerCell" class="telemetry-cell"><span class="label">AUTONOMY TIMER</span><strong id="timerValue">同步中</strong></div>
+      <div id="circuitCell" class="telemetry-cell"><span class="label">CIRCUIT</span><strong id="circuitValue">同步中</strong></div>
+      <div id="queueCell" class="telemetry-cell"><span class="label">QUEUE</span><strong id="queueValue">--</strong></div>
+      <div class="telemetry-cell"><span id="budgetGauge" class="gauge"></span><span class="label">DAILY BUDGET</span><strong id="budgetValue">--</strong></div>
+      <div class="telemetry-cell"><span class="label">MEMORY SEEDS</span><strong id="seedCount" class="seed-count">0</strong></div>
+    </div>
+  </header>
+  <nav class="tabs" aria-label="查看器页面">
+    <button data-tab="seeds">种子星图</button><button data-tab="thoughts">思考流</button><button data-tab="status">系统状态</button>
+  </nav>
+  <main>
+    <section id="panel-seeds" class="tab-panel constellation" data-panel="seeds">
+      <div class="core-stage"><div id="core" class="core" role="img" aria-label="自主意识核心状态"><span class="ring"></span><span class="core-dot"></span><span id="coreLabel" class="core-label">CORE // IDLE</span></div></div>
+      <div class="panel-head"><h2>种子星图</h2><span>MEMORY CONSTELLATION / 01</span></div>
+      <div class="seed-controls"><input id="search" maxlength="200" aria-label="搜索种子" placeholder="搜索内容、情绪或因果"><select id="sort"><option value="time">最新时间</option><option value="importance">重要度</option></select><button id="searchBtn">扫描</button></div>
+      <div id="emotions" class="emotion-filters" aria-label="情绪过滤"></div><div id="seeds" class="seed-grid"></div>
+      <div class="pager"><button id="prev">上一页</button><button id="next">下一页</button><span id="page"></span></div>
+    </section>
+    <section id="panel-thoughts" class="tab-panel" data-panel="thoughts" hidden><div class="panel-head"><h2>思考流</h2><span>THOUGHT STREAM / 02</span></div><div id="thoughts"></div></section>
+    <section id="panel-status" class="tab-panel" data-panel="status" hidden><div class="panel-head"><h2>系统状态</h2><span>TELEMETRY / 03</span></div><div id="statusDetails" class="status-grid"></div></section>
+  </main>
+  <aside id="drawer" class="drawer" aria-hidden="true"><button id="drawerClose" class="drawer-close" aria-label="关闭">×</button><div id="drawerBody"></div></aside>
+  <div id="backdrop" class="backdrop" hidden></div><footer>SECURE READ-ONLY TELEMETRY · 15 秒同步 · 无模型连接</footer>
+  <script type="module" src="/static/js/app.js"></script>
+</body>
+</html>
