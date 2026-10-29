@@ -14,6 +14,7 @@ def test_modular_offline_hud_and_hash_tabs() -> None:
     assert "location.hash" in scripts and "history.replaceState(null,'','#seeds')" in scripts
     assert "startRefresh" in scripts and "viewer:updated" in scripts
     assert 'id="refreshNow"' in page and 'id="lastUpdated"' in page
+    assert "手动刷新" in page
     assert 'id="pauseToggle"' not in page and 'id="pollInterval"' not in page
     assert "new Map" in scripts and "requestAnimationFrame" in scripts
     assert "http://" not in page + styles + scripts and "https://" not in page + styles + scripts
