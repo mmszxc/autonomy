@@ -7,7 +7,8 @@ def test_modular_offline_hud_and_hash_tabs() -> None:
     page = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
     styles = "\n".join(path.read_text(encoding="utf-8") for path in (STATIC_ROOT / "css").glob("*.css"))
     scripts = "\n".join(path.read_text(encoding="utf-8") for path in (STATIC_ROOT / "js").glob("*.js"))
-    assert "XIAOZHI · 自主意识监控" in page and 'data-panel="seeds"' in page
+    assert 'id="hudTitle"' in page and 'data-panel="seeds"' in page
+    assert "data.profile" in scripts and "document.title=title" in scripts
     assert "种子星图" in page and "思考流" in page and "系统状态" in page
     assert "#050b14" in styles and "#00e5ff" in styles and "conic-gradient" in styles
     assert "prefers-reduced-motion" in styles and "visibilitychange" in scripts

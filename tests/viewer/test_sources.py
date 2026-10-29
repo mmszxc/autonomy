@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+from tools.viewer.viewer_app.config import resolve_paths
 from tools.viewer.viewer_app.sources import seeds, status, thoughts
 
 
@@ -39,3 +40,27 @@ def test_runtime_status_is_read_only(profile: Path, monkeypatch) -> None:
     assert result["budget"]["calls"] == {"used": 7, "limit": 500}
     assert result["circuit"]["state"] == "open" and result["seed_total"] == 2
     assert (digest(state_db), digest(seed_db)) == before
+
+
+def test_profile_paths_and_queue_counts(profile: Path, monkeypatch) -> None:
+    config = profile / "config.yaml"
+    config.write_text(
+        "autonomy:\n  paths:\n    db_path: %s\n  thought_log: %s\n"
+        "memory:\n  seed_memory:\n    queue_dir: %s\n" % (
+            (profile / "autonomy_data" / "autonomy.db").as_posix(),
+            (profile / "autonomy_data" / "thoughts.log").as_posix(),
+            (profile / "seed_data" / "seed_queue").as_posix(),
+        ), encoding="utf-8",
+    )
+    paths = resolve_paths(profile)
+    queue = paths["queue"]
+    (queue / "worker.log").write_text("diagnostic", encoding="utf-8")
+    (queue / "worker.lock").write_text("", encoding="utf-8")
+    (queue / "session.json").write_text("{}", encoding="utf-8")
+    failed = queue / "_failed"; failed.mkdir()
+    (failed / "poison.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(status, "unit_state", lambda unit: "inactive")
+    result = status.load(profile, "xiaoai", paths)
+    assert result["profile"] == "xiaoai"
+    assert result["queue_backlog"] == len(list(queue.glob("*.json"))) == 2
+    assert result["queue_failed"] == 1

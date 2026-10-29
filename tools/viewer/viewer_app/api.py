@@ -7,6 +7,7 @@ from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 
+from .config import resolve_paths
 from .sources import seeds, status, thoughts
 
 
@@ -27,8 +28,12 @@ class ReadOnlyApi:
     def __init__(self, profile: str, home: Path) -> None:
         self.profile = profile
         self.home = home
-        self.thought_log = home / "autonomy_data" / "thoughts.log"
-        self.seed_db = home / "seed_data" / "seeds" / "seeds.db"
+        paths = resolve_paths(home)
+        self.paths = paths
+        self.autonomy_db = paths["autonomy_db"]
+        self.thought_log = paths["thought_log"]
+        self.seed_db = paths["seed_db"]
+        self.queue = paths["queue"]
 
     def route(self, path: str, query: dict[str, list[str]]) -> tuple[int, str, bytes]:
         if path == "/api/thoughts":
@@ -46,5 +51,5 @@ class ReadOnlyApi:
                 )
             )
         if path == "/api/status":
-            return json_response(status.load(self.home, self.profile))
+            return json_response(status.load(self.home, self.profile, self.paths))
         return json_response({"error": "not found"}, HTTPStatus.NOT_FOUND)

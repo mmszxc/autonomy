@@ -38,6 +38,6 @@ def test_http_auth_static_headers_and_traversal(profile: Path, monkeypatch) -> N
             assert "script-src 'self'" in response.headers["Content-Security-Policy"]
         assert payload["seed_total"] == 2
         with urllib.request.urlopen(base + "/?token=viewer-passphrase", timeout=3) as response:
-            assert b"XIAOZHI" in response.read()
+            assert b'id="hudTitle"' in response.read()
     finally:
         server.shutdown();server.server_close();thread.join(timeout=3)

@@ -55,15 +55,10 @@ def unit_state(unit: str) -> str:
         return "unknown"
 
 
-def _autonomy(home: Path) -> tuple[dict[str, int], dict[str, Any], list[str]]:
+def _autonomy(database: Path) -> tuple[dict[str, int], dict[str, Any], list[str]]:
     usage = {"calls": 0, "tokens": 0, "prompt": 0}
     circuit: dict[str, Any] = {"state": "unknown", "failures": 0, "blocked": False}
     errors: list[str] = []
-    directory = home / "autonomy_data"
-    database = next(
-        (path for path in (directory / "autonomy.db", directory / "state.db") if path.is_file()),
-        directory / "autonomy.db",
-    )
     if not database.is_file():
         return usage, circuit, ["autonomy 状态库不存在"]
     try:
@@ -80,30 +75,40 @@ def _autonomy(home: Path) -> tuple[dict[str, int], dict[str, Any], list[str]]:
     return usage, circuit, errors
 
 
-def load(home: Path, profile: str) -> dict[str, Any]:
-    usage, circuit, errors = _autonomy(home)
+def load(home: Path, profile: str, paths: dict[str, Path] | None = None) -> dict[str, Any]:
+    paths = paths or {
+        "autonomy_db": home / "autonomy_data" / "autonomy.db",
+        "seed_db": home / "seed_data" / "seeds" / "seeds.db",
+        "queue": home / "seed_data" / "seed_queue",
+    }
+    usage, circuit, errors = _autonomy(paths["autonomy_db"])
     seed_total = 0
-    seed_db = home / "seed_data" / "seeds" / "seeds.db"
+    seed_db = paths["seed_db"]
     if seed_db.is_file():
         try:
             with connect(seed_db) as connection:
                 seed_total = int(connection.execute("SELECT COUNT(*) FROM seeds").fetchone()[0])
         except (OSError, sqlite3.Error):
             errors.append("种子总数读取失败")
-    queue = home / "seed_data" / "seed_queue"
+    queue = paths["queue"]
+    failed = queue / "_failed"
     try:
-        backlog = sum(path.is_file() for path in queue.iterdir()) if queue.is_dir() else 0
+        backlog = sum(path.is_file() and path.suffix == ".json" for path in queue.iterdir()) if queue.is_dir() else 0
+        failed_count = sum(path.is_file() for path in failed.iterdir()) if failed.is_dir() else 0
     except OSError:
         backlog = 0
+        failed_count = 0
         errors.append("队列读取失败")
     limits = _limits(home / "config.yaml")
     return {
+        "profile": safe_text(profile),
         "timer": safe_text(unit_state(f"{profile}-autonomy.timer")),
         "runner": safe_text(unit_state(f"{profile}-autonomy.service")),
         "budget": {key: {"used": usage[key], "limit": limits[key]} for key in usage},
         "circuit": circuit,
         "seed_total": seed_total,
         "queue_backlog": backlog,
+        "queue_failed": failed_count,
         "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "errors": errors,
     }
