@@ -108,13 +108,22 @@ Ubuntu 24 测试机使用 Hermes 自带 CPython 3.14，并把 pytest 与 PyYAML 
 
 测试目录随后已删除，没有修改目标 profile 的生产依赖、配置或数据。
 
-Windows 本机结果：
+Windows 本机结果（本轮增量）：
 
 ```text
-118 passed, 1 skipped in 5.88s
+119 passed, 1 skipped in 6.21s
 ```
 
 跳过项为 Linux 专有行为；没有弱化断言。
+
+### 2026-10-29 增量发布复核
+
+- 同步最新 `runner.py`、`prompt.py`、`seed_memory/worker.py` 与资源治理测试；公开副本仅保留必要的通用路径和导入适配。
+- `worker.py` 已包含运行路径初始化及 profile `.env` 安全加载逻辑：不覆盖已有环境变量，也不记录变量值。
+- timer 模板更新为每小时第 00、20 分钟触发，随机延迟上限为 30 秒。
+- 示例默认预算更新为每日 500 次调用、1 亿总 token、1 亿 prompt token。
+- 双反斜杠、内网地址、本机用户名/盘符、SSH 私钥名与常见密钥格式扫描未发现风险内容；`.gitignore` 中仅保留必要的敏感文件忽略规则。
+- `git diff --check` 与公开仓库完整 pytest 均通过。
 
 明确排除的过时测试：
 

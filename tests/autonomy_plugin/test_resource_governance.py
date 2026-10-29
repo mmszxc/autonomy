@@ -1,6 +1,12 @@
 import os
+import json
 import signal
 from pathlib import Path
+
+import sys
+
+ROOT = Path(__file__).parents[2]
+sys.path.insert(0, str(ROOT))
 
 from plugins.autonomy.prompt import build_tick_prompt
 from plugins.autonomy.runner import Runner
@@ -49,6 +55,23 @@ def test_prefetch_process_group_is_platform_supported():
     assert hasattr(os, "killpg") or os.name == "nt"
     if os.name != "nt":
         assert signal.SIGKILL
+
+
+def test_completed_autonomy_turn_enqueues_standard_ended_session(tmp_path, monkeypatch):
+    home = tmp_path / "profile"
+    worker = home / "plugins" / "seed_memory" / "worker.py"
+    worker.parent.mkdir(parents=True); worker.write_text("# worker", encoding="utf-8")
+    r = _runner(); r.hermes_home = str(home)
+    calls = []
+    monkeypatch.setattr(runner_module.subprocess, "Popen", lambda *a, **kw: calls.append((a, kw)))
+    result = r._enqueue_completed_turn("run1", {"title": "visible"}, "assistant output")
+    queued = home / "seed_data" / "seed_queue" / "session_autonomy_run1.json"
+    assert result["queued"] is True and queued.is_file()
+    payload = json.loads(queued.read_text(encoding="utf-8"))
+    assert payload["status"] == "ended"
+    assert payload["messages"][0]["role"] == "user"
+    assert payload["messages"][1] == {"role": "assistant", "content": "assistant output"}
+    assert calls and calls[0][0][0][-1] == "--once"
 
 
 def test_memory_max_compatibility_hook_does_not_apply_rlimit_as(monkeypatch):

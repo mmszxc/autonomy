@@ -105,7 +105,9 @@ def test_config_example_yaml_values():
     assert cfg["quiet_s"] == 300
 
     limits = cfg["limits"]
-    assert limits["daily_tokens"] == 2000000
+    assert limits["daily_tokens"] == 100000000
+    assert limits["daily_calls"] == 500
+    assert limits["daily_prompt_tokens"] == 100000000
     assert limits["circuit_threshold"] == 3
     assert limits["circuit_cooldown_s"] == 1800
     assert limits["memory_max"] == "1G"
@@ -124,10 +126,10 @@ def test_config_example_yaml_key_order_and_chinese_comments():
         "quiet_s",
         "limits",
     ]
-    assert list(cfg["limits"].keys()) == ["daily_tokens", "circuit_threshold", "circuit_cooldown_s", "memory_max"]
+    assert list(cfg["limits"].keys()) == ["daily_tokens", "daily_calls", "daily_prompt_tokens", "circuit_threshold", "circuit_cooldown_s", "memory_max"]
     for key in ("model", "memory_provider", "in_process_loop", "data_dir", "thought_log", "quiet_s", "limits"):
         assert _comment_above(text, key), f"{key} 上方缺少中文注释"
-    for key in ("daily_tokens", "circuit_threshold", "circuit_cooldown_s", "memory_max"):
+    for key in ("daily_tokens", "daily_calls", "daily_prompt_tokens", "circuit_threshold", "circuit_cooldown_s", "memory_max"):
         assert _comment_above(text, key), f"limits.{key} 上方缺少中文注释"
 
 

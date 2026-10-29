@@ -2,8 +2,8 @@
 Description=Run Hermes autonomy hourly for <PROFILE>
 
 [Timer]
-OnCalendar=*-*-* *:20:00
-RandomizedDelaySec=120
+OnCalendar=*-*-* *:00/20:00
+RandomizedDelaySec=30
 Persistent=false
 Unit=xiaozhi-autonomy.service
 

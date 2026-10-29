@@ -97,7 +97,7 @@ class Runner:
         db,
         budget,
         circuit,
-        stop_file="/var/lib/hermes/autonomy_data/STOP_AUTONOMY",
+        stop_file="/var/lib/hermes/STOP_AUTONOMY",
         llm=None,
         gateway=None,
         lock_path=None,
@@ -192,6 +192,50 @@ class Runner:
         if result.get("text"):
             return result
         return {"text": "", "error": result.get("error", "transcript unavailable")}
+
+    def _enqueue_completed_turn(self, run_id, summary, assistant_text):
+        """Bridge standalone autonomy ticks into seed_memory's queue protocol.
+
+        Gateway-driven ticks do not reach Hermes' normal turn finalizer, so its
+        ``sync_turn`` hook is never called.  Write the same ended-session JSON
+        shape that seed_memory consumes, then invoke its detached worker.  Queue
+        creation must never turn an otherwise successful thought into a failure.
+        """
+        queue_dir = Path(self.hermes_home) / "seed_data" / "seed_queue"
+        worker = Path(self.hermes_home) / "plugins" / "seed_memory" / "worker.py"
+        if not worker.is_file():
+            return {"queued": False, "reason": "worker_missing"}
+        try:
+            queue_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            user_visible = summary.get("raw_text") if isinstance(summary, dict) else ""
+            if not user_visible:
+                user_visible = json.dumps(summary or {}, ensure_ascii=False)
+            payload = {
+                "session_id": "autonomy_" + run_id,
+                "created_at": time.time(), "updated_at": time.time(),
+                "status": "ended", "processed_turns": 0, "retries": 0,
+                "messages": [
+                    {"role": "user", "content": "自主思考轮摘要：" + str(user_visible)[:4000]},
+                    {"role": "assistant", "content": str(assistant_text or "")[:16000]},
+                ],
+            }
+            target = queue_dir / ("session_autonomy_" + run_id + ".json")
+            tmp = target.with_name(target.name + ".%d.tmp" % os.getpid())
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            os.chmod(tmp, 0o600); os.replace(tmp, target); os.chmod(target, 0o600)
+            env = os.environ.copy(); env["HERMES_HOME"] = str(self.hermes_home)
+            # Preserve worker diagnostics next to the queue; discarding stderr
+            # makes a queued-but-never-consumed session impossible to diagnose.
+            worker_log = queue_dir / "worker.log"
+            log_handle = open(worker_log, "ab", buffering=0)
+            kwargs = {"cwd": str(worker.parent.parent), "env": env, "stdin": subprocess.DEVNULL,
+                      "stdout": log_handle, "stderr": log_handle}
+            if os.name != "nt": kwargs["start_new_session"] = True
+            subprocess.Popen([sys.executable, str(worker), "--once"], **kwargs)
+            log_handle.close()
+            return {"queued": True, "path": str(target)}
+        except Exception as exc:
+            return {"queued": False, "reason": type(exc).__name__}
 
     def _bound_prefetch_text(self, text):
         """Deduplicate seed records and bound each summary and the whole injection."""
@@ -579,6 +623,12 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                     self.db.append_event(run_id=run, goal_id=goal_id, kind="transcript", exit_reason="ok", summary=transcript_meta[1:][:1200])
                 elif transcript.get("error"):
                     self.db.append_event(run_id=run, goal_id=goal_id, kind="transcript", exit_reason="unavailable", summary=str(transcript["error"])[:1200])
+                queue_result = self._enqueue_completed_turn(run, summary, transcript_text)
+                self.db.append_event(
+                    run_id=run, goal_id=goal_id, kind="seed_queue",
+                    exit_reason="queued" if queue_result.get("queued") else "degraded",
+                    summary=str(queue_result.get("path") or queue_result.get("reason") or "unknown")[:1200],
+                )
                 append_thought_log(
                     self.thought_log_path,
                     run_id=run,

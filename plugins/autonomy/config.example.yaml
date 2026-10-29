@@ -18,7 +18,12 @@ autonomy:
   # 宽松熔断额度：只约束资源，不约束思考内容与输出格式
   limits:
     # 单日 token 预算；0 或负数表示不限
-    daily_tokens: 2000000
+    # 每日 token 上限
+    daily_tokens: 100000000
+    # 每日模型调用次数上限
+    daily_calls: 500
+    # 每日 prompt token 上限
+    daily_prompt_tokens: 100000000
     # 连续失败达到该次数即打开熔断
     circuit_threshold: 3
     # 熔断打开后的冷却秒数；冷却结束后允许一次半开探测

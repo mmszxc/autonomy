@@ -15,6 +15,13 @@ from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(PLUGIN_DIR.parent))
+for vendor in (PLUGIN_DIR / "_vendor", PLUGIN_DIR / "_vendor_ml"):
+    if vendor.is_dir() and str(vendor) not in sys.path:
+        sys.path.insert(0, str(vendor))
+# Hermes CLI's bundled runtime owns ruamel.yaml and related runtime modules.
+for runtime_site in (Path.home() / ".hermes" / "installs").glob("*/pm-runtime/generations/*/lib/python*/site-packages"):
+    if runtime_site.is_dir() and str(runtime_site) not in sys.path:
+        sys.path.insert(0, str(runtime_site))
 
 
 def main():
@@ -23,6 +30,24 @@ def main():
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s", stream=sys.stdout, force=True)
     home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")).expanduser().resolve()
+    # Direct workers do not pass through the Hermes CLI profile bootstrap.
+    # Load the profile's local .env without logging values, while preserving
+    # explicitly supplied service environment variables.
+    env_file = home / ".env"
+    if env_file.is_file():
+        for line in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key and key.replace("_", "").isalnum():
+                os.environ.setdefault(key, value.strip().strip("\"'"))
+    # Standalone tools Python needs the local Hermes Agent source for the
+    # MemoryProvider base class imported by seed_memory.
+    agent_root = Path.home() / ".hermes" / "hermes-agent"
+    if agent_root.is_dir() and str(agent_root) not in sys.path:
+        sys.path.insert(0, str(agent_root))
     mod = importlib.import_module("seed_memory")
     provider = mod.SeedMemoryProvider()
     provider.initialize("detached-worker", hermes_home=str(home), start_worker=False)

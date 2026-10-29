@@ -30,16 +30,16 @@ ordering True
 
 ## 每小时自动思考定时器
 
-在 目标服务器 上，`xiaozhi` 使用 hermes 用户级 systemd 定时器，每小时约在第 20 分钟触发一次（带最多 120 秒随机延迟）：
+目标 profile 可使用 hermes 用户级 systemd 定时器，每小时在第 00 和 20 分钟附近触发（最多 30 秒随机延迟）：
 
 - 单元位置：`~/.config/systemd/user/xiaozhi-autonomy.service` 与 `xiaozhi-autonomy.timer`
-- 服务执行：`hermes -p xiaozhi autonomy tick --hermes-home /home/hermes/.hermes/profiles/xiaozhi`
+- 服务执行：`hermes -p <PROFILE> autonomy tick --hermes-home <HERMES_HOME>`
 - 查看定时器：`systemctl --user list-timers --all`
 - 查看状态：`hermes -p xiaozhi autonomy status`
 - 查看最近思考：`hermes -p xiaozhi autonomy log -n 1`
 - 关闭：`systemctl --user disable --now xiaozhi-autonomy.timer`
 - 重新开启：`systemctl --user enable --now xiaozhi-autonomy.timer`
 
-服务必须显式传入 `--hermes-home`：systemd 用户服务没有交互式 shell 上下文，仅传 `-p xiaozhi` 时，当前版本的 autonomy CLI 可能拿到空的 `hermes_home` 并报 `NoneType`。该参数也确保插件使用 xiaozhi profile，而非误落到默认 profile。当前版本在显式传参后实际使用的运行目录是 `<profile>/autonomy/`；它与 config 中历史设置的 `<profile>/autonomy_data/` 不一致，需在后续插件版本中统一，运维排查时以 `hermes -p xiaozhi autonomy tick --hermes-home ... --dry-run` 输出为准。
+服务应显式传入 `--hermes-home`：systemd 用户服务没有交互式 shell 上下文，显式传入可以避免 profile 解析歧义，并确保插件使用目标 profile。运行目录以配置中的 `data_dir` 为准。
 
-该定时器不创建系统级 service，不写入密钥，也不会修改 `default` profile。目标服务器 上 hermes 用户已启用 `linger=yes`，因此重启后用户级 systemd 与定时器会自动恢复；可用 `systemctl --user is-enabled xiaozhi-autonomy.timer` 和 `systemctl --user is-active xiaozhi-autonomy.timer` 检查。
+该定时器不创建系统级 service，不写入密钥，也不会修改其他 profile。若用户级 systemd 已启用 linger，重启后定时器会自动恢复；可用 `systemctl --user is-enabled <PROFILE>-autonomy.timer` 和 `systemctl --user is-active <PROFILE>-autonomy.timer` 检查。

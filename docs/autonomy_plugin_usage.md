@@ -105,8 +105,8 @@ ExecStart=/var/lib/hermes/app/venv/bin/hermes autonomy tick
 
 ```ini
 [Timer]
-OnCalendar=*-*-* *:20:00
-RandomizedDelaySec=120
+OnCalendar=*-*-* *:00/20:00
+RandomizedDelaySec=30
 Persistent=false
 ```
 
