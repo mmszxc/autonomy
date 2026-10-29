@@ -127,6 +127,16 @@ def _resolve_provider_details(
                 str(entry.get("api") or entry.get("base_url") or "").strip(),
                 str(entry.get("key_env") or entry.get("api_key_env") or "").strip(),
             )
+    custom_providers = raw_cfg.get("custom_providers") or []
+    if isinstance(custom_providers, list):
+        for entry in custom_providers:
+            if not isinstance(entry, dict) or str(entry.get("name") or "").strip() not in {prov, short_key}:
+                continue
+            return (
+                str(entry.get("name") or prov or short_key).strip(),
+                str(entry.get("api") or entry.get("base_url") or "").strip(),
+                str(entry.get("key_env") or entry.get("api_key_env") or "").strip(),
+            )
     model_sec = raw_cfg.get("model") or {}
     if isinstance(model_sec, dict):
         return (

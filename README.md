@@ -132,7 +132,7 @@ python3 tools/viewer/viewer.py --profile xiaozhi
 python3 tools/viewer/viewer.py --profile xiaozhi --token '自行生成的长随机口令'
 ```
 
-客户端可用 `Authorization: Bearer <口令>`，浏览器也可在 URL 查询参数中传入 `token`。查询参数可能被浏览器历史记录保存，优先使用反向代理或 Bearer header。数据接口为 `/api/thoughts?n=20`、`/api/seeds?limit=20&q=` 和 `/api/status`，页面每 15 秒自动刷新。生产部署前请确认端口未被占用，并结合主机防火墙限制来源地址。
+客户端可用 `Authorization: Bearer <口令>`，浏览器也可在 URL 查询参数中传入 `token`。查询参数可能被浏览器历史记录保存，优先使用反向代理或 Bearer header。数据接口为 `/api/thoughts?n=20`、`/api/seeds?limit=20&q=` 和 `/api/status`；页面不会自动轮询，仅在首次打开、切换标签或点击“刷新”时读取数据。生产部署前请确认端口未被占用，并结合主机防火墙限制来源地址。
 
 ## 示例身份文件
 

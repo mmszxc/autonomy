@@ -17,9 +17,11 @@ def _reset_address_space_limit():
 
 
 class CliGateway:
-    def __init__(self, hermes_bin="hermes", max_turns=30, run_budget=2400, profile=None):
+    def __init__(self, hermes_bin="hermes", max_turns=30, run_budget=2400, profile=None, model=None, provider=None):
         self.hermes_bin = os.environ.get("AUTONOMY_HERMES_BIN", hermes_bin)
         self.profile = profile
+        self.model = str(model or "").strip()
+        self.provider = str(provider or "").strip()
         self.max_turns = int(max_turns)
         self.run_budget = int(run_budget)
         self.runs = {}
@@ -29,7 +31,12 @@ class CliGateway:
         cmd = [self.hermes_bin]
         if self.profile:
             cmd.extend(["-p", self.profile])
-        cmd.extend(["chat", "--query-file", "-", "--oneshot", "--quiet", "--yolo", "--accept-hooks", "--max-turns", str(self.max_turns), "--run-budget", str(self.run_budget)])
+        cmd.append("chat")
+        if self.model:
+            cmd.extend(["--model", self.model])
+        if self.provider:
+            cmd.extend(["--provider", self.provider])
+        cmd.extend(["--query-file", "-", "--oneshot", "--quiet", "--yolo", "--accept-hooks", "--max-turns", str(self.max_turns), "--run-budget", str(self.run_budget)])
         kwargs = {"stdin": subprocess.PIPE, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": True, "errors": "replace"}
         if os.name == "nt": kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         else:

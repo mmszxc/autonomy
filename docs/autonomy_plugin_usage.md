@@ -44,6 +44,36 @@ autonomy:
 
 代码仍兼容旧 schema（仅用于读取既有部署）：`enabled`、`model.inherit`、`memory.provider`、`budget.daily_tokens`、`circuit.failure_threshold`/`cooldown_seconds`、`resources`、`paths`。新配置写入不应再生成这些旧嵌套键。
 
+## 双模型/双密钥配置
+
+主对话与自主思考可以使用不同的模型、provider 和环境变量密钥。密钥值只放在 profile 的 `.env`，配置文件只引用变量名：
+
+```yaml
+model:
+  default: <MAIN_MODEL>
+  provider: main-provider
+
+custom_providers:
+  - name: main-provider
+    provider: custom
+    base_url: https://<ENDPOINT>/v1
+    key_env: HERMES_<HOST>_API_KEY_MAIN
+    model: <MAIN_MODEL>
+  - name: autonomy-provider
+    provider: custom
+    base_url: https://<ENDPOINT>/v1
+    key_env: HERMES_<HOST>_API_KEY_AUTONOMY
+    model: <AUTONOMY_MODEL>
+
+autonomy:
+  transport: cli
+  model:
+    model: <AUTONOMY_MODEL>
+    provider: autonomy-provider
+```
+
+`autonomy.model` 为对象时，CLI 自主轮会传递显式的 `--model` 和 `--provider`，Hermes 再从对应 `custom_providers` 条目读取 `key_env`。设为字符串时只传 `--model`，不会擅自复用或改写 provider；设为 `null` 时继承主模型，CLI 命令保持原样。主模型与自主模型不同即为 `parallel` 模式。修改后应分别做两个模型的最小请求，再手动执行一轮 `hermes autonomy tick`；任何输出都不应包含密钥值。
+
 ## CLI 命令
 
 在 参考部署 上使用 Hermes 虚拟环境的绝对路径，并以 `hermes` 运行：

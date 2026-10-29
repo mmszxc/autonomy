@@ -137,8 +137,10 @@ def test_config_example_yaml_key_order_and_chinese_comments():
 def test_config_example_has_no_real_keys():
     text = CONFIG_EXAMPLE_YAML.read_text(encoding="utf-8")
     lowered = text.lower()
-    for marker in ("sk-", "api_key", "password", "bearer "):
+    for marker in ("sk-", "password", "bearer "):
         assert marker not in lowered
+    assert "HERMES_<HOST>_API_KEY_MAIN" in text
+    assert "HERMES_<HOST>_API_KEY_AUTONOMY" in text
 
 
 # ------------------------------------------------- 插件目录 .py 守卫标记

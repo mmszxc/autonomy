@@ -1,5 +1,21 @@
 # autonomy 配置示例：把 autonomy 段并入 Hermes 的配置/档案即可生效。
 # 这里只放行为与额度参数，绝不放任何密钥（密钥仍由 Hermes 的 provider 配置管理）。
+# 双模型/双密钥示例（取消注释后按部署替换占位符）：
+# model:
+#   default: <MAIN_MODEL>
+#   provider: main-provider
+# custom_providers:
+#   - name: main-provider
+#     provider: custom
+#     base_url: https://<ENDPOINT>/v1
+#     key_env: HERMES_<HOST>_API_KEY_MAIN
+#     model: <MAIN_MODEL>
+#   - name: autonomy-provider
+#     provider: custom
+#     base_url: https://<ENDPOINT>/v1
+#     key_env: HERMES_<HOST>_API_KEY_AUTONOMY
+#     model: <AUTONOMY_MODEL>
+# autonomy.model 也可写成：{model: <AUTONOMY_MODEL>, provider: autonomy-provider}
 autonomy:
   # 自主思考使用的模型；null 表示继承 Hermes 主模型（只有一个模型时对话优先）
   model: null

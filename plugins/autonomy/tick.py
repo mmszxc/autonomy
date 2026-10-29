@@ -102,19 +102,22 @@ def main(argv=None, *, hermes_home=None):
         cooldown_s=os.environ.get("AUTONOMY_CIRCUIT_COOLDOWN_S") or circuit_cfg.get("cooldown_seconds"),
     )
 
-    gw_model = None if auto_model.get("inherit", True) else auto_model.get("model")
-    gw_provider = None if auto_model.get("inherit", True) else auto_model.get("provider")
+    inherit_model = auto_model.get("inherit", True)
+    gw_model = None if inherit_model else auto_model.get("model")
+    configured_auto_model = auto_cfg.get("model")
+    provider_explicit = isinstance(configured_auto_model, dict) and bool(configured_auto_model.get("provider"))
+    gw_provider = auto_model.get("provider") if not inherit_model and provider_explicit else None
     transport = str(auto_cfg.get("transport") or "auto").lower()
     gw = GatewayClient(model=gw_model, provider=gw_provider)
     if transport == "cli":
         from .cli_transport import CliGateway
-        gw = CliGateway(max_turns=int(limits_cfg.get("max_turns") or 30), run_budget=int(run_max_seconds), profile=Path(hermes_home).name)
+        gw = CliGateway(max_turns=int(limits_cfg.get("max_turns") or 30), run_budget=int(run_max_seconds), profile=Path(hermes_home).name, model=gw_model, provider=gw_provider)
     elif transport == "auto":
         try:
             gw._req("GET", "/health")
         except Exception:
             from .cli_transport import CliGateway
-            gw = CliGateway(max_turns=int(limits_cfg.get("max_turns") or 30), run_budget=int(run_max_seconds), profile=Path(hermes_home).name)
+            gw = CliGateway(max_turns=int(limits_cfg.get("max_turns") or 30), run_budget=int(run_max_seconds), profile=Path(hermes_home).name, model=gw_model, provider=gw_provider)
 
     r = Runner(
         db,
