@@ -231,9 +231,24 @@ class Runner:
             kwargs = {"cwd": str(worker.parent.parent), "env": env, "stdin": subprocess.DEVNULL,
                       "stdout": log_handle, "stderr": log_handle}
             if os.name != "nt": kwargs["start_new_session"] = True
-            subprocess.Popen([sys.executable, str(worker), "--once"], **kwargs)
-            log_handle.close()
-            return {"queued": True, "path": str(target)}
+            # A systemd oneshot service kills its remaining cgroup when tick
+            # returns. Wait for queue drain here so the worker is not orphaned
+            # halfway through an embedding/model request.
+            proc = subprocess.Popen([sys.executable, str(worker), "--once"], **kwargs)
+            try:
+                returncode = proc.wait(timeout=300)
+            except subprocess.TimeoutExpired:
+                if os.name != "nt":
+                    try: os.killpg(proc.pid, signal.SIGTERM)
+                    except OSError: pass
+                else:
+                    proc.terminate()
+                try: proc.wait(timeout=10)
+                except subprocess.TimeoutExpired: proc.kill()
+                return {"queued": True, "path": str(target), "worker": "timeout"}
+            finally:
+                log_handle.close()
+            return {"queued": True, "path": str(target), "worker": "ok" if returncode == 0 else "exit_%s" % returncode}
         except Exception as exc:
             return {"queued": False, "reason": type(exc).__name__}
 

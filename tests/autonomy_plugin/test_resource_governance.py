@@ -63,7 +63,12 @@ def test_completed_autonomy_turn_enqueues_standard_ended_session(tmp_path, monke
     worker.parent.mkdir(parents=True); worker.write_text("# worker", encoding="utf-8")
     r = _runner(); r.hermes_home = str(home)
     calls = []
-    monkeypatch.setattr(runner_module.subprocess, "Popen", lambda *a, **kw: calls.append((a, kw)))
+    class FakeProcess:
+        pid = 123
+        def wait(self, timeout=None): return 0
+    def fake_popen(*a, **kw):
+        calls.append((a, kw)); return FakeProcess()
+    monkeypatch.setattr(runner_module.subprocess, "Popen", fake_popen)
     result = r._enqueue_completed_turn("run1", {"title": "visible"}, "assistant output")
     queued = home / "seed_data" / "seed_queue" / "session_autonomy_run1.json"
     assert result["queued"] is True and queued.is_file()
