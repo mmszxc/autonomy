@@ -152,10 +152,12 @@ def test_status_uses_read_only_state_and_reports_timer_budget_queue(tmp_path: Pa
     seed_db = home / "seed_data" / "seeds" / "seeds.db"
     before = (_digest(state_db), _digest(seed_db))
     monkeypatch.setattr(viewer, "_timer_status", lambda profile: "active")
+    monkeypatch.setattr(viewer, "_runner_status", lambda profile: "activating")
 
     result = viewer.load_status(home, "xiaozhi")
 
     assert result["timer"] == "active"
+    assert result["runner"] == "activating"
     assert result["budget"]["calls"] == {"used": 7, "limit": 500}
     assert result["budget"]["tokens"] == {"used": 1234, "limit": 100_000_000}
     assert result["circuit"] == {"failures": 2, "state": "open", "blocked": False}
@@ -204,3 +206,20 @@ def test_default_paths_and_cli_are_zero_dependency(tmp_path: Path, monkeypatch: 
     assert args.port == 8765
     assert args.profile == "xiaozhi"
     assert viewer.safe_text('<img src=x onerror="alert(1)">') == "&lt;img src=x onerror=&quot;alert(1)&quot;&gt;"
+
+
+def test_hud_ui_is_offline_responsive_and_motion_safe() -> None:
+    page = viewer.INDEX_HTML
+    assert "XIAOZHI · 自主意识监控" in page
+    assert "#050b14" in page and "#00e5ff" in page
+    assert 'id="stars"' in page and 'id="core"' in page
+    assert "conic-gradient" in page
+    assert "思考流" in page and "种子星图" in page
+    assert "prefers-reduced-motion" in page
+    assert "visibilitychange" in page
+    assert "setInterval(refresh,15000)" in page
+    assert "thoughtNodes=new Map" in page and "seedNodes=new Map" in page
+    assert "typeTerminal" in page and "requestAnimationFrame" in page
+    assert "textContent" in page
+    assert "https://" not in page and "http://" not in page
+    assert "<link " not in page and "<script src=" not in page
