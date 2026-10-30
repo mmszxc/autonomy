@@ -11,4 +11,18 @@ Hermes Agent 的结构化长期记忆插件：将会话经历保存为带情绪�
 - 队列单文件连续失败超过阈值后移入 `_failed/`，保留 `last_error` 供诊断，不阻塞后续文件。
 - 本地 embedding 不可用时回退到重要度与时效排序。
 
+## Tagger 稳定性配置
+
+以下配置默认启用：
+
+```yaml
+memory:
+  seed_memory:
+    tagger_retries: 3          # 2s、6s、15s，并附加不超过 0.5s 的抖动
+    tagger_serialize: true     # 跨 profile 串行调用 tagger
+    tagger_lock_timeout_s: 120
+```
+
+串行锁由 profile 路径推导到共享 Hermes 主目录的 `_shared/tagger.lock`，共享目录权限为 `0700`。锁超时以及 5xx、连接类瞬态错误会保留队列文件供下一轮重试，不会立即移入 `_failed/`。
+
 运行数据、模型、密钥和 profile 配置不属于公开仓库内容。
