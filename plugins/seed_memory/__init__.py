@@ -8,6 +8,8 @@ import hashlib
 import logging
 import os
 import re
+import sqlite3
+import unicodedata
 from contextlib import contextmanager
 import time
 import sys
@@ -43,6 +45,17 @@ def _is_blocking_auth_error(exc: BaseException) -> bool:
     text = str(exc).lower()
     markers = ("authentication", "unauthorized", "forbidden", "invalid api key", "api key", "model not found", "not found")
     return any(marker in name or marker in text for marker in markers)
+
+
+def _summary_hash(value: Any) -> str:
+    """Return a stable duplicate-detection key for a seed summary."""
+    normalized = unicodedata.normalize("NFKC", str(value or "")).lower()
+    normalized = "".join(
+        char
+        for char in normalized
+        if not char.isspace() and not unicodedata.category(char).startswith("P")
+    )
+    return hashlib.sha1(normalized.encode("utf-8")).hexdigest()
 
 
 def _safe_session_name(value: str) -> str:
@@ -304,6 +317,8 @@ class SeedMemoryProvider(MemoryProvider):
                 value_aligned=list(args.get("value_aligned") or []),
                 value_conflicted=list(args.get("value_conflicted") or []),
                 seeds_planted=list(args.get("seeds_planted") or []),
+                caused_by=list(args.get("caused_by") or []),
+                led_to=list(args.get("led_to") or []),
                 importance=float(args.get("importance", 0.5)),
             )
             if not seed.summary or not seed.emotion.primary:
@@ -508,8 +523,60 @@ class SeedMemoryProvider(MemoryProvider):
         pair=list(messages or []); n=max(1,int(max_turns))*2
         return [pair[i:i+n] for i in range(0,len(pair),n)]
 
+    def _dedup_seeds(self, seeds: Iterable[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
+        """Filter exact-normalized summary duplicates before writing to the store."""
+        existing_hashes = set()
+        db_path = Path(self._store.DB_PATH)
+        if db_path.exists():
+            try:
+                db_uri = f"file:{db_path.as_posix()}?mode=ro"
+                with sqlite3.connect(db_uri, uri=True) as conn:
+                    existing_hashes = {
+                        _summary_hash(row[0])
+                        for row in conn.execute("SELECT summary FROM seeds")
+                        if str(row[0] or "").strip()
+                    }
+            except sqlite3.Error as exc:
+                logger.warning("dedup database read failed; retaining candidates: %s", exc)
+
+        unique: List[Dict[str, Any]] = []
+        seen_hashes = set(existing_hashes)
+        duplicate = 0
+        rejected = 0
+        for seed in seeds:
+            summary = seed.get("summary") if isinstance(seed, dict) else getattr(seed, "summary", None)
+            if not str(summary or "").strip():
+                rejected += 1
+                continue
+            summary_hash = _summary_hash(summary)
+            if summary_hash in seen_hashes:
+                duplicate += 1
+                continue
+            seen_hashes.add(summary_hash)
+            unique.append(seed)
+
+        stats = {"inserted": len(unique), "duplicate": duplicate, "rejected": rejected}
+        try:
+            stats_path = self._queue_dir / "stats.json"
+            tmp_path = stats_path.with_name(stats_path.name + ".tmp")
+            payload = {**stats, "updated_at": time.time()}
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+            os.replace(tmp_path, stats_path)
+        except OSError as exc:
+            logger.warning("dedup stats write failed: %s", exc)
+        logger.info(
+            "dedup inserted=%d duplicate=%d rejected=%d",
+            stats["inserted"],
+            stats["duplicate"],
+            stats["rejected"],
+        )
+        return unique, stats
+
     def _drain_queue(self) -> None:
-        queue_files = list(self._queue_dir.glob("*.json")) if self._queue_dir else []
+        # Only transcript sessions belong to the drain queue.  stats.json and
+        # other operational sidecars must never inflate worker counters.
+        queue_files = list(self._queue_dir.glob("session_*.json")) if self._queue_dir else []
         logger.info("drain start queue_dir=%s write_enabled=%s queue_file_count=%d", self._queue_dir, self._writes_enabled(), len(queue_files))
         if self._user_active():
             logger.info("drain skip reason=user_active")
@@ -520,7 +587,7 @@ class SeedMemoryProvider(MemoryProvider):
         import time
         now = time.time(); started = time.monotonic(); processed_files = 0; inspected_files = 0; skipped_files = 0; backlog_files = 0
         max_files = int(self._config.get("max_files", 6)); max_duration = float(self._config.get("max_duration_s", 540))
-        for path in sorted(self._queue_dir.glob("*.json"), key=lambda p: p.stat().st_mtime):
+        for path in sorted(self._queue_dir.glob("session_*.json"), key=lambda p: p.stat().st_mtime):
             inspected_files += 1
             if self._user_active():
                 logger.info("drain skip reason=user_active"); break
@@ -575,10 +642,18 @@ class SeedMemoryProvider(MemoryProvider):
                     logger.info("drain skip reason=user_active path=%s", path.name); break
                 processed_files += 1
                 logger.info("drain processing path=%s turns=%d cursor=%d timeout_s=%s", path.name, len(messages) // 2, cursor, self._config.get("llm_timeout_s", self._config.get("tagger_timeout_seconds", 240)))
+                # Inject real seed IDs so the LLM can populate caused_by with
+                # references that actually exist.  The worker path was missing
+                # this, which is why caused_by stayed empty for queue-extracted
+                # seeds while only prefetch/tagger-direct seeds got edges.
+                try:
+                    recent_seeds = self._store.list_recent_seeds(limit=15)
+                except Exception:
+                    recent_seeds = []
                 from concurrent.futures import ThreadPoolExecutor
                 timeout_s = float(self._config.get("llm_timeout_s", self._config.get("tagger_timeout_seconds", 240)))
                 pool = ThreadPoolExecutor(max_workers=1)
-                future = pool.submit(lambda: self._tagger.extract_seeds(messages, self._llm_call, persist=False, session_id=str(payload.get("session_id", "unknown"))))
+                future = pool.submit(lambda: self._tagger.extract_seeds(messages, self._llm_call, persist=False, session_id=str(payload.get("session_id", "unknown")), recent_seeds=recent_seeds))
                 try:
                     seeds = future.result(timeout=timeout_s)
                     from hermes.emotion import tagger as _tagger
@@ -587,7 +662,7 @@ class SeedMemoryProvider(MemoryProvider):
                         logger.info("truncated response; retrying path=%s max_tokens=%d", path.name, retry_limit)
                         self._config["tagger_max_tokens"] = retry_limit
                         try:
-                            seeds = self._tagger.extract_seeds(messages, self._llm_call, persist=False, session_id=str(payload.get("session_id", "unknown")))
+                            seeds = self._tagger.extract_seeds(messages, self._llm_call, persist=False, session_id=str(payload.get("session_id", "unknown")), recent_seeds=recent_seeds)
                         finally:
                             self._config["tagger_max_tokens"] = old_limit
                     logger.info("drain model returned path=%s seeds=%d partial=%s elapsed=%.3fs", path.name, len(seeds or []), getattr(_tagger, "LAST_PARTIAL", False), time.monotonic() - started)
@@ -597,7 +672,21 @@ class SeedMemoryProvider(MemoryProvider):
                             if current.get("updated_at") != original_updated:
                                 logger.info("queue changed during drain; retaining %s", path.name)
                                 continue
-                            self._store.save_seeds(seeds)
+                            seeds, _dedup_stats = self._dedup_seeds(seeds)
+                            if seeds:
+                                self._store.save_seeds(seeds)
+                            # Reverse-link led_to: the LLM can name causes but not
+                            # consequences, so compute led_to from caused_by after
+                            # the fact.  This is what makes the causal graph
+                            # bidirectional instead of a forward-only chain.
+                            try:
+                                new_ids = [s.id for s in seeds]
+                                caused_by_map = {s.id: list(s.caused_by) for s in seeds}
+                                edges = self._store.backlink_led_to(new_ids, caused_by_map)
+                                if edges:
+                                    logger.info("led_to backlinked edges=%d path=%s", edges, path.name)
+                            except Exception as exc:
+                                logger.warning("led_to backlink failed path=%s type=%s", path.name, type(exc).__name__)
                             current["processed_turns"] = len(current.get("messages", [])) // 2
                             current["updated_at"] = time.time()
                             if current.get("status", "ended") == "ended" and current["processed_turns"] >= len(current.get("messages", [])) // 2:
@@ -668,7 +757,7 @@ class SeedMemoryProvider(MemoryProvider):
 
         backlog = 0
         if self._queue_dir:
-            for p in self._queue_dir.glob('*.json'):
+            for p in self._queue_dir.glob('session_*.json'):
                 try:
                     q=json.loads(p.read_text(encoding='utf-8')); backlog += int(q.get('processed_turns',0)) < (len(self._normalise_messages(q.get('messages'))) // 2)
                 except Exception: backlog += 1

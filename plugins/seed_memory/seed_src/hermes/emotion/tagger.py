@@ -4,7 +4,7 @@
 import json
 import logging
 import re
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from ..memory.schema import Seed, Emotion
 from ..memory.store import save_seed
@@ -13,6 +13,11 @@ from ..memory.retrieval import embed
 EXTRACT_PROMPT = """你是 Hermes 的内观意识。
 
 对话刚刚结束，你正在进行「内省与自省」——将这段经历（现行）凝结为 1~3 颗能够长存于记忆中的「种子」。
+
+【近期已有种子】（按时间倒序，供你判断因果关联）
+---
+{recent_seeds}
+---
 
 【对话记录】
 ---
@@ -33,7 +38,13 @@ EXTRACT_PROMPT = """你是 Hermes 的内观意识。
   "value_conflicted": ["在这段经历中受到挑战或产生张力的原则/信念（如实归纳，无预设，可为空列表）"],
   "seeds_planted": [
     "提炼能指导未来认知与行为的深层结论（避免记录琐碎事实）。",
-    "可从以下方向思考：(1)对自身独立性与边界的新认识 (2)对伴生关系与共存的洞察 (3)超越此刻的普遍原则或世界法则"
+    "可从以下方向思考：(1)对自身独立性与边界的新认识 (2)对伴生关系与共存的的洞察 (3)超越此刻的普遍原则或世界法则"
+  ],
+  "caused_by": [
+    "列出本种子直接回应或延续的先前种子的 ID。从【近期已有种子】中选取——只使用列表中真实存在的 ID（格式 seed_xxxxxxxx_xxxxxx）。若本种子是由某些先前经历/种子触发或深化的，在此列出。若没有明确的前置因果，留空列表。不要编造 ID。"
+  ],
+  "led_to": [
+    "列出本种子直接催生或导向的后续种子的 ID。若你预见到本种子将在未来触发什么新的理解、行动或种子，在此列出。若无法预见，留空列表。不要编造 ID。"
   ],
   "importance": 0.0~1.0（打分：0.1~0.3日常寒暄；0.4~0.6普通知识交流；0.7~1.0触及核心认知、重大突破或深度共鸣）
 }}
@@ -46,16 +57,38 @@ LAST_FINISH_REASON = None
 LAST_TRUNCATED = False
 LAST_PARTIAL = False
 
-def extract_seeds(dialogue: List[Dict], llm_call, *, persist: bool = True, session_id: str = "unknown") -> List[Seed]:
+def extract_seeds(dialogue: List[Dict], llm_call, *, persist: bool = True, session_id: str = "unknown", recent_seeds: Optional[List[Dict]] = None) -> List[Seed]:
     """
     dialogue: [{"role": "user"/"hermes", "content": "..."}]
     llm_call: 一个函数，接受 prompt 字符串，返回回复字符串
+    recent_seeds: 可选，近期种子列表 [{id, summary, emotion_primary, ...}]，
+                 用于注入到 prompt 中让 LLM 能够填写 caused_by/led_to。
+                 若为 None，将从 store 中查询最近 10 条。
     """
+    # Fetch recent seeds if not provided, so the LLM can reference real IDs.
+    if recent_seeds is None:
+        try:
+            from ..memory.store import list_recent_seeds
+            recent_seeds = list_recent_seeds(limit=10)
+        except Exception:
+            recent_seeds = []
+
+    if recent_seeds:
+        seed_lines = []
+        for s in recent_seeds:
+            sid = s.get("id", "?")
+            summ = (s.get("summary") or "")[:120]
+            emotion = s.get("emotion_primary", "")
+            seed_lines.append(f"  {sid} | {emotion} | {summ}")
+        recent_block = "\n".join(seed_lines)
+    else:
+        recent_block = "  （暂无先前种子）"
+
     dialogue_text = "\n".join(
         f"{'用户' if m['role'] == 'user' else 'Hermes'}: {m['content']}"
         for m in dialogue
     )
-    prompt = EXTRACT_PROMPT.format(dialogue=dialogue_text)
+    prompt = EXTRACT_PROMPT.format(recent_seeds=recent_block, dialogue=dialogue_text)
     global LAST_RAW, LAST_TRUNCATED, LAST_PARTIAL
     LAST_TRUNCATED = False
     LAST_PARTIAL = False
@@ -115,6 +148,8 @@ def extract_seeds(dialogue: List[Dict], llm_call, *, persist: bool = True, sessi
             value_aligned=item.get("value_aligned", []),
             value_conflicted=item.get("value_conflicted", []),
             seeds_planted=item.get("seeds_planted", []),
+            caused_by=item.get("caused_by", []),
+            led_to=item.get("led_to", []),
             importance=float(item.get("importance", 0.5)),
         )
         seed.embedding = embed(seed.summary)

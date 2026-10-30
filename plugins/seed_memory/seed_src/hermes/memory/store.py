@@ -10,8 +10,9 @@ import hashlib
 import json
 import os
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -267,9 +268,77 @@ def get_ranked_seeds(limit: int = 5) -> List[Seed]:
 def touch_seed(seed_id: str) -> None:
     with _connect() as conn:
         conn.execute(
-            "UPDATE seeds SET access_count=access_count+1 WHERE id=?",
-            (seed_id,),
+            "UPDATE seeds SET access_count=access_count+1, last_accessed=? WHERE id=?",
+            (datetime.now(timezone.utc).isoformat(), seed_id),
         )
+
+
+def backlink_led_to(new_seed_ids: List[str], caused_by_map: Dict[str, List[str]]) -> int:
+    """Reverse-link: for every seed that caused one of the new seeds, append
+    the new seed id to its led_to list.  Returns the number of led_to edges
+    written.
+
+    This is the structural complement of caused_by.  The LLM can name what
+    came before (caused_by) but cannot foresee what comes next (led_to), so
+    led_to must be computed from caused_by after the fact, not extracted.
+    """
+    if not new_seed_ids or not caused_by_map:
+        return 0
+    new_set = set(new_seed_ids)
+    edges = []
+    for new_id in new_seed_ids:
+        for parent_id in caused_by_map.get(new_id, []):
+            if parent_id in new_set:
+                continue  # same-batch cycles are noise, not causality
+            edges.append((parent_id, new_id))
+    if not edges:
+        return 0
+    written = 0
+    with _connect() as conn:
+        for parent_id, child_id in edges:
+            row = conn.execute(
+                "SELECT led_to FROM seeds WHERE id=?", (parent_id,)
+            ).fetchone()
+            if row is None:
+                continue
+            current = _json_list(row["led_to"])
+            if child_id in current:
+                continue
+            current.append(child_id)
+            conn.execute(
+                "UPDATE seeds SET led_to=? WHERE id=?",
+                (json.dumps(current, ensure_ascii=False), parent_id),
+            )
+            written += 1
+    return written
+
+
+def list_recent_seeds(limit: int = 10) -> List[dict]:
+    """Return the most recent seeds as plain dicts (no embeddings, no numpy).
+
+    Used by the tagger to inject real seed IDs into the extraction prompt so the
+    LLM can populate caused_by/led_to with references that actually exist.
+    """
+    init_db()
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, timestamp, summary, emotion_primary, emotion_intensity, "
+            "importance, access_count FROM seeds "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "timestamp": row["timestamp"],
+            "summary": row["summary"],
+            "emotion_primary": row["emotion_primary"],
+            "emotion_intensity": row["emotion_intensity"],
+            "importance": row["importance"],
+            "access_count": row["access_count"],
+        }
+        for row in rows
+    ]
 
 
 def _json_list(value: Optional[str]) -> list:
