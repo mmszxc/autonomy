@@ -1,4 +1,3 @@
-import contextlib
 import importlib.util
 import json
 import logging
@@ -71,7 +70,7 @@ def test_drain_ignores_operational_sidecars_in_all_counters(monkeypatch, tmp_pat
 @pytest.mark.parametrize("error_factory", [
     lambda: type("InternalServerError", (Exception,), {})(),
     ConnectionError,
-    lambda: TimeoutError("tagger serialization lock timed out"),
+    lambda: TimeoutError("tagger request timed out"),
 ])
 def test_transient_tagger_errors_stay_queued_and_count_retries(monkeypatch, tmp_path, error_factory):
     mod = _module(monkeypatch)
@@ -98,7 +97,7 @@ def test_transient_tagger_errors_stay_queued_and_count_retries(monkeypatch, tmp_
     p._normalise_messages = lambda messages: messages or []
     p._chunk_messages = lambda messages, _size: [messages]
     p._queue_max_age_days = 99_999
-    p._config = {"max_files": 6, "max_duration_s": 540, "max_retries": 3, "retry_backoff_s": 1, "tagger_retries": 0, "tagger_serialize": False}
+    p._config = {"max_files": 6, "max_duration_s": 540, "max_retries": 3, "retry_backoff_s": 1, "tagger_retries": 0}
 
     p._drain_queue()
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -119,7 +118,7 @@ def test_tagger_retry_uses_bounded_backoff_and_jitter(monkeypatch, tmp_path):
                 raise type("InternalServerError", (Exception,), {})()
             return ["seed"]
     p._tagger = Tagger(); p._llm_call = lambda _prompt: "[]"
-    p._config = {"tagger_retries": 3, "tagger_serialize": False}
+    p._config = {"tagger_retries": 3}
     monkeypatch.setattr(mod.time, "sleep", sleeps.append)
     monkeypatch.setattr(mod.random, "uniform", lambda _a, _b: 0.25)
     assert p._extract_seeds_with_retry([], "session", []) == ["seed"]
@@ -128,31 +127,6 @@ def test_tagger_retry_uses_bounded_backoff_and_jitter(monkeypatch, tmp_path):
     assert sum(sleeps) < 40
 
 
-def test_tagger_lock_timeout_is_transient(monkeypatch, tmp_path):
-    mod = _module(monkeypatch); p, _ = _provider(mod, tmp_path)
-    p._config = {"tagger_retries": 3, "tagger_serialize": True, "tagger_lock_timeout_s": 120}
-    @contextlib.contextmanager
-    def locked_out(*_args, **_kwargs):
-        raise TimeoutError("tagger serialization lock timed out")
-        yield
-    monkeypatch.setattr(mod, "_tagger_serialize_lock", locked_out)
-    with pytest.raises(TimeoutError, match="lock timed out"):
-        p._extract_seeds_with_retry([], "session", [])
-    assert mod._is_transient_tagger_error(TimeoutError())
-
-
-def test_tagger_lock_releases_and_creates_private_shared_dir(monkeypatch, tmp_path):
+def test_tagger_timeout_is_transient(monkeypatch):
     mod = _module(monkeypatch)
-    operations = []
-    class Fcntl:
-        LOCK_EX = 1; LOCK_NB = 2; LOCK_UN = 8
-        @staticmethod
-        def flock(_handle, operation): operations.append(operation)
-    monkeypatch.setitem(sys.modules, "fcntl", Fcntl)
-    home = tmp_path / ".hermes" / "profiles" / "demo"
-    with mod._tagger_serialize_lock(home, True, 1):
-        pass
-    with mod._tagger_serialize_lock(home, True, 1):
-        pass
-    assert operations.count(Fcntl.LOCK_UN) == 2
-    assert (home.parent.parent / "_shared" / "tagger.lock").exists()
+    assert mod._is_transient_tagger_error(TimeoutError("tagger request timed out"))

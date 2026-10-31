@@ -64,40 +64,6 @@ def _is_transient_tagger_error(exc: BaseException) -> bool:
     }
 
 
-@contextmanager
-def _tagger_serialize_lock(hermes_home: Optional[Path], enabled: bool, timeout_s: float = 120.0):
-    """Serialize tagger calls across profiles without making the profile tree shared."""
-    if not enabled or hermes_home is None:
-        yield
-        return
-    shared_dir = hermes_home.parent.parent / "_shared"
-    shared_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        os.chmod(shared_dir, 0o700)
-    except OSError:
-        pass
-    lock_path = shared_dir / "tagger.lock"
-    with lock_path.open("a+") as handle:
-        try:
-            import fcntl
-        except ImportError:  # Windows test/development compatibility only.
-            yield
-            return
-        deadline = time.monotonic() + max(0.0, float(timeout_s))
-        while True:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("tagger serialization lock timed out")
-                time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
-
-
 def _summary_hash(value: Any) -> str:
     """Return a stable duplicate-detection key for a seed summary."""
     normalized = unicodedata.normalize("NFKC", str(value or "")).lower()
@@ -625,28 +591,25 @@ class SeedMemoryProvider(MemoryProvider):
         return unique, stats
 
     def _extract_seeds_with_retry(self, messages: List[Dict[str, str]], session_id: str, recent_seeds: List[Dict[str, Any]]) -> List[Any]:
-        """Run the tagger under the optional shared lock with bounded 5xx retries."""
+        """Run the tagger with bounded retries for transient failures."""
         retries = max(0, int(self._config.get("tagger_retries", 3)))
-        serialize = bool(self._config.get("tagger_serialize", True))
-        lock_timeout_s = float(self._config.get("tagger_lock_timeout_s", 120))
         delays = (2.0, 6.0, 15.0)
-        with _tagger_serialize_lock(self._hermes_home, serialize, lock_timeout_s):
-            for attempt in range(retries + 1):
-                try:
-                    return self._tagger.extract_seeds(
-                        messages, self._llm_call, persist=False,
-                        session_id=session_id, recent_seeds=recent_seeds,
-                    )
-                except Exception as exc:
-                    if not _is_transient_tagger_error(exc) or attempt >= retries:
-                        raise
-                    base_delay = delays[min(attempt, len(delays) - 1)]
-                    delay = base_delay + random.uniform(0.0, 0.5)
-                    logger.warning(
-                        "tagger transient retry attempt=%d/%d type=%s delay_s=%.3f",
-                        attempt + 1, retries, type(exc).__name__, delay,
-                    )
-                    time.sleep(delay)
+        for attempt in range(retries + 1):
+            try:
+                return self._tagger.extract_seeds(
+                    messages, self._llm_call, persist=False,
+                    session_id=session_id, recent_seeds=recent_seeds,
+                )
+            except Exception as exc:
+                if not _is_transient_tagger_error(exc) or attempt >= retries:
+                    raise
+                base_delay = delays[min(attempt, len(delays) - 1)]
+                delay = base_delay + random.uniform(0.0, 0.5)
+                logger.warning(
+                    "tagger transient retry attempt=%d/%d type=%s delay_s=%.3f",
+                    attempt + 1, retries, type(exc).__name__, delay,
+                )
+                time.sleep(delay)
         raise RuntimeError("unreachable tagger retry state")
 
     def _drain_queue(self) -> None:

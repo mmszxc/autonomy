@@ -19,10 +19,8 @@ Hermes Agent 的结构化长期记忆插件：将会话经历保存为带情绪�
 memory:
   seed_memory:
     tagger_retries: 3          # 2s、6s、15s，并附加不超过 0.5s 的抖动
-    tagger_serialize: true     # 跨 profile 串行调用 tagger
-    tagger_lock_timeout_s: 120
 ```
 
-串行锁由 profile 路径推导到共享 Hermes 主目录的 `_shared/tagger.lock`，共享目录权限为 `0700`。锁超时以及 5xx、连接类瞬态错误会保留队列文件供下一轮重试，不会立即移入 `_failed/`。
+每个 profile 独立配置标注模型，互不共享锁或运行状态。5xx、超时和连接类瞬态错误会保留队列文件供下一轮重试，不会立即移入 `_failed/`。
 
 运行数据、模型、密钥和 profile 配置不属于公开仓库内容。
