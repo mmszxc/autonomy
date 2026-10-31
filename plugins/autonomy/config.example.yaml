@@ -16,6 +16,19 @@
 #     key_env: HERMES_<HOST>_API_KEY_AUTONOMY
 #     model: <AUTONOMY_MODEL>
 # autonomy.model 也可写成：{model: <AUTONOMY_MODEL>, provider: autonomy-provider}
+# Hermes 原生白名单降级与外部顾问示例（仅使用明确列出的 provider/model）：
+# fallback_providers:
+#   - {provider: custom:autonomy-provider, model: <AUTONOMY_MODEL>}
+#   - {provider: custom:advisor-provider, model: <ADVISOR_MODEL>}
+# delegation:
+#   provider: custom:advisor-provider
+#   model: <ADVISOR_MODEL>
+#   oneshot_max_children: 2
+#   max_iterations: 3
+#   subagent_auto_approve: false
+# display:
+#   suppress_warning_notifications: true  # 不把降级警告附加到对话正文；状态回调/日志仍保留
+
 autonomy:
   # 自主思考使用的模型；null 表示继承 Hermes 主模型（只有一个模型时对话优先）
   model: null

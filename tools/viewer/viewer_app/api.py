@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from .config import resolve_paths
-from .sources import seeds, status, thoughts
+from .redact import safe_text
+from .sources import model_route, seeds, status, thoughts
 
 
 def _integer(query: dict[str, list[str]], name: str, default: int, low: int, high: int) -> int:
@@ -34,6 +35,22 @@ class ReadOnlyApi:
         self.thought_log = paths["thought_log"]
         self.seed_db = paths["seed_db"]
         self.queue = paths["queue"]
+        self.notes_to_team = paths["data_dir"] / "notes_to_team.md"
+
+    def _load_notes_to_team(self, limit: int = 1024) -> dict[str, Any]:
+        try:
+            size = self.notes_to_team.stat().st_size
+            with self.notes_to_team.open("rb") as handle:
+                if size > limit:
+                    handle.seek(-limit, 2)
+                content = handle.read(limit).decode("utf-8", errors="replace")
+        except OSError:
+            return {"available": False, "content": "", "truncated": False}
+        return {
+            "available": True,
+            "content": safe_text(content),
+            "truncated": size > limit,
+        }
 
     def route(self, path: str, query: dict[str, list[str]]) -> tuple[int, str, bytes]:
         if path == "/api/thoughts":
@@ -52,4 +69,8 @@ class ReadOnlyApi:
             )
         if path == "/api/status":
             return json_response(status.load(self.home, self.profile, self.paths))
+        if path == "/api/notes-to-team":
+            return json_response(self._load_notes_to_team())
+        if path == "/api/model-route":
+            return json_response(model_route.load(self.home, self.profile))
         return json_response({"error": "not found"}, HTTPStatus.NOT_FOUND)

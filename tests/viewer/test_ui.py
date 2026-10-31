@@ -34,6 +34,24 @@ def test_manual_refresh_only_and_incremental_rendering() -> None:
     assert "root.children[index]!==node" in seeds and "root.children[index]!==node" in thoughts
 
 
+def test_model_route_card_uses_text_content() -> None:
+    page = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
+    script = (STATIC_ROOT / "js/model-route.js").read_text(encoding="utf-8")
+    assert "模型路由" in page and "modelRouteFallbacks" in page
+    assert "/api/model-route" in script
+    assert "textContent" in script and "innerHTML" not in script
+
+
+def test_notes_to_team_card_is_hidden_and_uses_safe_text_content() -> None:
+    page = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
+    notes = (STATIC_ROOT / "js/notes.js").read_text(encoding="utf-8")
+    assert 'id="notesToTeamCard" class="glass" hidden' in page
+    assert "给团队的留言" in page
+    assert "/api/notes-to-team" in notes
+    assert "textContent" in notes and "innerHTML" not in notes
+    assert "setTimeout" not in notes and "setInterval" not in notes
+
+
 def test_modules_remain_small_and_single_entrypoint() -> None:
     root = STATIC_ROOT.parent
     assert len((root / "viewer.py").read_text(encoding="utf-8").splitlines()) < 60

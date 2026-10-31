@@ -43,7 +43,7 @@ def _file_lock(path):
         fh.close()
 
 
-from .prompt import build_tick_prompt, load_extra_rules
+from .prompt import build_tick_prompt, load_extra_rules, load_team_bulletin
 from .proposals import parse
 from .config import determine_mode
 from .thought_log import append_thought_log, resolve_thought_log_path
@@ -525,9 +525,11 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             recent_events = self.db.list_events(5)
             memory_review, memory_seed_ids = self._prefetch_memory(run, recent_events)
             rules = load_extra_rules(self.data_dir)
+            bulletin = load_team_bulletin(self.data_dir)
             prompt = build_tick_prompt(
                 goals, recent_events, memory_review=memory_review,
                 workspace=self.workspace, extra_rules=rules,
+                team_bulletin=bulletin,
             )
             raw = ""
             usage = {}

@@ -74,4 +74,4 @@ def resolve_paths(home: Path) -> dict[str, Path]:
     queue = Path(queue_value).expanduser() if queue_value else home / "seed_data" / "seed_queue"
     if not queue.is_dir() and (home / "seed_queue").is_dir():
         queue = home / "seed_queue"
-    return {"autonomy_db": db, "thought_log": thought, "seed_db": seed_db, "queue": queue}
+    return {"data_dir": data_dir, "autonomy_db": db, "thought_log": thought, "seed_db": seed_db, "queue": queue}
