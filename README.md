@@ -160,6 +160,8 @@ python3 -m pytest tests -q
 
 欢迎 issue 和 pull request。贡献说明见 `CONTRIBUTING.md`。
 
+涉及底层契约、成员改装或主版本吸收时，请同时参考 [`docs/DESIGN_PRINCIPLES.md`](docs/DESIGN_PRINCIPLES.md)。
+
 ## 许可证
 
 - 除 `identity/` 单独标注的内容外，仓库代码和文档以 **MIT License** 发布，见根目录 `LICENSE`。
