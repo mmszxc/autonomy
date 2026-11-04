@@ -31,6 +31,31 @@ _SECRET_ASSIGN_RE = re.compile(
 _SK_RE = re.compile(r"(?i)\bsk-[a-z0-9_-]{12,}\b")
 _REDACTED = "[REDACTED]"
 
+# P2-2: seed reference markers used by the autonomy tick prompt.  They are
+# intentional structured references, never secrets, so redaction must skip
+# them and the runner gets a dedicated extractor for post-turn handling.
+_SEED_REF_RE = re.compile(r"\[#([A-Za-z0-9_.:-]+)\]")
+_EXPAND_REF_RE = re.compile(r"\[#expand:([A-Za-z0-9_.:-]+)\]")
+
+
+def extract_seed_references(text: Any) -> Dict[str, List[str]]:
+    """Return explicit seed references found in an assistant transcript.
+
+    ``refs`` lists plain ``[#seed_id]`` citations (expansion requests are
+    excluded); ``expands`` lists ``[#expand:seed_id]`` request targets.
+    Duplicates are removed while preserving order.
+    """
+    raw = str(text or "")
+    expands = list(dict.fromkeys(m.group(1) for m in _EXPAND_REF_RE.finditer(raw)))
+    refs = []
+    for match in _SEED_REF_RE.finditer(raw):
+        seed_id = match.group(1)
+        if seed_id.startswith("expand:"):
+            continue
+        if seed_id not in refs:
+            refs.append(seed_id)
+    return {"refs": refs, "expands": expands}
+
 
 def _error(message: str) -> Dict[str, Any]:
     return {"error": message, "text": ""}

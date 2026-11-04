@@ -19,6 +19,7 @@ import time
 import json
 import os
 import re
+import sqlite3
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -244,6 +245,197 @@ class Runner:
                 else: os.replace(src, dst)
         os.replace(path, path.with_name(path.name + ".1"))
 
+    # ------------------------------------------------------------------
+    # P2-2: post-turn [#seed_id] / [#expand:seed_id] reference handling
+    # ------------------------------------------------------------------
+    _SEED_REF_RE = re.compile(r"\[#([A-Za-z0-9_.:-]+)\]")
+    _EXPAND_REF_RE = re.compile(r"\[#expand:([A-Za-z0-9_.:-]+)\]")
+
+    def _seed_db_path(self):
+        """Resolve this profile's seed database path (if present)."""
+        try:
+            path = Path(self.hermes_home) / "seed_data" / "seeds" / "seeds.db"
+            return path if path.is_file() else None
+        except OSError:
+            return None
+
+    def _handle_seed_references(self, run, assistant_text):
+        """Scan assistant text for [#seed_id] / [#expand:seed_id] references.
+
+        [#seed_id]        -> touch the seed (access_count + recall_count +1)
+        [#expand:seed_id] -> queue an expansion request for the next round
+
+        Both features degrade silently when the P1 columns/tables are absent.
+        """
+        text = str(assistant_text or "")
+        expand_ids = {m.group(1) for m in self._EXPAND_REF_RE.finditer(text)}
+        ref_ids = []
+        for match in self._SEED_REF_RE.finditer(text):
+            seed_id = match.group(1)
+            if seed_id.startswith("expand:"):
+                continue
+            if seed_id not in ref_ids:
+                ref_ids.append(seed_id)
+        if not ref_ids and not expand_ids:
+            return {"refs": 0, "expands": 0}
+        path = self._seed_db_path()
+        if path is None:
+            return {"refs": len(ref_ids), "expands": len(expand_ids), "db": "missing"}
+        touched = expanded = 0
+        conn = None
+        try:
+            conn = sqlite3.connect(str(path), timeout=2.0)
+            conn.execute("PRAGMA busy_timeout=2000")
+            if ref_ids:
+                columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(seeds)")}
+                has_recall = "recall_count" in columns
+                for seed_id in ref_ids:
+                    try:
+                        if has_recall:
+                            conn.execute(
+                                "UPDATE seeds SET access_count=COALESCE(access_count,0)+1, "
+                                "recall_count=COALESCE(recall_count,0)+1, "
+                                "last_accessed_at=? WHERE id=?",
+                                (time.time(), seed_id),
+                            )
+                        else:
+                            conn.execute(
+                                "UPDATE seeds SET access_count=COALESCE(access_count,0)+1, "
+                                "last_accessed_at=? WHERE id=?",
+                                (time.time(), seed_id),
+                            )
+                        touched += conn.total_changes and 1 or 0
+                    except sqlite3.Error:
+                        # recall_count column missing or per-row failure: skip
+                        pass
+            if expand_ids:
+                tables = {
+                    str(row[0]) for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                if "seed_expand_requests" in tables:
+                    now_iso = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+                    for seed_id in expand_ids:
+                        try:
+                            conn.execute(
+                                "INSERT INTO seed_expand_requests(id, seed_id, requested_at, status) "
+                                "VALUES(?,?,?,'pending')",
+                                (uuid.uuid4().hex, seed_id, now_iso),
+                            )
+                            expanded += 1
+                        except sqlite3.Error:
+                            pass
+            conn.commit()
+        except sqlite3.Error:
+            pass
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+        return {"refs": len(ref_ids), "touched": touched, "expands": expanded}
+
+    # ------------------------------------------------------------------
+    # P3-1: shareable cross-profile knowledge flow
+    # ------------------------------------------------------------------
+    _SHARED_KNOWLEDGE_DIR = "/home/hermes/.hermes/shared"
+    _KNOWN_PROFILES = ("xiaozhi", "xiaoai")
+
+    def _profile_name(self):
+        try:
+            name = Path(self.hermes_home).name
+            return re.sub(r"[^A-Za-z0-9_-]", "-", name) or "default"
+        except Exception:
+            return "default"
+
+    def _export_shared_seeds(self, run):
+        """Export this profile's top shareable seeds for other profiles.
+
+        Writes /home/hermes/.hermes/shared/top_seeds_{profile}.jsonl atomically.
+        Degrades to an importance-only filter when the shareable column (P1-1)
+        is absent, and never raises into the tick path.
+        """
+        path = self._seed_db_path()
+        if path is None:
+            return {"exported": 0, "reason": "db_missing"}
+        try:
+            shared_dir = Path(self._SHARED_KNOWLEDGE_DIR)
+            shared_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(path), timeout=2.0)
+            try:
+                columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(seeds)")}
+                if "shareable" in columns:
+                    rows = conn.execute(
+                        "SELECT id, summary, importance FROM seeds "
+                        "WHERE shareable=1 AND importance > 0.7 LIMIT 20"
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT id, summary, importance FROM seeds "
+                        "WHERE importance > 0.7 LIMIT 20"
+                    ).fetchall()
+            finally:
+                conn.close()
+            target = shared_dir / ("top_seeds_%s.jsonl" % self._profile_name())
+            tmp = target.with_name(target.name + ".%d.tmp" % os.getpid())
+            payload = "".join(
+                json.dumps(
+                    {"id": str(r[0]), "summary": str(r[1] or ""), "importance": r[2]},
+                    ensure_ascii=False,
+                ) + "\n"
+                for r in rows
+            )
+            tmp.write_text(payload, encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, target)
+            return {"exported": len(rows), "path": str(target)}
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            try:
+                self.db.append_event(run_id=run, kind="shared_export", exit_reason="degraded", summary=str(exc)[:240])
+            except Exception:
+                pass
+            return {"exported": 0, "reason": type(exc).__name__}
+
+    def _load_peer_shared_seeds(self):
+        """Read the peer profile's shared top seeds (best 3 by importance)."""
+        try:
+            my_name = self._profile_name()
+            shared_dir = str(self._SHARED_KNOWLEDGE_DIR)
+            peer_files = []
+            for name in self._KNOWN_PROFILES:
+                if name == my_name:
+                    continue
+                peer_files.append(os.path.join(shared_dir, "top_seeds_{}.jsonl".format(name)))
+            best = []
+            for path in peer_files:
+                if not os.path.isfile(path):
+                    continue
+                with open(path, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except ValueError:
+                            continue
+                        try:
+                            importance = float(obj.get("importance") or 0.0)
+                        except (TypeError, ValueError):
+                            importance = 0.0
+                        best.append((importance, str(obj.get("summary") or "")[:100]))
+            if not best:
+                return ""
+            best.sort(key=lambda item: item[0], reverse=True)
+            lines = []
+            for _imp, summary in best[:3]:
+                lines.append("[[TEAM_RECALL]] 对方记忆: " + summary)
+            return "\n".join(lines)
+        except OSError:
+            return ""
+
     def _enqueue_completed_turn(self, run_id, summary, assistant_text):
         """Bridge standalone autonomy ticks into seed_memory's queue protocol.
 
@@ -345,6 +537,91 @@ class Runner:
         ids = list(dict.fromkeys(re.findall(r"(?:seed_id|id)\s*[=:]\s*([A-Za-z0-9_.:-]+)", bounded)))
         self._prefetch_meta = {"count": len(ids), "chars": len(bounded), "truncated": truncated, "seed_ids": ids}
         return bounded, ids
+
+    def _render_three_layers(self, run, seed_ids):
+        """P2-1: compose Layer1(概览)/Layer2(邻居)/Layer3(详情) prefetch text.
+
+        Falls back to None when the seed DB is unavailable so the caller keeps
+        the provider's original bounded text.
+        """
+        path = self._seed_db_path()
+        if path is None or not seed_ids:
+            return None
+        conn = None
+        try:
+            conn = sqlite3.connect(str(path), timeout=2.0)
+            conn.execute("PRAGMA busy_timeout=2000")
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(seeds)")}
+            if "id" not in columns or "summary" not in columns:
+                return None
+            unique_ids = list(dict.fromkeys(seed_ids))[:5]
+            summaries = {}
+            for seed_id in unique_ids:
+                row = conn.execute(
+                    "SELECT summary FROM seeds WHERE id=?", (seed_id,)
+                ).fetchone()
+                if row:
+                    summaries[seed_id] = str(row[0] or "")
+            layers = []
+            # Layer 1 (~300 chars): top-5 seeds, 60 chars each.
+            layer1 = ["【记忆概览】"]
+            for seed_id in unique_ids:
+                layer1.append("%s: %s" % (seed_id, summaries.get(seed_id, "")[:60]))
+            layers.append("\n".join(layer1))
+            # Layer 2 (~800 chars): one-hop neighbours from seed_edges.
+            try:
+                edge_tables = {
+                    str(row[0]) for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                if "seed_edges" in edge_tables:
+                    edge_cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(seed_edges)")}
+                    if {"from_id", "to_id", "edge_type"}.issubset(edge_cols):
+                        layer2 = ["【关联记忆】"]
+                        for seed_id in unique_ids:
+                            rows = conn.execute(
+                                "SELECT to_id, edge_type FROM seed_edges WHERE from_id=? "
+                                "UNION SELECT from_id, edge_type FROM seed_edges WHERE to_id=? LIMIT 10",
+                                (seed_id, seed_id),
+                            ).fetchall()
+                            shown = 0
+                            for other_id, edge_type in rows:
+                                label = str(edge_type or "related")
+                                if label not in ("caused_by", "led_to"):
+                                    label = "related"
+                                other_summary = summaries.get(str(other_id), "")
+                                layer2.append(
+                                    "%s --%s--> %s: %s" % (
+                                        seed_id, label, str(other_id), other_summary[:60]
+                                    )
+                                )
+                                shown += 1
+                                if shown >= 2 or sum(len(x) for x in layer2) > 800:
+                                    break
+                        if len(layer2) > 1:
+                            layers.append("\n".join(layer2)[:800])
+            except sqlite3.Error:
+                pass  # old DB without seed_edges: silently skip Layer 2
+            # Layer 3 (~1000 chars): top-2 seeds, 500 chars full text each.
+            layer3 = ["【详情】"]
+            for seed_id in unique_ids[:2]:
+                layer3.append("%s\n%s" % (seed_id, summaries.get(seed_id, "")[:500]))
+            layers.append("\n".join(layer3)[:1000])
+            # P3-1: peer profile shared knowledge.
+            peer_block = self._load_peer_shared_seeds()
+            if peer_block:
+                layers.append(peer_block)
+            layers.append("【提示】引用记忆用 [#seed_id]，申请展开用 [#expand:seed_id]")
+            return "\n".join(layers)
+        except sqlite3.Error:
+            return None
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
 
     def _prefetch_memory(self, run, recent_events, goals=None):
         # D-20261102T2220 (xiaoai): rotate query across cycles so retrieval
@@ -479,6 +756,16 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 reason = "memory prefetch returned empty"
                 self.db.append_event(run_id=run, kind="memory_prefetch", exit_reason="empty", summary=reason)
                 return "暂无可回顾的记忆。", []
+            # P2-1: re-render the bounded seed ids as three structured layers
+            # (概览/关联/详情) when the seed DB is reachable; otherwise keep
+            # the provider's original flat text.
+            layered = None
+            try:
+                layered = self._render_three_layers(run, ids)
+            except Exception:
+                layered = None
+            if layered:
+                text, ids = self._bound_prefetch_text(layered)
             meta = self._prefetch_meta
             summary = "count=%d chars=%d truncated=%s seed_ids=%s" % (meta["count"], meta["chars"], meta["truncated"], ",".join(ids) or "unavailable")
             self.db.append_event(run_id=run, kind="memory_prefetch", exit_reason="ok", summary=summary)
@@ -785,6 +1072,27 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                     exit_reason="queued" if queue_result.get("queued") else "degraded",
                     summary=("path=%s worker=%s elapsed_s=%s" % (queue_result.get("path") or queue_result.get("reason") or "unknown", queue_result.get("worker", "not_started"), queue_result.get("elapsed_s", 0)))[:1200],
                 )
+                # P2-2: resolve [#seed_id] / [#expand:seed_id] references in
+                # the assistant transcript (touch + recall_count / expand queue).
+                try:
+                    ref_result = self._handle_seed_references(run, transcript_text)
+                    if ref_result.get("refs") or ref_result.get("expands"):
+                        self.db.append_event(
+                            run_id=run, goal_id=goal_id, kind="seed_refs",
+                            exit_reason="ok",
+                            summary=json.dumps(ref_result, ensure_ascii=False)[:400],
+                        )
+                except Exception as ref_error:
+                    self.db.append_event(
+                        run_id=run, goal_id=goal_id, kind="seed_refs",
+                        exit_reason=type(ref_error).__name__,
+                        summary=str(ref_error)[:240],
+                    )
+                # P3-1: export this profile's top shareable seeds for peers.
+                try:
+                    self._export_shared_seeds(run)
+                except Exception:
+                    pass
                 append_thought_log(
                     self.thought_log_path,
                     run_id=run,
