@@ -167,7 +167,7 @@ def _rerank_with_ext_hook(seeds: List[Seed], query: str) -> List[Seed]:
     if len(seeds) <= 3:
         return seeds
 
-    hook_path = Path(memory_store.DB_PATH).parent / "ext_hooks.py"
+    hook_path = Path(memory_store.DB_PATH).parent.parent / "ext_hooks.py"
     if not hook_path.is_file():
         return seeds
 
