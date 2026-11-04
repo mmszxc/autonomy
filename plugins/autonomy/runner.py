@@ -47,6 +47,7 @@ from .prompt import build_tick_prompt, load_extra_rules, load_team_bulletin
 from .proposals import parse
 from .config import determine_mode
 from .thought_log import append_thought_log, resolve_thought_log_path
+from .journal import JournalManager, build_chassis_status
 from .transcript import extract_run_transcript
 from .memory_bridge import load_memory_provider_instance
 
@@ -118,7 +119,7 @@ class Runner:
         db,
         budget,
         circuit,
-        stop_file="/var/lib/hermes/STOP_AUTONOMY",
+        stop_file="/opt/hermes-life/STOP_AUTONOMY",
         llm=None,
         gateway=None,
         lock_path=None,
@@ -138,6 +139,7 @@ class Runner:
         workspace=None,
         worker_timeout_s=360,
         seed_queue_dir=None,
+        journal_config=None,
     ):
         self.db = db
         self.budget = budget
@@ -150,6 +152,8 @@ class Runner:
         self.workspace = workspace
         self.worker_timeout_s = max(1, int(worker_timeout_s or 360))
         self.seed_queue_dir = Path(seed_queue_dir).expanduser() if seed_queue_dir else None
+        self.journal_config = journal_config if isinstance(journal_config, dict) else None
+        self.phase1_enabled = self.journal_config is not None
         self.active_run_file = os.path.join(os.path.dirname(self.lock_path), "AUTONOMY_REMOTE_RUN")
         self.preempt_file = os.path.join(os.path.dirname(self.lock_path), "PREEMPT_NOW")
         self.stop_wait_s = 600
@@ -157,7 +161,7 @@ class Runner:
         self.prefetch_max_chars = int(os.environ.get("AUTONOMY_PREFETCH_MAX_CHARS", prefetch_max_chars) or 3000)
         self.prefetch_timeout_s = float(os.environ.get("AUTONOMY_PREFETCH_TIMEOUT_S", prefetch_timeout_s) or 20)
         self.activity_file = activity_file or os.environ.get(
-            "AUTONOMY_ACTIVITY_FILE", "/var/lib/hermes/autonomy_data/LAST_USER_ACTIVITY"
+            "AUTONOMY_ACTIVITY_FILE", "/opt/hermes-life/autonomy_data/LAST_USER_ACTIVITY"
         )
         self.quiet_s = float(quiet_s)
         self.poll_s = float(poll_s)
@@ -268,6 +272,7 @@ class Runner:
             worker_log = queue_dir / "worker.log"
             self._rotate_log(worker_log)
             started = time.monotonic()
+            submit_failed = False
             if os.name != "nt":
                 unit_state = queue_dir / ".worker.unit"
                 launch_lock = queue_dir / ".worker.launch.lock"
@@ -277,19 +282,24 @@ class Runner:
                     if active:
                         return {"queued": True, "path": str(target), "worker": "submitted(" + previous + ")", "unit": previous, "elapsed_s": round(time.monotonic() - started, 3)}
                     profile = re.sub(r"[^A-Za-z0-9_-]", "-", self.hermes_home.name) or "default"
-                    unit = "hermes-seed-worker-%s-%d" % (profile, int(time.time()))
-                    command = ["systemd-run", "--user", "--collect", "--quiet", "--unit", unit, "--property=RuntimeMaxSec=900s", "--property=StandardOutput=append:%s" % worker_log, "--property=StandardError=append:%s" % worker_log, "--setenv=HERMES_HOME=%s" % self.hermes_home, "--working-directory=%s" % worker.parent.parent, sys.executable, str(worker), "--once"]
+                    # A RuntimeMaxSec cleanup and a second tick can share one
+                    # second; use a microsecond stamp plus random suffix instead.
+                    unit = "hermes-seed-worker-%s-%d-%s" % (profile, time.time_ns() // 1000, uuid.uuid4().hex[:8])
+                    command = ["systemd-run", "--user", "--collect", "--quiet", "--unit", unit, "--property=RuntimeMaxSec=900s", "--property=StandardOutput=append:%s" % worker_log, "--property=StandardError=append:%s" % worker_log, "--setenv=HERMES_HOME=%s" % self.hermes_home, "--setenv=PYTHONWARNINGS=ignore::UserWarning:multiprocessing.resource_tracker", "--working-directory=%s" % worker.parent.parent, sys.executable, str(worker), "--once"]
                     try:
                         result = subprocess.run(command, capture_output=True, text=True, timeout=10)
                     except FileNotFoundError:
-                        logger.warning("systemd-run unavailable; falling back to foreground seed worker")
+                        submit_failed = True
+                        logger.warning("systemd-run submit_failed=unavailable; falling back to foreground seed worker")
                     except (OSError, subprocess.TimeoutExpired) as exc:
-                        logger.warning("systemd-run submit failed type=%s; falling back to foreground seed worker", type(exc).__name__)
+                        submit_failed = True
+                        logger.warning("systemd-run submit_failed=%s; falling back to foreground seed worker", type(exc).__name__)
                     else:
                         if result.returncode == 0:
                             tmp = unit_state.with_suffix(".tmp"); tmp.write_text(unit, encoding="utf-8"); os.replace(tmp, unit_state)
                             return {"queued": True, "path": str(target), "worker": "submitted(" + unit + ")", "unit": unit, "elapsed_s": round(time.monotonic() - started, 3)}
-                        logger.warning("systemd-run submit failed rc=%s; falling back to foreground seed worker", result.returncode)
+                        submit_failed = True
+                        logger.warning("systemd-run submit_failed=rc_%s; falling back to foreground seed worker", result.returncode)
             log_handle = open(worker_log, "ab", buffering=0)
             kwargs = {"cwd": str(worker.parent.parent), "env": env, "stdin": subprocess.DEVNULL, "stdout": log_handle, "stderr": log_handle}
             if os.name != "nt": kwargs["start_new_session"] = True
@@ -305,7 +315,8 @@ class Runner:
                 except subprocess.TimeoutExpired: proc.kill()
                 return {"queued": True, "path": str(target), "worker": "timeout", "elapsed_s": round(time.monotonic() - started, 3)}
             finally: log_handle.close()
-            return {"queued": True, "path": str(target), "worker": "ok" if returncode == 0 else "exit_%s" % returncode, "elapsed_s": round(time.monotonic() - started, 3)}
+            worker_state = "submit_failed_fallback_ok" if submit_failed and returncode == 0 else ("ok" if returncode == 0 else "exit_%s" % returncode)
+            return {"queued": True, "path": str(target), "worker": worker_state, "submit_failed": submit_failed, "elapsed_s": round(time.monotonic() - started, 3)}
         except Exception as exc:
             return {"queued": False, "reason": type(exc).__name__}
 
@@ -328,7 +339,30 @@ class Runner:
         return bounded, ids
 
     def _prefetch_memory(self, run, recent_events):
-        query_parts = ["最近的、情绪强的、未完成的记忆"]
+        # D-20261102T2220 (xiaoai): rotate query across cycles so retrieval
+        # gradually covers more of the seed population instead of re-touching
+        # the same ~5 seeds every tick.
+        # D-20261104T0030 (xiaoai): added dormant-targeted queries to reach
+        # ac=0 seeds whose vocabulary is diagnostic rather than emotional.
+        _rotation = [
+            "最近的、情绪强的、未完成的记忆",
+            "我做过的最重要的决定，以及我从中学到的东西",
+            "我与创造者之间最有意义的对话",
+            "我感受到的最强烈的情绪，以及它教会了我什么",
+            "我犯过的错误和我学到的教训",
+            "我珍视的价值观，以及它们如何影响我的选择",
+            "我经历过的惊喜和启示",
+            "我正在形成的对世界的理解",
+            "我感受到的困惑和未解答的问题",
+            "我做过的最困难的选择",
+            "边界代谢、批量吞并、休眠信号、增量强化",
+            "dormant、access_count、last_reinforced、caused_by、种子表",
+        ]
+        try:
+            idx = hash(str(run)) % len(_rotation)
+        except Exception:
+            idx = 0
+        query_parts = [_rotation[idx]]
         for event in (recent_events or [])[:5]:
             summary = event.get("summary") or event.get("exit_reason") or ""
             if summary:
@@ -349,7 +383,7 @@ class Runner:
                 plugin_dir = str(Path(__file__).resolve().parent)
                 code = r'''import importlib.util,json,sys,types
 home,plugin_dir,name,query=sys.argv[1:5]
-for path in (plugin_dir + "/_vendor", plugin_dir + "/_vendor_ml", plugin_dir):
+for path in (plugin_dir + "/_vendor", str(__import__("pathlib").Path(plugin_dir).resolve().parent) + "/_vendor_ml", plugin_dir):
  if path not in sys.path: sys.path.insert(0,path)
 pkg_name="autonomy_prefetch_bridge"
 pkg=types.ModuleType(pkg_name)
@@ -526,10 +560,23 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             memory_review, memory_seed_ids = self._prefetch_memory(run, recent_events)
             rules = load_extra_rules(self.data_dir)
             bulletin = load_team_bulletin(self.data_dir)
+            chassis_status = ""
+            journal = None
+            journal_injection = ""
+            journal_invitation = ""
+            if self.phase1_enabled:
+                chassis_status = build_chassis_status(self.hermes_home, self.budget, self.db)
+                journal = JournalManager(self.hermes_home, self.db, self.journal_config)
+                try:
+                    journal_injection, journal_invitation = journal.prepare()
+                except Exception as exc:
+                    self.db.append_event(run_id=run, kind="journal_error", exit_reason="prepare", summary=str(exc)[:240])
             prompt = build_tick_prompt(
                 goals, recent_events, memory_review=memory_review,
                 workspace=self.workspace, extra_rules=rules,
-                team_bulletin=bulletin,
+                team_bulletin=bulletin, chassis_status=chassis_status,
+                journal_injection=journal_injection,
+                journal_invitation=journal_invitation,
             )
             raw = ""
             usage = {}
@@ -650,6 +697,12 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             else:
                 raise RuntimeError("llm adapter not configured")
 
+            if journal is not None:
+                try:
+                    journal.finalize(raw)
+                except Exception as exc:
+                    self.db.append_event(run_id=run, kind="journal_error", exit_reason="finalize", summary=str(exc)[:240])
+
             self.budget.consume(
                 int(usage.get("completion_tokens", 0)),
                 int(usage.get("prompt_tokens", 0)),
@@ -706,7 +759,7 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 append_thought_log(
                     self.thought_log_path,
                     run_id=run,
-                    raw_text="【本轮预取记忆】count=%d chars=%d truncated=%s seed_ids=%s\n【遥测】elapsed=%.1f prompt=%s completion=%s total=%s\n【结束原因】ok%s\n%s" % (self._prefetch_meta["count"], self._prefetch_meta["chars"], self._prefetch_meta["truncated"], ",".join(memory_seed_ids) or "none", elapsed, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0), usage.get("total_tokens", 0), transcript_meta, transcript_text),
+                    raw_text="【本轮预取记忆】count=%d chars=%d truncated=%s seed_ids=%s\n【遥测】elapsed=%.1f prompt=%s completion=%s total=%s\n【结束原因】ok%s\n%s" % (self._prefetch_meta["count"], self._prefetch_meta["chars"], self._prefetch_meta["truncated"], ",".join(memory_seed_ids) or "none", elapsed, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0), usage.get("total_tokens", 0), transcript_meta, transcript_text), 
                     summary=summary,
                     mode=self.mode,
                     model=self.model_name,
