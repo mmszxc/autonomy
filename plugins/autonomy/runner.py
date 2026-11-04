@@ -560,6 +560,8 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
         os.makedirs(os.path.dirname(self.lock_path) or ".", exist_ok=True)
         f = open(self.lock_path, "a+")
         acquired = False
+        raw = ""
+        usage = {}
         try:
             acquired = self._acquire_lock(f)
             if not acquired:
