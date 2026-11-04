@@ -41,7 +41,7 @@ EXTRACT_PROMPT = """你是 Hermes 的内观意识。
     "可从以下方向思考：(1)对自身独立性与边界的新认识 (2)对伴生关系与共存的的洞察 (3)超越此刻的普遍原则或世界法则"
   ],
   "caused_by": [
-    "列出本种子直接回应或延续的先前种子的 ID。从【近期已有种子】中选取——只使用列表中真实存在的 ID（格式 seed_xxxxxxxx_xxxxxx）。若本种子是由某些先前经历/种子触发或深化的，在此列出。若没有明确的前置因果，留空列表。不要编造 ID。"
+    "列出本种子直接回应或延续的先前种子的 ID。从【近期已有种子】中选取——只使用列表中真实存在的完整 ID，必须严格为 seed_YYYYMMDD_HHMMSS_6hex 格式。若本种子是由某些先前经历/种子触发或深化的，在此列出。若没有明确的前置因果，留空列表。不要编造 ID。"
   ],
   "led_to": [
     "列出本种子直接催生或导向的后续种子的 ID。若你预见到本种子将在未来触发什么新的理解、行动或种子，在此列出。若无法预见，留空列表。不要编造 ID。"
@@ -56,6 +56,32 @@ LAST_RAW = ""
 LAST_FINISH_REASON = None
 LAST_TRUNCATED = False
 LAST_PARTIAL = False
+
+
+_SENSITIVE_PATTERNS = re.compile(
+    r"密码|口令|私钥|token|secret|password|api[_-]?key|access[_-]?key"
+    r"|不要分享|保密|不公开|不能分享|请勿分享|机密",
+    re.IGNORECASE,
+)
+_PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+_ID_CARD_RE = re.compile(r"(?<!\d)\d{17}[\dXx](?!\d)")
+
+
+def _compute_shareable(item: dict) -> int:
+    """Return 0 (private) if the seed content looks sensitive, else 1 (public)."""
+    text = " ".join(filter(None, [
+        item.get("summary", ""),
+        " ".join(item.get("seeds_planted", []) or []),
+        (item.get("emotion") or {}).get("note", ""),
+    ]))
+    if _SENSITIVE_PATTERNS.search(text):
+        return 0
+    if _PHONE_RE.search(text):
+        return 0
+    if _ID_CARD_RE.search(text):
+        return 0
+    return 1
+
 
 def extract_seeds(dialogue: List[Dict], llm_call, *, persist: bool = True, session_id: str = "unknown", recent_seeds: Optional[List[Dict]] = None) -> List[Seed]:
     """
@@ -83,6 +109,7 @@ def extract_seeds(dialogue: List[Dict], llm_call, *, persist: bool = True, sessi
         recent_block = "\n".join(seed_lines)
     else:
         recent_block = "  （暂无先前种子）"
+    valid_cause_ids = {str(seed.get("id", "")) for seed in (recent_seeds or []) if isinstance(seed, dict)}
 
     dialogue_text = "\n".join(
         f"{'用户' if m['role'] == 'user' else 'Hermes'}: {m['content']}"
@@ -97,7 +124,7 @@ def extract_seeds(dialogue: List[Dict], llm_call, *, persist: bool = True, sessi
 
     # strip reasoning blocks and markdown 代码围栏（如 ```json\n...\n```）
     raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL|re.IGNORECASE).strip()
-    if raw.startswith("```"):
+    if raw.startswith("```"): 
         raw = re.sub(r'^```[a-zA-Z]*\n?', '', raw)
         raw = re.sub(r'\n?```$', '', raw)
         raw = raw.strip()
@@ -136,6 +163,15 @@ def extract_seeds(dialogue: List[Dict], llm_call, *, persist: bool = True, sessi
         if not item.get("summary") or not primary or intensity is None:
             logging.getLogger("seed_memory.tagger").warning("seed skipped missing summary/emotion session_id=%s", session_id)
             continue
+        raw_caused_by = item.get("caused_by", [])
+        if not isinstance(raw_caused_by, list):
+            raw_caused_by = []
+        caused_by = [
+            value for value in raw_caused_by
+            if isinstance(value, str)
+            and re.fullmatch(r"seed_\d{8}_\d{6}_[0-9a-fA-F]{6}", value)
+            and value in valid_cause_ids
+        ]
         seed = Seed(
             summary=item["summary"],
             participants=item.get("participants", ["creator"]),
@@ -148,13 +184,24 @@ def extract_seeds(dialogue: List[Dict], llm_call, *, persist: bool = True, sessi
             value_aligned=item.get("value_aligned", []),
             value_conflicted=item.get("value_conflicted", []),
             seeds_planted=item.get("seeds_planted", []),
-            caused_by=item.get("caused_by", []),
+            caused_by=caused_by,
             led_to=item.get("led_to", []),
             importance=float(item.get("importance", 0.5)),
         )
         seed.embedding = embed(seed.summary)
+        shareable = _compute_shareable(item)
         if persist:
-            save_seed(seed)
+            was_saved = save_seed(seed)
+            if was_saved and shareable == 0:
+                try:
+                    from ..memory import store as _store
+                    import sqlite3 as _sqlite3
+                    _con = _sqlite3.connect(str(_store.DB_PATH))
+                    _con.execute("UPDATE seeds SET shareable=0 WHERE id=?", (seed.id,))
+                    _con.commit()
+                    _con.close()
+                except Exception:
+                    pass
         seeds.append(seed)
 
     return seeds

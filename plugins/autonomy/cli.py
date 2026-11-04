@@ -142,6 +142,48 @@ def _seed_details(raw_cfg, hermes_home, seed_ids):
         return []
 
 
+
+
+def cmd_seed_show(seed_id: str, hermes_home=None):
+    """Query a seed by ID and return its full details (excluding embedding blob)."""
+    import sqlite3
+
+    home = resolve_hermes_home(hermes_home)
+    env_path = os.environ.get("HERMES_SEED_DB_PATH", "")
+    candidates = [
+        Path(env_path) if env_path else None,
+        Path(home) / "seed_data" / "seeds" / "seeds.db",
+        Path(home) / "plugins" / "seed_memory" / "seed_src" / "hermes" / "data" / "seeds.db",
+    ]
+    db_path = next((p for p in candidates if p is not None and p.is_file()), None)
+    if db_path is None:
+        return {"ok": False, "not_found": True, "seed_id": seed_id}
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db_path.as_posix(), uri=True)
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            "SELECT id, summary, importance, timestamp, recall_count, shareable, "
+            "emotion_primary, emotion_intensity FROM seeds WHERE id=?",
+            (seed_id,),
+        ).fetchone()
+        con.close()
+    except (OSError, sqlite3.Error) as exc:
+        return {"ok": False, "error": str(exc), "seed_id": seed_id}
+    if row is None:
+        return {"ok": False, "not_found": True, "seed_id": seed_id}
+    return {
+        "ok": True,
+        "seed_id": row["id"],
+        "summary": row["summary"],
+        "importance": row["importance"],
+        "created_at": row["timestamp"],
+        "recall_count": row["recall_count"] if row["recall_count"] is not None else 0,
+        "shareable": row["shareable"] if row["shareable"] is not None else 1,
+        "source": None,
+        "emotion_label": row["emotion_primary"],
+        "emotion_score": row["emotion_intensity"],
+    }
+
 def cmd_log(hermes_home: Optional[str | Path] = None, count: int = 3, full: bool = False, as_json: bool = False, seeds: bool = False, tools: bool = False) -> Dict[str, Any]:
     raw_cfg = load_raw_config(hermes_home)
     path = resolve_paths(raw_cfg, hermes_home=hermes_home)["thought_log"]
@@ -274,9 +316,10 @@ def setup_cli_parser(subparser: argparse.ArgumentParser) -> None:
         "action",
         nargs="?",
         default="status",
-        choices=["init", "stop", "resume", "status", "log", "reset-circuit", "tick"],
-        help="Autonomy command: init | stop | resume | status | tick",
+        choices=["init", "stop", "resume", "status", "log", "reset-circuit", "tick", "seed-show"],
+        help="Autonomy command: init | stop | resume | status | tick | seed-show",
     )
+    subparser.add_argument("seed_id", nargs="?", default=None, help="Seed ID for seed-show")
     subparser.add_argument("--hermes-home", default=None, help="Override HERMES_HOME path")
     subparser.add_argument("--json", action="store_true", help="Output JSON")
     subparser.add_argument("--dry-run", action="store_true", help="Dry run for tick")
@@ -395,6 +438,33 @@ def handle_cli(args: argparse.Namespace) -> int:
         if getattr(args, "resume_if_idle", False):
             tick_args.append("--resume-if-idle")
         return tick_main(tick_args, hermes_home=hermes_home)
+
+    if action == "seed-show":
+        seed_id_arg = getattr(args, "seed_id", None)
+        if not seed_id_arg:
+            print("usage: hermes autonomy seed-show <seed_id>", file=sys.stderr)
+            return 1
+        res = cmd_seed_show(seed_id_arg, hermes_home=hermes_home)
+        if as_json:
+            print(json.dumps(res, ensure_ascii=False))
+        elif not res.get("ok"):
+            if res.get("not_found"):
+                print("seed not found: %s" % seed_id_arg)
+            else:
+                print("error: %s" % res.get("error", "unknown"), file=sys.stderr)
+            return 1
+        else:
+            print("seed_id:      %s" % res["seed_id"])
+            print("created_at:   %s" % res["created_at"])
+            print("importance:   %s" % res["importance"])
+            print("recall_count: %s" % res["recall_count"])
+            print("shareable:    %s" % res["shareable"])
+            print("emotion_label:%s" % res["emotion_label"])
+            print("emotion_score:%s" % res["emotion_score"])
+            print("source:       %s" % (res["source"] or "N/A"))
+            print("summary:")
+            print("  %s" % res["summary"])
+        return 0
 
     return 1
 
