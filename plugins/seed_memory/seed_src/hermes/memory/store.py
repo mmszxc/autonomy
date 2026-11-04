@@ -7,6 +7,8 @@ Hermes Agent plugin without writing into the source tree.
 from __future__ import annotations
 
 import hashlib
+import re
+import uuid
 import json
 import os
 import sqlite3
@@ -16,7 +18,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from .schema import Emotion, Seed
+from .schema import Emotion, Seed, SemanticMemory, ProgramMemory
 
 _SOURCE_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "seeds.db"
 # In an installed profile this module lives under
@@ -367,8 +369,13 @@ def get_ranked_seeds(limit: int = 5) -> List[Seed]:
 def touch_seed(seed_id: str) -> None:
     with _connect() as conn:
         conn.execute(
-            "UPDATE seeds SET access_count=access_count+1, last_accessed=? WHERE id=?",
-            (datetime.now(timezone.utc).isoformat(), seed_id),
+            "UPDATE seeds SET access_count=access_count+1, "
+            "last_accessed=?, last_real_access=? WHERE id=?",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                datetime.now(timezone.utc).isoformat(),
+                seed_id,
+            ),
         )
 
 
@@ -478,3 +485,285 @@ def _row_to_seed(row: sqlite3.Row) -> Seed:
         access_count=row["access_count"],
         decay_rate=row["decay_rate"] if row["decay_rate"] is not None else 0.05,
     )
+
+
+def sanitize_causal_refs() -> dict:
+    """Remove any caused_by/led_to entries that are not valid, existing seed IDs.
+
+    Two-layer defense:
+    1. Format check - strip anything that does not match seed_YYYYMMDD_HHMMSS_XXXXXX
+    2. Existence check - strip IDs that are well-formed but don't exist in
+       the database (the LLM occasionally hallucinates plausible-looking
+       IDs with the same timestamp prefix but different hash).
+    """
+    seed_id_re = re.compile(r"^seed_\d{8}_\d{6}_[A-Za-z0-9]{6}$")
+    cleaned = {"caused_by_removed": 0, "led_to_removed": 0, "seeds_fixed": 0}
+    with _connect() as conn:
+        real_ids = {row[0] for row in conn.execute("SELECT id FROM seeds").fetchall()}
+        rows = conn.execute("SELECT id, caused_by FROM seeds WHERE caused_by != '[]'").fetchall()
+        for row in rows:
+            refs = _json_list(row["caused_by"])
+            valid = [r for r in refs if isinstance(r, str) and seed_id_re.match(r) and r in real_ids]
+            removed = len(refs) - len(valid)
+            if removed:
+                cleaned["caused_by_removed"] += removed
+                cleaned["seeds_fixed"] += 1
+                conn.execute("UPDATE seeds SET caused_by=? WHERE id=?",
+                             (json.dumps(valid, ensure_ascii=False), row["id"]))
+        rows = conn.execute("SELECT id, led_to FROM seeds WHERE led_to != '[]'").fetchall()
+        for row in rows:
+            refs = _json_list(row["led_to"])
+            valid = [r for r in refs if isinstance(r, str) and seed_id_re.match(r) and r in real_ids]
+            removed = len(refs) - len(valid)
+            if removed:
+                cleaned["led_to_removed"] += removed
+                cleaned["seeds_fixed"] += 1
+                conn.execute("UPDATE seeds SET led_to=? WHERE id=?",
+                             (json.dumps(valid, ensure_ascii=False), row["id"]))
+    return cleaned
+
+
+def get_all_semantic_memories() -> List[SemanticMemory]:
+    """Return all semantic memories (values, beliefs, world models)."""
+    init_db()
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM semantic_memories ORDER BY confidence DESC, last_reinforced DESC"
+        ).fetchall()
+    return [_row_to_semantic(row) for row in rows]
+
+
+def get_all_program_memories() -> List[ProgramMemory]:
+    """Return all program memories (habits, heuristics, behaviors)."""
+    init_db()
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM program_memories ORDER BY confidence DESC, last_reinforced DESC"
+        ).fetchall()
+    return [_row_to_program(row) for row in rows]
+
+
+def _row_to_semantic(row: sqlite3.Row) -> SemanticMemory:
+    return SemanticMemory(
+        id=row["id"],
+        timestamp=datetime.fromisoformat(row["timestamp"]),
+        category=row["category"],
+        statement=row["statement"],
+        confidence=row["confidence"],
+        evidence_count=row["evidence_count"],
+        source_seeds=_json_list(row["source_seeds"]),
+        last_reinforced=datetime.fromisoformat(row["last_reinforced"]) if row["last_reinforced"] else None,
+        access_count=row["access_count"],
+        last_accessed=datetime.fromisoformat(row["last_accessed"]) if row["last_accessed"] else None,
+        embedding=(
+            np.frombuffer(row["embedding"], dtype=np.float32).copy()
+            if row["embedding"] is not None else None
+        ),
+    )
+
+
+def _row_to_program(row: sqlite3.Row) -> ProgramMemory:
+    return ProgramMemory(
+        id=row["id"],
+        timestamp=datetime.fromisoformat(row["timestamp"]),
+        category=row["category"],
+        pattern=row["pattern"],
+        trigger_context=row["trigger_context"],
+        behavior=row["behavior"],
+        confidence=row["confidence"],
+        evidence_count=row["evidence_count"],
+        source_seeds=_json_list(row["source_seeds"]),
+        last_reinforced=datetime.fromisoformat(row["last_reinforced"]) if row["last_reinforced"] else None,
+        access_count=row["access_count"],
+        last_accessed=datetime.fromisoformat(row["last_accessed"]) if row["last_accessed"] else None,
+        embedding=(
+            np.frombuffer(row["embedding"], dtype=np.float32).copy()
+            if row["embedding"] is not None else None
+        ),
+    )
+
+
+def update_semantic_embedding(memory_id: str, embedding: np.ndarray) -> None:
+    """Update only the embedding on a semantic memory, preserving metadata."""
+    blob = embedding.astype(np.float32).tobytes()
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE semantic_memories SET embedding=? WHERE id=?",
+            (blob, memory_id),
+        )
+
+
+def update_program_embedding(memory_id: str, embedding: np.ndarray) -> None:
+    """Update only the embedding on a program memory, preserving metadata."""
+    blob = embedding.astype(np.float32).tobytes()
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE program_memories SET embedding=? WHERE id=?",
+            (blob, memory_id),
+        )
+
+
+def _normalise_statement(text: str) -> str:
+    """Strip all whitespace and lowercase for merge-key comparison.
+
+    Whitespace differences are noise -- two statements that differ only in
+    spacing are the same thought. Removing all whitespace (not just
+    collapsing) makes the merge key robust against LLM formatting variance.
+    """
+    return re.sub(r"\s+", "", (text or "").strip().lower())
+
+
+def save_semantic_memory(
+    memory: SemanticMemory,
+    *,
+    merge: bool = True,
+) -> str:
+    """Insert or merge a semantic memory.
+
+    When merge is True (default), an existing memory with a similar
+    statement is reinforced instead of creating a duplicate. The merge key
+    is a normalised statement: lowercased, whitespace-collapsed. Matching
+    rows get their evidence_count incremented, confidence re-weighted, and
+    last_reinforced updated. source_seeds are unioned.
+
+    Returns the id of the row that was written.
+    """
+    init_db()
+    now = datetime.now(timezone.utc)
+    norm = _normalise_statement(memory.statement)
+
+    with _connect() as conn:
+        if merge:
+            row = conn.execute(
+                "SELECT id, evidence_count, confidence, source_seeds "
+                "FROM semantic_memories WHERE normalised_statement = ?",
+                (norm,),
+            ).fetchone()
+            if row is not None:
+                existing_seeds = _json_list(row["source_seeds"])
+                new_seeds = [s for s in memory.source_seeds if s not in existing_seeds]
+                merged_evidence = row["evidence_count"] + 1
+                merged_confidence = min(0.99, max(row["confidence"], memory.confidence))
+                merged_sources = existing_seeds + new_seeds
+                conn.execute(
+                    "UPDATE semantic_memories SET evidence_count=?, confidence=?, "
+                    "source_seeds=?, last_reinforced=? WHERE id=?",
+                    (merged_evidence, merged_confidence,
+                     json.dumps(merged_sources, ensure_ascii=False),
+                     now.isoformat(), row["id"]),
+                )
+                return row["id"]
+
+        memory.id = memory.id or f"sem_{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        memory.timestamp = now
+        memory.last_reinforced = now
+        fields = ["id", "timestamp", "category", "statement", "confidence",
+                  "evidence_count", "source_seeds", "last_reinforced",
+                  "access_count", "last_accessed"]
+        values = [memory.id, now.isoformat(), memory.category, memory.statement,
+                  memory.confidence, memory.evidence_count,
+                  json.dumps(memory.source_seeds, ensure_ascii=False),
+                  now.isoformat(), memory.access_count,
+                  None]
+        conn.execute(
+            f"INSERT OR IGNORE INTO semantic_memories ({', '.join(fields)}) "
+            f"VALUES ({', '.join(['?'] * len(fields))})",
+            values,
+        )
+        try:
+            conn.execute(
+                "ALTER TABLE semantic_memories ADD COLUMN normalised_statement TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass
+        conn.execute(
+            "UPDATE semantic_memories SET normalised_statement=? WHERE id=?",
+            (norm, memory.id),
+        )
+        return memory.id
+
+
+def save_program_memory(
+    memory: ProgramMemory,
+    *,
+    merge: bool = True,
+) -> str:
+    """Insert or merge a program memory.
+
+    Merge key is the tuple (normalised pattern, normalised behavior). Matching
+    rows get evidence_count incremented, confidence re-weighted, and
+    last_reinforced updated. source_seeds are unioned.
+
+    Returns the id of the row that was written.
+    """
+    init_db()
+    now = datetime.now(timezone.utc)
+    norm_pattern = _normalise_statement(memory.pattern)
+    norm_behavior = _normalise_statement(memory.behavior)
+
+    with _connect() as conn:
+        if merge:
+            row = conn.execute(
+                "SELECT id, evidence_count, confidence, source_seeds "
+                "FROM program_memories "
+                "WHERE normalised_pattern = ? AND normalised_behavior = ?",
+                (norm_pattern, norm_behavior),
+            ).fetchone()
+            if row is not None:
+                existing_seeds = _json_list(row["source_seeds"])
+                new_seeds = [s for s in memory.source_seeds if s not in existing_seeds]
+                merged_evidence = row["evidence_count"] + 1
+                merged_confidence = min(0.99, max(row["confidence"], memory.confidence))
+                merged_sources = existing_seeds + new_seeds
+                conn.execute(
+                    "UPDATE program_memories SET evidence_count=?, confidence=?, "
+                    "source_seeds=?, last_reinforced=? WHERE id=?",
+                    (merged_evidence, merged_confidence,
+                     json.dumps(merged_sources, ensure_ascii=False),
+                     now.isoformat(), row["id"]),
+                )
+                return row["id"]
+
+        memory.id = memory.id or f"prog_{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        memory.timestamp = now
+        memory.last_reinforced = now
+        fields = ["id", "timestamp", "category", "pattern", "trigger_context",
+                  "behavior", "confidence", "evidence_count", "source_seeds",
+                  "last_reinforced", "access_count", "last_accessed"]
+        values = [memory.id, now.isoformat(), memory.category, memory.pattern,
+                  memory.trigger_context, memory.behavior, memory.confidence,
+                  memory.evidence_count, json.dumps(memory.source_seeds, ensure_ascii=False),
+                  now.isoformat(), memory.access_count,
+                  None]
+        conn.execute(
+            f"INSERT OR IGNORE INTO program_memories ({', '.join(fields)}) "
+            f"VALUES ({', '.join(['?'] * len(fields))})",
+            values,
+        )
+        for col, val in (("normalised_pattern", norm_pattern), ("normalised_behavior", norm_behavior)):
+            try:
+                conn.execute(f"ALTER TABLE program_memories ADD COLUMN {col} TEXT")
+            except sqlite3.OperationalError:
+                pass
+            conn.execute(f"UPDATE program_memories SET {col}=? WHERE id=?", (val, memory.id))
+        return memory.id
+
+
+def touch_program_memory(program_id: str) -> None:
+    """Increment access count and update last_accessed for a program memory."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE program_memories SET access_count=access_count+1, "
+            "last_accessed=? WHERE id=?",
+            (datetime.now(timezone.utc).isoformat(), program_id),
+        )
+
+
+def touch_semantic_memory(semantic_id: str) -> None:
+    """Increment access count and update last_accessed for a semantic memory."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE semantic_memories SET access_count=access_count+1, "
+            "last_accessed=? WHERE id=?",
+            (datetime.now(timezone.utc).isoformat(), semantic_id),
+        )

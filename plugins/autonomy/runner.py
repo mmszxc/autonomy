@@ -566,7 +566,7 @@ class Runner:
             # Layer 1 (~300 chars): top-5 seeds, 60 chars each.
             layer1 = ["【记忆概览】"]
             for seed_id in unique_ids:
-                layer1.append("%s: %s" % (seed_id, summaries.get(seed_id, "")[:60]))
+                layer1.append("seed_id=%s: %s" % (seed_id, summaries.get(seed_id, "")[:60]))
             layers.append("\n".join(layer1))
             # Layer 2 (~800 chars): one-hop neighbours from seed_edges.
             try:
@@ -592,7 +592,7 @@ class Runner:
                                     label = "related"
                                 other_summary = summaries.get(str(other_id), "")
                                 layer2.append(
-                                    "%s --%s--> %s: %s" % (
+                                    "seed_id=%s --%s--> seed_id=%s: %s" % (
                                         seed_id, label, str(other_id), other_summary[:60]
                                     )
                                 )
