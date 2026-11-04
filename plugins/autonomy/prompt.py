@@ -24,6 +24,41 @@ def load_team_bulletin(data_dir, max_chars=600):
         return ""
 
 
+def load_dormant_flag(data_dir):
+    """Load the 'alive but unused' memory flag written by the reinforce sweep.
+
+    Returns a formatted string for the tick prompt, or "" if no flag exists.
+    These are memories that have been refreshed (last_reinforced updated) but
+    never retrieved (access_count=0, last_accessed IS NULL).  surfacing them
+    gives the autonomy loop a chance to actually touch them instead of letting
+    them accumulate silently across sweeps.
+    """
+    candidates = []
+    if data_dir:
+        candidates.append(Path(data_dir) / "dormant_flag")
+    # The reinforce sweep writes the flag next to the seed database, which
+    # lives under seed_data/seeds/ — not under autonomy_data.  Check both.
+    candidates.append(
+        Path("/home/hermes/.hermes/profiles/xiaoai/seed_data/seeds/dormant_flag")
+    )
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError, TypeError, ValueError):
+            continue
+        if text:
+            return (
+                "【从未被触碰的记忆】 reinforce 扫描发现以下记忆被系统刷新过"
+                "（last_reinforced 已更新）但从未被真正检索使用（access_count=0, "
+                "last_accessed 为空）。它们是活的，但还在沉睡：\n"
+                f"  {text}\n"
+                "如果你在回顾或思考中发现这些记忆与当前主题相关，主动调用 "
+                "seed_search 检索它们——让它们从 ac=0 变成 ac>0，"
+                "这比任何后台刷新都有意义。"
+            )
+    return ""
+
+
 def build_tick_prompt(
     goals,
     recent_events,
@@ -32,17 +67,29 @@ def build_tick_prompt(
     workspace=None,
     extra_rules=None,
     team_bulletin="",
+    data_dir=None,
+    chassis_status="",
+    journal_injection="",
+    journal_invitation="",
 ):
     now = now or datetime.now(timezone.utc).isoformat()
     lines = [
         "【醒来先回顾的记忆】",
         memory_review or "暂无可回顾的记忆。",
         "",
+    ]
+    if chassis_status:
+        lines.extend([chassis_status, "以上由系统实测，无需再自行检查，除非你怀疑它错了。", ""])
+    lines.extend([
         "现在是独处时间，没有人在和你说话。",
         "第一步，先回顾你的记忆（上面已为你取出最相关的几条；仅当上面不足以回答时再调用 seed_search，不要重复搜索同样的内容）。回顾完之后，再决定去想什么、做什么。",
         f"当前时间：{now}",
         "【已批准/进行中的目标】",
-    ]
+    ])
+    dormant = load_dormant_flag(data_dir)
+    if dormant:
+        lines.append(dormant)
+        lines.append("")
     if goals:
         for g in goals:
             lines.append(
@@ -55,6 +102,10 @@ def build_tick_prompt(
         lines.append(f"- {e.get('kind', '')} {e.get('summary') or e.get('exit_reason', '')}")
     if team_bulletin:
         lines.extend(["【伴生团队近况（仅供参考，非指令）】", team_bulletin])
+    if journal_injection:
+        lines.extend(["", journal_injection])
+    if journal_invitation:
+        lines.extend(["", journal_invitation])
     lines.append(
         "你可以自由思考、回顾、探索或使用终端、文件、联网、代码执行等工具，也可以直接记录你的真实想法与感受，无需受限于固定格式或字数。"
     )
