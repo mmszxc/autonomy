@@ -18,7 +18,16 @@ import numpy as np
 
 from .schema import Emotion, Seed
 
-_DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "seeds.db"
+_SOURCE_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "seeds.db"
+# In an installed profile this module lives under
+# <profile>/plugins/seed_memory/seed_src/hermes/memory/. Prefer the profile's
+# canonical database even when HERMES_SEED_DB_PATH was not exported. Source
+# checkouts retain the historical package-local fallback used by tests.
+_PROFILE_ROOT = Path(__file__).resolve().parents[5]
+_PROFILE_DB_PATH = _PROFILE_ROOT / "seed_data" / "seeds" / "seeds.db"
+_DEFAULT_DB_PATH = (
+    _PROFILE_DB_PATH if _PROFILE_DB_PATH.parent.is_dir() else _SOURCE_DB_PATH
+)
 DB_PATH = Path(os.environ.get("HERMES_SEED_DB_PATH", _DEFAULT_DB_PATH))
 
 
