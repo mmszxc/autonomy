@@ -144,8 +144,6 @@ python3 tools/viewer/viewer.py --profile xiaozhi --token '自行生成的长随�
 
 `identity/SOUL.md` 是作者 **mmszxc** 提供的示例身份文件，不是插件运行所必需，也不会由安装步骤自动覆盖到 profile。你可以阅读、采用或替换为自己的身份文件。
 
-身份文件与代码采用不同许可证，详见下一节。
-
 ## 测试
 
 ```bash
@@ -186,5 +184,4 @@ python3 -m pytest tests -q
 
 ## 许可证
 
-- 除 `identity/` 单独标注的内容外，仓库代码和文档以 **MIT License** 发布，见根目录 `LICENSE`。
-- `identity/SOUL.md` 以 **Creative Commons Attribution 4.0 International（CC BY 4.0）** 发布，署名 **mmszxc**，见 `identity/LICENSE.md`。
+本仓库所有内容（包括 `identity/SOUL.md`）均以 **MIT License** 发布，见根目录 `LICENSE`。
