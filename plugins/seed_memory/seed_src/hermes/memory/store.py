@@ -92,7 +92,9 @@ def init_db(db_path: str | os.PathLike[str] | None = None) -> None:
                 content_hash TEXT,
                 caused_by TEXT,
                 led_to TEXT,
-                decay_rate REAL DEFAULT 0.05
+                decay_rate REAL DEFAULT 0.05,
+                recall_count INTEGER DEFAULT 0,
+                shareable INTEGER DEFAULT 1
             )"""
         )
         columns = {row[1] for row in conn.execute("PRAGMA table_info(seeds)")}
@@ -108,6 +110,8 @@ def init_db(db_path: str | os.PathLike[str] | None = None) -> None:
             "caused_by": "TEXT",
             "led_to": "TEXT",
             "decay_rate": "REAL DEFAULT 0.05",
+            "recall_count": "INTEGER DEFAULT 0",
+            "shareable": "INTEGER DEFAULT 1",
         }
         for column, sql_type in migrations.items():
             if column not in columns:
@@ -151,6 +155,86 @@ def init_db(db_path: str | os.PathLike[str] | None = None) -> None:
             "CREATE INDEX IF NOT EXISTS idx_seeds_importance_timestamp "
             "ON seeds(importance DESC, timestamp DESC)"
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS seed_edges (
+                from_id TEXT,
+                to_id TEXT,
+                edge_type TEXT NOT NULL,
+                weight REAL DEFAULT 1.0,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (from_id, to_id, edge_type)
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS seed_expand_requests (
+                id TEXT PRIMARY KEY,
+                seed_id TEXT NOT NULL,
+                requested_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                processed_at TEXT
+            )"""
+        )
+
+        fts_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='seeds_fts'"
+        ).fetchone()
+        if fts_exists is None:
+            try:
+                conn.execute(
+                    "CREATE VIRTUAL TABLE seeds_fts USING "
+                    "fts5(summary, tokenize=trigram, content=seeds, content_rowid=rowid)"
+                )
+            except sqlite3.OperationalError:
+                # SQLite versions before trigram support still have unicode61.
+                conn.execute(
+                    "CREATE VIRTUAL TABLE seeds_fts USING "
+                    "fts5(summary, tokenize=unicode61, content=seeds, content_rowid=rowid)"
+                )
+            conn.execute(
+                "INSERT OR IGNORE INTO seeds_fts(seeds_fts) VALUES('rebuild')"
+            )
+
+        # Migrate causal links already stored in the legacy JSON columns.
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for row in conn.execute("SELECT id, caused_by, led_to FROM seeds"):
+            for parent_id in _json_list(row["caused_by"]):
+                conn.execute(
+                    "INSERT OR IGNORE INTO seed_edges "
+                    "(from_id, to_id, edge_type, weight, created_at) "
+                    "VALUES (?, ?, 'caused_by', 1.0, ?)",
+                    (parent_id, row["id"], now_iso),
+                )
+            for child_id in _json_list(row["led_to"]):
+                conn.execute(
+                    "INSERT OR IGNORE INTO seed_edges "
+                    "(from_id, to_id, edge_type, weight, created_at) "
+                    "VALUES (?, ?, 'led_to', 1.0, ?)",
+                    (row["id"], child_id, now_iso),
+                )
+
+
+def _sync_seed_indexes(conn: sqlite3.Connection, seed: Seed) -> None:
+    """Synchronize the FTS row and normalized causal edges for a new seed."""
+    conn.execute(
+        "INSERT OR REPLACE INTO seeds_fts(rowid, summary) "
+        "SELECT rowid, summary FROM seeds WHERE id=?",
+        (seed.id,),
+    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for parent_id in seed.caused_by:
+        conn.execute(
+            "INSERT OR IGNORE INTO seed_edges "
+            "(from_id, to_id, edge_type, weight, created_at) "
+            "VALUES (?, ?, 'caused_by', 1.0, ?)",
+            (parent_id, seed.id, now_iso),
+        )
+    for child_id in seed.led_to:
+        conn.execute(
+            "INSERT OR IGNORE INTO seed_edges "
+            "(from_id, to_id, edge_type, weight, created_at) "
+            "VALUES (?, ?, 'led_to', 1.0, ?)",
+            (seed.id, child_id, now_iso),
+        )
 
 
 def save_seeds(seeds: List[Seed]) -> int:
@@ -184,7 +268,10 @@ def save_seeds(seeds: List[Seed]) -> int:
                 f"INSERT OR IGNORE INTO seeds ({', '.join(fields)}) VALUES ({', '.join(['?'] * len(fields))})",
                 values,
             )
-            inserted += int(cursor.rowcount > 0)
+            was_inserted = cursor.rowcount > 0
+            inserted += int(was_inserted)
+            if was_inserted:
+                _sync_seed_indexes(conn, seed)
     return inserted
 
 
@@ -235,7 +322,10 @@ def save_seed(seed: Seed) -> bool:
         placeholders = ", ".join(["?"] * len(fields))
         sql = f"INSERT OR IGNORE INTO seeds ({', '.join(fields)}) VALUES ({placeholders})"
         cursor = conn.execute(sql, values)
-        return cursor.rowcount > 0
+        was_inserted = cursor.rowcount > 0
+        if was_inserted:
+            _sync_seed_indexes(conn, seed)
+        return was_inserted
 
 
 def update_embedding(seed_id: str, embedding: np.ndarray) -> None:
@@ -302,14 +392,19 @@ def backlink_led_to(new_seed_ids: List[str], caused_by_map: Dict[str, List[str]]
             if row is None:
                 continue
             current = _json_list(row["led_to"])
-            if child_id in current:
-                continue
-            current.append(child_id)
+            if child_id not in current:
+                current.append(child_id)
+                conn.execute(
+                    "UPDATE seeds SET led_to=? WHERE id=?",
+                    (json.dumps(current, ensure_ascii=False), parent_id),
+                )
+                written += 1
             conn.execute(
-                "UPDATE seeds SET led_to=? WHERE id=?",
-                (json.dumps(current, ensure_ascii=False), parent_id),
+                "INSERT OR IGNORE INTO seed_edges "
+                "(from_id, to_id, edge_type, weight, created_at) "
+                "VALUES (?, ?, 'led_to', 1.0, ?)",
+                (parent_id, child_id, datetime.now(timezone.utc).isoformat()),
             )
-            written += 1
     return written
 
 
