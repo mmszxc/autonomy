@@ -178,6 +178,11 @@ def extract_run_transcript(
         tools: List[Dict[str, str]] = []
         lines: List[str] = []
         unmatched_index = 0
+        _fold_last: Dict[str, Any] = {}
+        _fold_count = 0
+
+        def _strip_ts(s: str) -> str:
+            return re.sub(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?", "", s)
         for message in messages:
             if str(message["role"] or "") != "assistant":
                 continue
@@ -203,10 +208,17 @@ def extract_run_transcript(
                     "result_preview": _preview(result, tool_result_chars),
                 }
                 tools.append(item)
-                line = "【工具】%s args=%s" % (item["name"], item["args_preview"] or "-")
-                if item["result_preview"]:
-                    line += " result=" + item["result_preview"]
-                lines.append(line)
+                _fold_key = (item["name"], item["args_preview"], _strip_ts(item["result_preview"] or ""))
+                if _fold_last.get("key") == _fold_key:
+                    _fold_count += 1
+                    lines[-1] = lines[-1].rsplit(" (连续重复", 1)[0] + " (连续重复 %d 次)" % (_fold_count + 1)
+                else:
+                    _fold_last["key"] = _fold_key
+                    _fold_count = 0
+                    line = "【工具】%s args=%s" % (item["name"], item["args_preview"] or "-")
+                    if item["result_preview"]:
+                        line += " result=" + item["result_preview"]
+                    lines.append(line)
 
         text = "\n".join(lines)
         limit = max(0, int(max_chars))

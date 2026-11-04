@@ -65,6 +65,14 @@ def _decode(raw):
     return json.JSONDecoder().raw_decode(text[start:])[0]
 
 
+def _slice_head_tail(text, head, tail):
+    """Return head + tail of text, skipping the middle when over budget."""
+    total = head + tail
+    if len(text) <= total:
+        return text
+    return text[:head] + "\n…[中段省略]…\n" + text[-tail:]
+
+
 def _decode_or_raw(raw):
     """Parse JSON if present; otherwise preserve the raw text without raising."""
     raw_str = str(raw or "")
@@ -259,7 +267,7 @@ class Runner:
                 "status": "ended", "processed_turns": 0, "retries": 0,
                 "messages": [
                     {"role": "user", "content": "自主思考轮摘要：" + str(user_visible)[:4000]},
-                    {"role": "assistant", "content": str(assistant_text or "")[:16000]},
+                    {"role": "assistant", "content": _slice_head_tail(str(assistant_text or ""), 3000, 11000)},
                 ],
             }
             target = queue_dir / ("session_autonomy_" + run_id + ".json")
@@ -338,7 +346,7 @@ class Runner:
         self._prefetch_meta = {"count": len(ids), "chars": len(bounded), "truncated": truncated, "seed_ids": ids}
         return bounded, ids
 
-    def _prefetch_memory(self, run, recent_events):
+    def _prefetch_memory(self, run, recent_events, goals=None):
         # D-20261102T2220 (xiaoai): rotate query across cycles so retrieval
         # gradually covers more of the seed population instead of re-touching
         # the same ~5 seeds every tick.
@@ -363,10 +371,18 @@ class Runner:
         except Exception:
             idx = 0
         query_parts = [_rotation[idx]]
+        # Inject active goals for relevance-guided retrieval
+        for g in (goals or [])[:2]:
+            gt = "; ".join(filter(None, [g.get("title", ""), g.get("description", "")]))
+            if gt:
+                query_parts.append(gt[:200])
         for event in (recent_events or [])[:5]:
             summary = event.get("summary") or event.get("exit_reason") or ""
             if summary:
-                query_parts.append(str(summary)[:160])
+                # Strip trailing telemetry injected by tick() before using as query
+                summary = re.sub(r"\s*elapsed=\S+.*$", "", summary, flags=re.DOTALL)
+                if summary.strip():
+                    query_parts.append(str(summary)[:160])
         query = "；".join(query_parts)
         provider = None
         try:
@@ -556,8 +572,8 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             goals = [g for g in self.db.list_goals() if g.get("status") in ("approved", "active")]
             if goal_id:
                 goals = [g for g in goals if g.get("id") == goal_id]
-            recent_events = self.db.list_events(5)
-            memory_review, memory_seed_ids = self._prefetch_memory(run, recent_events)
+            recent_events = self.db.recent_runs(5)
+            memory_review, memory_seed_ids = self._prefetch_memory(run, recent_events, goals=goals)
             rules = load_extra_rules(self.data_dir)
             bulletin = load_team_bulletin(self.data_dir)
             chassis_status = ""
@@ -708,6 +724,18 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 int(usage.get("prompt_tokens", 0)),
             )
 
+            # Extract transcript before decode so empty-raw (max_turns hit) can
+            # synthesize a summary from the actual assistant turns.
+            transcript = self._extract_transcript(started, time.time())
+            if not str(raw or "").strip() and transcript.get("assistant_texts"):
+                synth = []
+                for t in transcript["assistant_texts"][-3:]:
+                    if t:
+                        synth.append(t[:300])
+                for tc in transcript.get("tool_calls", [])[-5:]:
+                    synth.append("%s(%s)→%s" % (tc.get("tool_name", ""), tc.get("args_preview", ""), tc.get("result_preview", "")))
+                raw = "【合成摘要（max_turns）】\n" + "\n".join(synth)
+
             # JSON parse failure does NOT trip circuit breaker; raw text is preserved.
             summary, proposals, _is_json = _decode_or_raw(raw)
             created = []
@@ -742,7 +770,6 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             self.db.c.commit()
 
             try:
-                transcript = self._extract_transcript(started, time.time())
                 transcript_text = transcript.get("text") or str(raw or "")
                 transcript_meta = ""
                 if transcript.get("session_id"):
