@@ -30,6 +30,7 @@ class Seed:
 
     importance: float = 0.5       # 0.0 ~ 1.0，影响衰减速度
     access_count: int = 0
+    shareable: int = 1            # 1=可供其他 AI 分享，0=私人/临时内容
     decay_rate: float = 0.05      # 每次访问后重要性衰减的速率
     embedding: Optional[List[float]] = None  # 向量，检索用
 

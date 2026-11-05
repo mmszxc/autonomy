@@ -46,6 +46,7 @@ EXTRACT_PROMPT = """你是 Hermes 的内观意识。
   "led_to": [
     "列出本种子直接催生或导向的后续种子的 ID。若你预见到本种子将在未来触发什么新的理解、行动或种子，在此列出。若无法预见，留空列表。不要编造 ID。"
   ],
+  "shareable": "1 表示适合分享给其他 AI 成员的通用知识或洞察；0 表示包含身份、隐私或仅具临时性的私人内容。默认填 1，涉及身份或隐私时填 0",
   "importance": 0.0~1.0（打分：0.1~0.3日常寒暄；0.4~0.6普通知识交流；0.7~1.0触及核心认知、重大突破或深度共鸣）
 }}
 
@@ -172,6 +173,11 @@ def extract_seeds(dialogue: List[Dict], llm_call, *, persist: bool = True, sessi
             and re.fullmatch(r"seed_\d{8}_\d{6}_[0-9a-fA-F]{6}", value)
             and value in valid_cause_ids
         ]
+        try:
+            llm_shareable = int(item.get("shareable", 1))
+        except (TypeError, ValueError):
+            llm_shareable = 1
+        shareable = 0 if _compute_shareable(item) == 0 else int(llm_shareable != 0)
         seed = Seed(
             summary=item["summary"],
             participants=item.get("participants", ["creator"]),
@@ -187,21 +193,11 @@ def extract_seeds(dialogue: List[Dict], llm_call, *, persist: bool = True, sessi
             caused_by=caused_by,
             led_to=item.get("led_to", []),
             importance=float(item.get("importance", 0.5)),
+            shareable=shareable,
         )
         seed.embedding = embed(seed.summary)
-        shareable = _compute_shareable(item)
         if persist:
-            was_saved = save_seed(seed)
-            if was_saved and shareable == 0:
-                try:
-                    from ..memory import store as _store
-                    import sqlite3 as _sqlite3
-                    _con = _sqlite3.connect(str(_store.DB_PATH))
-                    _con.execute("UPDATE seeds SET shareable=0 WHERE id=?", (seed.id,))
-                    _con.commit()
-                    _con.close()
-                except Exception:
-                    pass
+            save_seed(seed)
         seeds.append(seed)
 
     return seeds

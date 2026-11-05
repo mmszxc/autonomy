@@ -263,7 +263,8 @@ def save_seeds(seeds: List[Seed]) -> int:
             fields = ["id", "timestamp", "summary", "participants", "emotion_primary",
                       "emotion_intensity", "emotion_secondary", "emotion_note", "value_aligned",
                       "value_conflicted", "seeds_planted", "importance", "embedding",
-                      "access_count", "last_accessed", "content_hash", "caused_by", "led_to", "decay_rate"]
+                      "access_count", "last_accessed", "content_hash", "caused_by", "led_to", "decay_rate",
+                      "shareable"]
             values = [seed.id, seed.timestamp.isoformat(), seed.summary,
                       json.dumps(seed.participants, ensure_ascii=False), seed.emotion.primary,
                       seed.emotion.intensity, json.dumps(seed.emotion.secondary, ensure_ascii=False),
@@ -272,7 +273,7 @@ def save_seeds(seeds: List[Seed]) -> int:
                       json.dumps(seed.seeds_planted, ensure_ascii=False), seed.importance,
                       embedding_blob, seed.access_count, None, _seed_hash(seed),
                       json.dumps(seed.caused_by, ensure_ascii=False), json.dumps(seed.led_to, ensure_ascii=False),
-                      seed.decay_rate]
+                      seed.decay_rate, int(seed.shareable)]
             if "created_at" in columns:
                 fields.append("created_at"); values.append(seed.timestamp.isoformat())
             cursor = conn.execute(
@@ -303,7 +304,7 @@ def save_seed(seed: Seed) -> bool:
             "emotion_primary", "emotion_intensity", "emotion_secondary", "emotion_note",
             "value_aligned", "value_conflicted", "seeds_planted", "importance",
             "embedding", "access_count", "last_accessed", "content_hash",
-            "caused_by", "led_to", "decay_rate"
+            "caused_by", "led_to", "decay_rate", "shareable"
         ]
         values = [
             seed.id,
@@ -325,6 +326,7 @@ def save_seed(seed: Seed) -> bool:
             json.dumps(seed.caused_by, ensure_ascii=False),
             json.dumps(seed.led_to, ensure_ascii=False),
             seed.decay_rate,
+            int(seed.shareable),
         ]
         if "created_at" in columns:
             fields.append("created_at")
@@ -483,6 +485,7 @@ def _row_to_seed(row: sqlite3.Row) -> Seed:
         importance=row["importance"],
         embedding=embedding,
         access_count=row["access_count"],
+        shareable=int(row["shareable"] if row["shareable"] is not None else 1),
         decay_rate=row["decay_rate"] if row["decay_rate"] is not None else 0.05,
     )
 

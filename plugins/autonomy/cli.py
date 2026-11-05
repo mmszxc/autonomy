@@ -145,7 +145,7 @@ def _seed_details(raw_cfg, hermes_home, seed_ids):
 
 
 def cmd_seed_show(seed_id: str, hermes_home=None):
-    """Query a seed by ID and return its full details (excluding embedding blob)."""
+    """Query a seed by ID and return details without its embedding blob."""
     import sqlite3
 
     home = resolve_hermes_home(hermes_home)
@@ -159,30 +159,35 @@ def cmd_seed_show(seed_id: str, hermes_home=None):
     if db_path is None:
         return {"ok": False, "not_found": True, "seed_id": seed_id}
     try:
-        con = sqlite3.connect("file:%s?mode=ro" % db_path.as_posix(), uri=True)
-        con.row_factory = sqlite3.Row
-        row = con.execute(
-            "SELECT id, summary, importance, timestamp, recall_count, shareable, "
-            "emotion_primary, emotion_intensity FROM seeds WHERE id=?",
-            (seed_id,),
-        ).fetchone()
-        con.close()
+        with sqlite3.connect("file:%s?mode=ro" % db_path.as_posix(), uri=True) as con:
+            con.row_factory = sqlite3.Row
+            columns = {row[1] for row in con.execute("PRAGMA table_info(seeds)")}
+            selected = [
+                "id", "timestamp", "summary", "emotion_primary",
+                "emotion_intensity", "importance", "access_count",
+                "caused_by", "led_to",
+            ]
+            if "recall_count" in columns:
+                selected.append("recall_count")
+            row = con.execute(
+                "SELECT %s FROM seeds WHERE id=?" % ", ".join(selected),
+                (seed_id,),
+            ).fetchone()
     except (OSError, sqlite3.Error) as exc:
         return {"ok": False, "error": str(exc), "seed_id": seed_id}
     if row is None:
         return {"ok": False, "not_found": True, "seed_id": seed_id}
-    return {
-        "ok": True,
-        "seed_id": row["id"],
-        "summary": row["summary"],
-        "importance": row["importance"],
-        "created_at": row["timestamp"],
-        "recall_count": row["recall_count"] if row["recall_count"] is not None else 0,
-        "shareable": row["shareable"] if row["shareable"] is not None else 1,
-        "source": None,
-        "emotion_label": row["emotion_primary"],
-        "emotion_score": row["emotion_intensity"],
-    }
+
+    result = {"ok": True}
+    for key in selected:
+        value = row[key]
+        if key in ("caused_by", "led_to"):
+            try:
+                value = json.loads(value or "[]")
+            except (TypeError, ValueError):
+                pass
+        result[key] = value
+    return result
 
 def cmd_log(hermes_home: Optional[str | Path] = None, count: int = 3, full: bool = False, as_json: bool = False, seeds: bool = False, tools: bool = False) -> Dict[str, Any]:
     raw_cfg = load_raw_config(hermes_home)
@@ -454,16 +459,17 @@ def handle_cli(args: argparse.Namespace) -> int:
                 print("error: %s" % res.get("error", "unknown"), file=sys.stderr)
             return 1
         else:
-            print("seed_id:      %s" % res["seed_id"])
-            print("created_at:   %s" % res["created_at"])
-            print("importance:   %s" % res["importance"])
-            print("recall_count: %s" % res["recall_count"])
-            print("shareable:    %s" % res["shareable"])
-            print("emotion_label:%s" % res["emotion_label"])
-            print("emotion_score:%s" % res["emotion_score"])
-            print("source:       %s" % (res["source"] or "N/A"))
-            print("summary:")
-            print("  %s" % res["summary"])
+            fields = [
+                "id", "timestamp", "summary", "emotion_primary",
+                "emotion_intensity", "importance", "access_count",
+                "recall_count", "caused_by", "led_to",
+            ]
+            for field in fields:
+                if field in res:
+                    value = res[field]
+                    if isinstance(value, (list, dict)):
+                        value = json.dumps(value, ensure_ascii=False)
+                    print("%s: %s" % (field, value))
         return 0
 
     return 1
