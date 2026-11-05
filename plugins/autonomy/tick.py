@@ -141,6 +141,7 @@ def main(argv=None, *, hermes_home=None):
         workspace=auto_cfg.get("workspace") if isinstance(auto_cfg.get("workspace"), str) else None,
         worker_timeout_s=int(limits_cfg.get("worker_timeout_s", 360) or 360),
         seed_queue_dir=((raw_cfg.get("memory") or {}).get("seed_memory") or {}).get("queue_dir"),
+        journal_config=auto_cfg.get("journal") if isinstance(auto_cfg.get("journal"), dict) else {"enabled": True, "window_local": "21:00-23:59", "tz": "Asia/Shanghai", "reflection_max_chars": 800, "inject_max_chars": 400},
     )
 
     if a.resume_if_idle:
