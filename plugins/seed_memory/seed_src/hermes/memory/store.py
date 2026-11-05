@@ -123,6 +123,8 @@ def init_db(db_path: str | os.PathLike[str] | None = None) -> None:
             "decay_rate": "REAL DEFAULT 0.05",
             "recall_count": "INTEGER DEFAULT 0",
             "shareable": "INTEGER DEFAULT 1",
+            "last_real_access": "TEXT",
+            "last_reinforced": "TEXT",
         }
         for column, sql_type in migrations.items():
             if column not in columns:
