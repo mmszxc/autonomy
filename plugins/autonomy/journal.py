@@ -242,10 +242,16 @@ class JournalManager:
     def finalize(self, output):
         if not self.pending_path:
             return
-        match = _REFLECTION_RE.search(str(output or ""))
-        if not match:
-            return
-        text = match.group(1).strip()[:int(self.cfg["reflection_max_chars"])]
+        raw = str(output or "")
+        match = _REFLECTION_RE.search(raw)
+        if match:
+            text = match.group(1).strip()
+        else:
+            # Models occasionally answer the invitation with a natural label
+            # instead of reproducing the exact requested heading.
+            marker = next((x for x in ("本轮感受：", "独处心情：", "本轮情绪：") if x in raw), "")
+            text = raw.split(marker, 1)[1].strip() if marker else ""
+        text = text[:int(self.cfg["reflection_max_chars"])]
         if text:
             with self.pending_path.open("a", encoding="utf-8") as fh:
                 fh.write("\n【今日体悟】\n" + text + "\n")
