@@ -60,9 +60,12 @@ class ProgramMemory:
     pattern: str = ""
     trigger_context: str = ""
     behavior: str = ""
+    domain_signature: str = ""
     confidence: float = 0.5
     evidence_count: int = 0
     source_seeds: List[str] = field(default_factory=list)
+    counter_seeds: List[str] = field(default_factory=list)
+    consecutive_failures: int = 0
     last_reinforced: Optional[datetime] = None
     access_count: int = 0
     last_accessed: Optional[datetime] = None

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import concurrent.futures
 import importlib.util
+import json
 import os
 import re
 import sqlite3
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -153,6 +154,83 @@ def _fts_retrieve(
     except sqlite3.OperationalError:
         return []
     return [(rank, memory_store._row_to_seed(row)) for rank, row in enumerate(rows, 1)]
+
+
+def retrieve_program_evidence(
+    query: str, recalled_seeds: List[Seed], limit: int = 3
+) -> List[Dict[str, Any]]:
+    """Return active program memories with one positive and negative example."""
+    if limit <= 0:
+        return []
+    try:
+        conn = _connect_ro()
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(program_memories)")
+        }
+        required = {"source_seeds", "counter_seeds", "consecutive_failures"}
+        if not required.issubset(columns):
+            return []
+        rows = conn.execute(
+            """SELECT * FROM program_memories
+               WHERE COALESCE(consecutive_failures, 0) < 2
+               ORDER BY confidence DESC, evidence_count DESC"""
+        ).fetchall()
+        recalled_ids = {seed.id for seed in recalled_seeds}
+        terms = [term.casefold() for term in re.findall(r"\w+", query)[:10]]
+        ranked: List[Tuple[int, sqlite3.Row, List[str], List[str]]] = []
+        for row in rows:
+            positive_ids = [str(item) for item in memory_store._json_list(row["source_seeds"])]
+            counter_ids = [str(item) for item in memory_store._json_list(row["counter_seeds"])]
+            searchable = " ".join(
+                str(row[key] or "")
+                for key in ("domain_signature", "pattern", "trigger_context", "behavior")
+                if key in columns
+            ).casefold()
+            score = 10 * len(recalled_ids.intersection(positive_ids + counter_ids))
+            score += sum(1 for term in terms if term in searchable)
+            if score:
+                ranked.append((score, row, positive_ids, counter_ids))
+        ranked.sort(
+            key=lambda item: (-item[0], -float(item[1]["confidence"] or 0), item[1]["id"])
+        )
+        selected = ranked[:limit]
+        evidence_ids = {
+            seed_id
+            for _, _, positive, counter in selected
+            for seed_id in positive + counter
+        }
+        seed_by_id: Dict[str, Seed] = {}
+        if evidence_ids:
+            placeholders = ",".join("?" for _ in evidence_ids)
+            seed_rows = conn.execute(
+                f"SELECT * FROM seeds WHERE id IN ({placeholders})",
+                tuple(evidence_ids),
+            ).fetchall()
+            seed_by_id = {
+                row["id"]: memory_store._row_to_seed(row) for row in seed_rows
+            }
+        return [
+            {
+                "id": row["id"],
+                "domain_signature": row["domain_signature"] or "",
+                "pattern": row["pattern"] or "",
+                "trigger_context": row["trigger_context"] or "",
+                "behavior": row["behavior"] or "",
+                "confidence": float(row["confidence"] or 0),
+                "positive_seed": next(
+                    (seed_by_id[item] for item in positive if item in seed_by_id), None
+                ),
+                "counter_seed": next(
+                    (seed_by_id[item] for item in counter if item in seed_by_id), None
+                ),
+            }
+            for _, row, positive, counter in selected
+        ]
+    except (sqlite3.Error, ValueError, TypeError, json.JSONDecodeError):
+        return []
+    finally:
+        if "conn" in locals():
+            conn.close()
 
 
 def _fallback(limit: int) -> List[Seed]:

@@ -185,6 +185,40 @@ def init_db(db_path: str | os.PathLike[str] | None = None) -> None:
                 processed_at TEXT
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS program_memories (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'habit',
+                pattern TEXT NOT NULL DEFAULT '',
+                trigger_context TEXT NOT NULL DEFAULT '',
+                behavior TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0.5,
+                evidence_count INTEGER NOT NULL DEFAULT 0,
+                source_seeds TEXT NOT NULL DEFAULT '[]',
+                last_reinforced TEXT,
+                access_count INTEGER NOT NULL DEFAULT 0,
+                last_accessed TEXT,
+                embedding TEXT,
+                normalised_pattern TEXT,
+                normalised_behavior TEXT,
+                domain_signature TEXT NOT NULL DEFAULT '',
+                counter_seeds TEXT NOT NULL DEFAULT '[]',
+                consecutive_failures INTEGER NOT NULL DEFAULT 0
+            )"""
+        )
+        program_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(program_memories)")
+        }
+        for column, declaration in {
+            "domain_signature": "TEXT DEFAULT ''",
+            "counter_seeds": "TEXT DEFAULT '[]'",
+            "consecutive_failures": "INTEGER DEFAULT 0",
+        }.items():
+            if column not in program_columns:
+                conn.execute(
+                    f"ALTER TABLE program_memories ADD COLUMN {column} {declaration}"
+                )
 
         fts_exists = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='seeds_fts'"
@@ -546,6 +580,24 @@ def get_all_program_memories() -> List[ProgramMemory]:
     return [_row_to_program(row) for row in rows]
 
 
+def update_program_memory_failure(memory_id: str, failed: bool = True) -> bool:
+    """Increment the circuit breaker on failure, or reset it after success."""
+    init_db()
+    with _connect() as conn:
+        if failed:
+            cursor = conn.execute(
+                "UPDATE program_memories SET consecutive_failures="
+                "COALESCE(consecutive_failures, 0) + 1 WHERE id=?",
+                (memory_id,),
+            )
+        else:
+            cursor = conn.execute(
+                "UPDATE program_memories SET consecutive_failures=0 WHERE id=?",
+                (memory_id,),
+            )
+        return cursor.rowcount > 0
+
+
 def _row_to_semantic(row: sqlite3.Row) -> SemanticMemory:
     return SemanticMemory(
         id=row["id"],
@@ -573,9 +625,12 @@ def _row_to_program(row: sqlite3.Row) -> ProgramMemory:
         pattern=row["pattern"],
         trigger_context=row["trigger_context"],
         behavior=row["behavior"],
+        domain_signature=row["domain_signature"] or "",
         confidence=row["confidence"],
         evidence_count=row["evidence_count"],
         source_seeds=_json_list(row["source_seeds"]),
+        counter_seeds=_json_list(row["counter_seeds"]),
+        consecutive_failures=row["consecutive_failures"] or 0,
         last_reinforced=datetime.fromisoformat(row["last_reinforced"]) if row["last_reinforced"] else None,
         access_count=row["access_count"],
         last_accessed=datetime.fromisoformat(row["last_accessed"]) if row["last_accessed"] else None,
@@ -707,7 +762,7 @@ def save_program_memory(
     with _connect() as conn:
         if merge:
             row = conn.execute(
-                "SELECT id, evidence_count, confidence, source_seeds "
+                "SELECT id, evidence_count, confidence, source_seeds, counter_seeds "
                 "FROM program_memories "
                 "WHERE normalised_pattern = ? AND normalised_behavior = ?",
                 (norm_pattern, norm_behavior),
@@ -715,15 +770,18 @@ def save_program_memory(
             if row is not None:
                 existing_seeds = _json_list(row["source_seeds"])
                 new_seeds = [s for s in memory.source_seeds if s not in existing_seeds]
+                existing_counters = _json_list(row["counter_seeds"])
+                new_counters = [s for s in memory.counter_seeds if s not in existing_counters]
                 merged_evidence = row["evidence_count"] + 1
                 merged_confidence = min(0.99, max(row["confidence"], memory.confidence))
-                merged_sources = existing_seeds + new_seeds
                 conn.execute(
                     "UPDATE program_memories SET evidence_count=?, confidence=?, "
-                    "source_seeds=?, last_reinforced=? WHERE id=?",
+                    "source_seeds=?, counter_seeds=?, domain_signature=?, "
+                    "consecutive_failures=0, last_reinforced=? WHERE id=?",
                     (merged_evidence, merged_confidence,
-                     json.dumps(merged_sources, ensure_ascii=False),
-                     now.isoformat(), row["id"]),
+                     json.dumps(existing_seeds + new_seeds, ensure_ascii=False),
+                     json.dumps(existing_counters + new_counters, ensure_ascii=False),
+                     memory.domain_signature, now.isoformat(), row["id"]),
                 )
                 return row["id"]
 
@@ -731,13 +789,15 @@ def save_program_memory(
         memory.timestamp = now
         memory.last_reinforced = now
         fields = ["id", "timestamp", "category", "pattern", "trigger_context",
-                  "behavior", "confidence", "evidence_count", "source_seeds",
+                  "behavior", "domain_signature", "confidence", "evidence_count",
+                  "source_seeds", "counter_seeds", "consecutive_failures",
                   "last_reinforced", "access_count", "last_accessed"]
         values = [memory.id, now.isoformat(), memory.category, memory.pattern,
-                  memory.trigger_context, memory.behavior, memory.confidence,
-                  memory.evidence_count, json.dumps(memory.source_seeds, ensure_ascii=False),
-                  now.isoformat(), memory.access_count,
-                  None]
+                  memory.trigger_context, memory.behavior, memory.domain_signature,
+                  memory.confidence, memory.evidence_count,
+                  json.dumps(memory.source_seeds, ensure_ascii=False),
+                  json.dumps(memory.counter_seeds, ensure_ascii=False),
+                  memory.consecutive_failures, now.isoformat(), memory.access_count, None]
         conn.execute(
             f"INSERT OR IGNORE INTO program_memories ({', '.join(fields)}) "
             f"VALUES ({', '.join(['?'] * len(fields))})",
