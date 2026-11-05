@@ -847,6 +847,95 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             except OSError:
                 pass
 
+    # ------------------------------------------------------------------
+    # L0: self-reference circuit breaker (State-Hash Delta check)
+    # ------------------------------------------------------------------
+
+    def _l0_ensure_table(self):
+        """Ensure tick_stats table exists for L0 consecutive-no-change tracking."""
+        try:
+            self.db.c.execute(
+                "CREATE TABLE IF NOT EXISTS tick_stats "
+                "(key TEXT PRIMARY KEY, value TEXT, updated_at REAL)"
+            )
+            self.db.c.commit()
+        except Exception:
+            pass
+
+    def _l0_get_counter(self):
+        """Read consecutive_no_change counter from tick_stats; default 0."""
+        try:
+            self._l0_ensure_table()
+            row = self.db.c.execute(
+                "SELECT value FROM tick_stats WHERE key='consecutive_no_change'"
+            ).fetchone()
+            return int(row[0]) if row else 0
+        except Exception:
+            return 0
+
+    def _l0_set_counter(self, count):
+        """Persist consecutive_no_change counter into tick_stats."""
+        try:
+            self._l0_ensure_table()
+            self.db.c.execute(
+                "INSERT OR REPLACE INTO tick_stats(key, value, updated_at) VALUES(?, ?, ?)",
+                ("consecutive_no_change", str(int(count)), time.time()),
+            )
+            self.db.c.commit()
+        except Exception:
+            pass
+
+    def _l0_snapshot_recall(self):
+        """Return total recall_count sum from seeds.db; -1 when unavailable."""
+        path = self._seed_db_path()
+        if path is None:
+            return -1
+        try:
+            conn = sqlite3.connect(str(path), timeout=2.0)
+            try:
+                columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(seeds)")}
+                if "recall_count" not in columns:
+                    return -1
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(recall_count), 0) FROM seeds"
+                ).fetchone()
+                return int(row[0]) if row else 0
+            finally:
+                conn.close()
+        except Exception:
+            return -1
+
+    def _l0_has_git_change(self, since_ts):
+        """Return True if workspace has new commits or file changes since since_ts."""
+        ws = self.workspace
+        if not ws or not os.path.isdir(str(ws)):
+            return False
+        try:
+            since_str = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(since_ts))
+            result = subprocess.run(
+                ["git", "log", "--oneline", "--after=" + since_str],
+                cwd=str(ws), capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return True
+            result2 = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(ws), capture_output=True, text=True, timeout=10,
+            )
+            return result2.returncode == 0 and bool(result2.stdout.strip())
+        except Exception:
+            return False
+
+    def _l0_detect_change(self, tick_started, recall_before):
+        """Return True if any external state (git / recall_count) changed this tick."""
+        if self._l0_has_git_change(tick_started):
+            return True
+        if recall_before >= 0:
+            recall_after = self._l0_snapshot_recall()
+            if recall_after >= 0 and recall_after != recall_before:
+                return True
+        return False
+
     def tick(self, goal_id=None):
         run = uuid.uuid4().hex
         started = time.time()
@@ -892,6 +981,10 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             if goal_id:
                 goals = [g for g in goals if g.get("id") == goal_id]
             recent_events = self.db.recent_runs(5)
+            # L0: snapshot recall_count before this tick starts
+            _l0_recall_before = self._l0_snapshot_recall()
+            # L0: read consecutive_no_change counter to decide whether to inject hint
+            _l0_count = self._l0_get_counter()
             memory_review, memory_seed_ids = self._prefetch_memory(run, recent_events, goals=goals)
             rules = load_extra_rules(self.data_dir)
             bulletin = load_team_bulletin(self.data_dir)
@@ -913,6 +1006,9 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 journal_injection=journal_injection,
                 journal_invitation=journal_invitation,
             )
+            # L0: append self-reference warning when stuck for >= 2 consecutive rounds
+            if _l0_count >= 2:
+                prompt = prompt + "\n\n【L0提示】连续%d轮未产生外部状态变化，请尝试不同的行动方向。" % _l0_count
             raw = ""
             usage = {}
             is_dialog_first = self.mode != "parallel"
@@ -1087,6 +1183,19 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 ("ok", time.time(), summary_str),
             )
             self.db.c.commit()
+
+            # L0: detect external state change and update consecutive_no_change counter
+            try:
+                _l0_changed = self._l0_detect_change(started, _l0_recall_before)
+                _l0_new_count = 0 if _l0_changed else _l0_count + 1
+                self._l0_set_counter(_l0_new_count)
+                self.db.append_event(
+                    run_id=run, goal_id=goal_id, kind="l0_check",
+                    exit_reason="changed" if _l0_changed else "no_change",
+                    summary="consecutive_no_change=%d" % _l0_new_count,
+                )
+            except Exception:
+                pass
 
             try:
                 transcript_text = transcript.get("text") or str(raw or "")
