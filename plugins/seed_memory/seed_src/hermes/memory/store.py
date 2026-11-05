@@ -216,6 +216,8 @@ def init_db(db_path: str | os.PathLike[str] | None = None) -> None:
             "domain_signature": "TEXT DEFAULT ''",
             "counter_seeds": "TEXT DEFAULT '[]'",
             "consecutive_failures": "INTEGER DEFAULT 0",
+            "normalised_pattern": "TEXT",
+            "normalised_behavior": "TEXT",
         }.items():
             if column not in program_columns:
                 conn.execute(
