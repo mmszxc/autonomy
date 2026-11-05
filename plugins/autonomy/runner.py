@@ -1,4 +1,4 @@
-import os, uuid, json, threading, time, signal, re, subprocess, sys
+import os, uuid, json, threading, time, signal, re, subprocess, sys, statistics
 try:
     import fcntl
 except ImportError:
@@ -436,7 +436,36 @@ class Runner:
         except OSError:
             return ""
 
-    def _enqueue_completed_turn(self, run_id, summary, assistant_text):
+    def _surprise_importance(self, run_id, elapsed, tool_turns):
+        """Score objective surprise against the previous 30 completed ticks."""
+        rows = self.db.c.execute(
+            "SELECT e.summary, COALESCE(t.summary,'') FROM events e LEFT JOIN events t "
+            "ON t.run_id=e.run_id AND t.kind='transcript' WHERE e.kind='tick' "
+            "AND e.run_id<>? ORDER BY e.id DESC LIMIT 30", (run_id,),
+        ).fetchall()
+        elapsed_hist, tools_hist = [], []
+        for tick_summary, transcript_summary in rows:
+            em = re.search(r"elapsed=([0-9.]+)", tick_summary or "")
+            tm = re.search(r"tools=(\d+)", transcript_summary or "")
+            if em:
+                elapsed_hist.append(float(em.group(1)))
+                tools_hist.append(int(tm.group(1)) if tm else 0)
+        if len(elapsed_hist) < 5:
+            return 0.5
+        elapsed_std = statistics.pstdev(elapsed_hist) or 1.0
+        tools_std = statistics.pstdev(tools_hist) or 1.0
+        elapsed_z = (elapsed - statistics.mean(elapsed_hist)) / elapsed_std
+        tool_z = (tool_turns - statistics.mean(tools_hist)) / tools_std
+        delta = max(abs(elapsed_z), abs(tool_z))
+        if elapsed_z > 2.0:
+            return 0.8
+        if elapsed_z < -2.0:
+            return 0.9
+        if delta < 1.0:
+            return 0.2
+        return min(0.7, 0.4 + 0.15 * delta)
+
+    def _enqueue_completed_turn(self, run_id, summary, assistant_text, importance_override=None):
         """Bridge standalone autonomy ticks into seed_memory's queue protocol.
 
         Gateway-driven ticks do not reach Hermes' normal turn finalizer, so its
@@ -457,6 +486,7 @@ class Runner:
                 "session_id": "autonomy_" + run_id,
                 "created_at": time.time(), "updated_at": time.time(),
                 "status": "ended", "processed_turns": 0, "retries": 0,
+                "importance_override": importance_override,
                 "messages": [
                     {"role": "user", "content": "自主思考轮摘要：" + str(user_visible)[:4000]},
                     {"role": "assistant", "content": _slice_head_tail(str(assistant_text or ""), 3000, 11000)},
@@ -1066,7 +1096,12 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                     self.db.append_event(run_id=run, goal_id=goal_id, kind="transcript", exit_reason="ok", summary=transcript_meta[1:][:1200])
                 elif transcript.get("error"):
                     self.db.append_event(run_id=run, goal_id=goal_id, kind="transcript", exit_reason="unavailable", summary=str(transcript["error"])[:1200])
-                queue_result = self._enqueue_completed_turn(run, summary, transcript_text)
+                importance_override = self._surprise_importance(
+                    run, elapsed, int(transcript.get("tool_call_count", 0) or 0)
+                )
+                queue_result = self._enqueue_completed_turn(
+                    run, summary, transcript_text, importance_override
+                )
                 self.db.append_event(
                     run_id=run, goal_id=goal_id, kind="seed_queue",
                     exit_reason="queued" if queue_result.get("queued") else "degraded",

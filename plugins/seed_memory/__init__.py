@@ -377,6 +377,25 @@ class SeedMemoryProvider(MemoryProvider):
             if seed.seeds_planted:
                 insights = [self._memory_text(item, 300) for item in seed.seeds_planted[:5]]
                 lines.append("  洞见：「" + "；".join(insights) + "」")
+        programs = self._retrieval.retrieve_program_evidence(query, seeds)
+        for program in programs:
+            lines.append(
+                f"- program_memory id={self._memory_text(program['id'], 96)}; "
+                f"domain={self._memory_text(program['domain_signature'], 200)}; "
+                f"pattern={self._memory_text(program['pattern'], 400)}; "
+                f"trigger={self._memory_text(program['trigger_context'], 400)}; "
+                f"behavior={self._memory_text(program['behavior'], 500)}; "
+                f"confidence={program['confidence']:.2f}"
+            )
+            for label, key in (("正例", "positive_seed"), ("反例", "counter_seed")):
+                evidence = program[key]
+                if evidence is not None:
+                    lines.append(
+                        f"  {label} seed_id={self._memory_text(evidence.id, 96)}; "
+                        f"summary={self._memory_text(evidence.summary, 600)}; "
+                        f"emotion={self._memory_text(evidence.emotion.primary, 64)}; "
+                        f"insights={self._memory_text('；'.join(evidence.seeds_planted), 600)}"
+                    )
         lines.append("</memory_context>")
         return "\n".join(lines)
 
@@ -590,7 +609,7 @@ class SeedMemoryProvider(MemoryProvider):
         )
         return unique, stats
 
-    def _extract_seeds_with_retry(self, messages: List[Dict[str, str]], session_id: str, recent_seeds: List[Dict[str, Any]]) -> List[Any]:
+    def _extract_seeds_with_retry(self, messages: List[Dict[str, str]], session_id: str, recent_seeds: List[Dict[str, Any]], importance_override=None) -> List[Any]:
         """Run the tagger with bounded retries for transient failures."""
         retries = max(0, int(self._config.get("tagger_retries", 3)))
         delays = (2.0, 6.0, 15.0)
@@ -599,6 +618,7 @@ class SeedMemoryProvider(MemoryProvider):
                 return self._tagger.extract_seeds(
                     messages, self._llm_call, persist=False,
                     session_id=session_id, recent_seeds=recent_seeds,
+                    importance_override=importance_override,
                 )
             except Exception as exc:
                 if not _is_transient_tagger_error(exc) or attempt >= retries:
@@ -702,7 +722,9 @@ class SeedMemoryProvider(MemoryProvider):
                         logger.info("truncated response; retrying path=%s max_tokens=%d", path.name, retry_limit)
                         self._config["tagger_max_tokens"] = retry_limit
                         try:
-                            seeds = self._extract_seeds_with_retry(messages, session_id, recent_seeds)
+                            seeds = self._extract_seeds_with_retry(
+                    messages, session_id, recent_seeds, data.get("importance_override")
+                )
                         finally:
                             self._config["tagger_max_tokens"] = old_limit
                     logger.info("drain model returned path=%s seeds=%d partial=%s elapsed=%.3fs", path.name, len(seeds or []), getattr(_tagger, "LAST_PARTIAL", False), time.monotonic() - started)

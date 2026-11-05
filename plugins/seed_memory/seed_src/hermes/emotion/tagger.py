@@ -84,7 +84,7 @@ def _compute_shareable(item: dict) -> int:
     return 1
 
 
-def extract_seeds(dialogue: List[Dict], llm_call, *, persist: bool = True, session_id: str = "unknown", recent_seeds: Optional[List[Dict]] = None) -> List[Seed]:
+def extract_seeds(dialogue: List[Dict], llm_call, *, persist: bool = True, session_id: str = "unknown", recent_seeds: Optional[List[Dict]] = None, importance_override: Optional[float] = None) -> List[Seed]:
     """
     dialogue: [{"role": "user"/"hermes", "content": "..."}]
     llm_call: 一个函数，接受 prompt 字符串，返回回复字符串
@@ -192,7 +192,7 @@ def extract_seeds(dialogue: List[Dict], llm_call, *, persist: bool = True, sessi
             seeds_planted=item.get("seeds_planted", []),
             caused_by=caused_by,
             led_to=item.get("led_to", []),
-            importance=float(item.get("importance", 0.5)),
+            importance=float(importance_override if importance_override is not None else item.get("importance", 0.5)),
             shareable=shareable,
         )
         seed.embedding = embed(seed.summary)
