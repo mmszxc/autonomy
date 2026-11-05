@@ -163,7 +163,12 @@ def retrieve_program_evidence(
     if limit <= 0:
         return []
     try:
-        conn = _connect_ro()
+        # Unlike immutable seed retrieval, program memories are updated online
+        # (including breaker counters), so this reader must observe the WAL.
+        from .store import DB_PATH
+
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
         columns = {
             row[1] for row in conn.execute("PRAGMA table_info(program_memories)")
         }
