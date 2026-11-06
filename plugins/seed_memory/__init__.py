@@ -723,7 +723,7 @@ class SeedMemoryProvider(MemoryProvider):
                         self._config["tagger_max_tokens"] = retry_limit
                         try:
                             seeds = self._extract_seeds_with_retry(
-                    messages, session_id, recent_seeds, data.get("importance_override")
+                    messages, session_id, recent_seeds, payload.get("importance_override")
                 )
                         finally:
                             self._config["tagger_max_tokens"] = old_limit
