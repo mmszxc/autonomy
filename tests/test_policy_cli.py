@@ -50,7 +50,7 @@ def test_show_json(home, capsys):
     assert rc == 0
     obj = json.loads(out)
     assert {r["id"] for r in obj["rules"]} == {"pr-aaaa000001", "pr-bbbb000002"}
-    assert obj["summary"]["ok"] is True and obj["summary"]["candidates"] == 2
+    assert obj["summary"]["ok"] is True and obj["summary"]["candidates"] == 0
 
 
 def test_history_limit(home, capsys):
@@ -66,7 +66,7 @@ def test_history_limit(home, capsys):
 def test_rollback_removes_rule_and_records_no_failure(home, capsys):
     rc, out = _run(["policy", "rollback", "pr-aaaa000001", "--hermes-home", str(home)], capsys)
     assert rc == 0 and "rolled back" in out
-    ids = [r["id"] for r in policy.load_active_rules(home / "autonomy_data")]
+    ids = [r["id"] for r in policy.load_candidate_rules(home / "autonomy_data")]
     assert ids == ["pr-bbbb000002"]
     conn = sqlite3.connect(str(home / "autonomy_data" / "autonomy.db"))
     kinds = [r[0] for r in conn.execute("select kind from policy_events where rule_id='pr-aaaa000001'")]

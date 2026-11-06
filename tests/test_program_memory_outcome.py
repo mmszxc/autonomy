@@ -28,7 +28,8 @@ def env(tmp_path, monkeypatch):
 def _pm(PM, **kw):
     base = dict(id="", timestamp=None, category="habit", pattern="when alpha zebra",
                 trigger_context="ctx", behavior="do beta", domain_signature="d",
-                confidence=0.5, evidence_count=1)
+                confidence=0.5, evidence_count=1,
+                writer="test-writer", owner="test-owner", provenance="l0:test")
     base.update(kw)
     return PM(**base)
 

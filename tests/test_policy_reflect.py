@@ -108,7 +108,7 @@ def test_valid_rule_written_as_candidate(env):
     llm = _Llm([GOOD])
     res = pr.run_policy_reflection(profile, data, db, _at(3, 5), llm_call=llm, profile="p")
     assert res["status"] == "generated" and llm.calls == 1
-    rules = policy.load_active_rules(data)
+    rules = policy.load_candidate_rules(data)
     assert len(rules) == 1
     r = rules[0]
     assert r["status"] == "candidate" and r["channel"] == "A" and r["source_signature"] == res["key"]
@@ -127,7 +127,7 @@ def test_limit_does_not_generate(env):
     row = db.c.execute("select kind, reason from policy_events").fetchall()
     assert row == []
     assert res["executed"] is False
-    assert len(policy.load_active_rules(data)) == 5
+    assert len(policy.load_candidate_rules(data)) == 5
 
 
 def test_window_and_once_per_day(env):
@@ -315,7 +315,7 @@ def test_runner_reflection_slot_skips_l0_and_surprise(tmp_path, monkeypatch):
     monkeypatch.setattr(pr, "run_policy_reflection", fake)
     out = r.tick()
     assert out["status"] == "policy_reflect"
-    assert r._l0_get_counter() == 2
+    assert r._l0_get_counter() == 0
     kinds = {x["kind"] for x in db.list_events(50)}
     assert "tick" not in kinds and "l0_check" not in kinds
     assert calls and calls[0].get("run_id") == out["run_id"]

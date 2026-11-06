@@ -520,11 +520,17 @@ def remove_rule(data_dir, rule_id, reason="", source="auto", db=None, profile=""
     Returns {"ok", "removed": rule|None, "source", "reason"}.
     """
     try:
-        rules = load_active_rules(data_dir)
+        # A rollback may target an offline candidate or an approved production rule.
+        rules = load_candidate_rules(data_dir)
         hit = next((r for r in rules if r["id"] == rule_id), None)
+        saver = save_candidate_rules
+        if hit is None:
+            rules = load_active_rules(data_dir)
+            hit = next((r for r in rules if r["id"] == rule_id), None)
+            saver = save_active_rules
         if hit is None:
             return {"ok": False, "error": "not_found", "removed": None}
-        res = save_active_rules(data_dir, [r for r in rules if r["id"] != rule_id])
+        res = saver(data_dir, [r for r in rules if r["id"] != rule_id])
         if not res.get("ok"):
             return dict(res, removed=None)
         if db is not None:

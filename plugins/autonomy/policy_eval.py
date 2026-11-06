@@ -210,7 +210,7 @@ def _default_outcome_fn(pm_id, failed, counter_seed_id=None, source="auto", prof
 
 def _apply_stats(data_dir, decided):
     """Write back opportunities/fails/reuse_sessions for rules still active after this tick."""
-    fresh = policy.load_active_rules(data_dir)
+    fresh = policy.load_candidate_rules(data_dir)
     by_id = {r.get("id"): d for r, d in decided if d.get("action") not in (KIND_VETOED, KIND_EXPIRED_NO_OPP,
                                                                          KIND_EXPIRED_NEUTRAL, "error")}
     changed = False
@@ -225,7 +225,7 @@ def _apply_stats(data_dir, decided):
             r["stats"] = dict(st, **new)
             changed = True
     if changed:
-        return policy.save_active_rules(data_dir, fresh)
+        return policy.save_candidate_rules(data_dir, fresh)
     return {"ok": True, "skipped": True}
 
 
@@ -278,7 +278,7 @@ def evaluate_rules(profile_home, data_dir, db, now=None, outcome_fn=None):
                 **kwargs, profile_home=profile_home
             )
         profile = Path(profile_home).name if profile_home else ""
-        rules = policy.load_active_rules(data_dir)
+        rules = policy.load_candidate_rules(data_dir)
         if not rules:
             return {"ok": True, "candidates": 0, "actions": []}
         sdb = policy.open_state_db(profile_home)
@@ -311,7 +311,7 @@ def rule_rows(profile_home, data_dir=None, now=None):
         now = _f(now, time.time())
         home = Path(profile_home)
         data_dir = data_dir or (home / "autonomy_data")
-        rules = policy.load_active_rules(data_dir)
+        rules = policy.load_candidate_rules(data_dir)
         sdb = policy.open_state_db(home)
         adb = policy.open_autonomy_db(home)
         try:
@@ -344,7 +344,7 @@ def dry_run(profile_home, data_dir=None, now=None):
         now = _f(now, time.time())
         home = Path(profile_home)
         data_dir = data_dir or (home / "autonomy_data")
-        rules = policy.load_active_rules(data_dir)
+        rules = policy.load_candidate_rules(data_dir)
         sdb = policy.open_state_db(home)
         adb = policy.open_autonomy_db(home)
         try:
