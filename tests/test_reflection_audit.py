@@ -6,7 +6,10 @@ from autonomy.config import validate_reflection_profile
 from autonomy.policy_reflect import extract_final_json, redact
 
 
-def _tree(tmp_path, config="platform_toolsets:\n  cli: []\n"):
+_ZERO_TOOL_CONFIG = "platform_toolsets:\n  cli: []\nagent:\n  disabled_toolsets: [x_search]\n"
+
+
+def _tree(tmp_path, config=_ZERO_TOOL_CONFIG):
     root = tmp_path / ".hermes"
     source = root / "profiles" / "XiaoAI"
     reflect = root / "profiles" / "reflect"
@@ -33,8 +36,29 @@ def test_profile_name_source_comparison_casefold(tmp_path):
     ("context_engine: token_budget\n", "context_engine_enabled"),
 ])
 def test_profile_rejects_memory_and_both_context_spellings(tmp_path, extra, reason):
-    root, _, _ = _tree(tmp_path, "platform_toolsets:\n  cli: []\n" + extra)
+    root, _, _ = _tree(tmp_path, _ZERO_TOOL_CONFIG + extra)
     assert validate_reflection_profile(root, "XiaoAI", "reflect")[1] == reason
+
+
+@pytest.mark.parametrize("agent_yaml,reason", [
+    ("", "agent_not_mapping"),
+    ("agent: []\n", "agent_not_mapping"),
+    ("agent: text\n", "agent_not_mapping"),
+    ("agent: {}\n", "x_search_not_disabled"),
+    ("agent:\n  disabled_toolsets: x_search\n", "x_search_not_disabled"),
+    ("agent:\n  disabled_toolsets: []\n", "x_search_not_disabled"),
+    ("agent:\n  disabled_toolsets: [X_SEARCH]\n", "x_search_not_disabled"),
+])
+def test_profile_requires_explicit_x_search_disable(tmp_path, agent_yaml, reason):
+    config = "platform_toolsets:\n  cli: []\n" + agent_yaml
+    root, _, _ = _tree(tmp_path, config)
+    assert validate_reflection_profile(root, "XiaoAI", "reflect")[1] == reason
+
+
+def test_profile_allows_x_search_plus_other_disabled_toolsets(tmp_path):
+    config = "platform_toolsets:\n  cli: []\nagent:\n  disabled_toolsets: [terminal, x_search]\n"
+    root, _, _ = _tree(tmp_path, config)
+    assert validate_reflection_profile(root, "XiaoAI", "reflect")[0] is True
 
 
 def test_default_root_profiles_path(tmp_path):

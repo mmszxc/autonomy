@@ -26,17 +26,20 @@ def _profile(tmp_path, config, *, plugins=False):
     return source
 
 
+_ZERO_TOOL_CONFIG = "platform_toolsets:\n  cli: []\nagent:\n  disabled_toolsets: [x_search]\n"
+
+
 def test_reflection_profile_safe_only_when_tools_explicitly_empty(tmp_path):
-    source = _profile(tmp_path, "platform_toolsets:\n  cli: []\n")
+    source = _profile(tmp_path, _ZERO_TOOL_CONFIG)
     assert validate_reflection_profile(source, "xiaoai", "xiaoai-reflect")[:2] == (True, "")
 
 
 @pytest.mark.parametrize("config,reason", [
     ("{}\n", "toolsets_not_explicitly_empty"),
     ("platform_toolsets:\n  cli: [web]\n", "toolsets_not_explicitly_empty"),
-    ("platform_toolsets:\n  cli: []\nmcp_servers:\n  x: {}\n", "mcp_servers_configured"),
-    ("platform_toolsets:\n  cli: []\ncontext_engine:\n  enabled: true\n", "context_engine_enabled"),
-    ("platform_toolsets:\n  cli: []\nplugins: [memory]\n", "plugins_configured"),
+    (_ZERO_TOOL_CONFIG + "mcp_servers:\n  x: {}\n", "mcp_servers_configured"),
+    (_ZERO_TOOL_CONFIG + "context_engine:\n  enabled: true\n", "context_engine_enabled"),
+    (_ZERO_TOOL_CONFIG + "plugins: [memory]\n", "plugins_configured"),
 ])
 def test_reflection_profile_rejects_unsafe_config(tmp_path, config, reason):
     source = _profile(tmp_path, config)
@@ -44,7 +47,7 @@ def test_reflection_profile_rejects_unsafe_config(tmp_path, config, reason):
 
 
 def test_reflection_profile_rejects_plugin_directory(tmp_path):
-    source = _profile(tmp_path, "platform_toolsets:\n  cli: []\n", plugins=True)
+    source = _profile(tmp_path, _ZERO_TOOL_CONFIG, plugins=True)
     assert validate_reflection_profile(source, "xiaoai", "xiaoai-reflect")[1] == "plugin_directory_not_empty"
 
 

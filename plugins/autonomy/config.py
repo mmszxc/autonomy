@@ -86,8 +86,10 @@ def validate_reflection_profile(
 ) -> Tuple[bool, str, Optional[Path]]:
     """Fail closed unless a separate profile explicitly proves it has no tools.
 
-    Portable MCP and built-in plugin resolution are an intentional extension
-    point pending live Hermes resolver measurements.
+    Live Hermes resolver measurements show that an explicit empty CLI toolset
+    suppresses built-ins, plugins, and portable MCP.  XAI credentials are the
+    exception: they can auto-inject ``x_search``, so it must also be explicitly
+    disabled under ``agent.disabled_toolsets``.
     """
     name = str(reflection_profile or "").strip()
     source_name = str(source_profile or "").strip()
@@ -119,6 +121,12 @@ def validate_reflection_profile(
     toolsets = raw.get("platform_toolsets")
     if not isinstance(toolsets, dict) or "cli" not in toolsets or toolsets.get("cli") != []:
         return False, "toolsets_not_explicitly_empty", profile_home
+    agent = raw.get("agent")
+    if not isinstance(agent, dict):
+        return False, "agent_not_mapping", profile_home
+    disabled_toolsets = agent.get("disabled_toolsets")
+    if not isinstance(disabled_toolsets, list) or "x_search" not in disabled_toolsets:
+        return False, "x_search_not_disabled", profile_home
     if raw.get("mcp_servers") not in (None, False, {}, []):
         return False, "mcp_servers_configured", profile_home
     if raw.get("memory") not in (None, False, {}, []):
