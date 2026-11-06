@@ -149,7 +149,10 @@ def test_model_error_degrades(env):
     res = pr.run_policy_reflection(profile, data, db, _at(3, 5), llm_call=llm)
     assert res["executed"] is True and res["status"] == "model_error"
     assert not (data / "policy" / "active.json").exists()
-    assert pr.run_policy_reflection(profile, data, db, _at(3, 5), llm_call=None)["status"] == "already_ran"
+    # Operational/model failures are retryable within the daily three-attempt cap.
+    assert pr.run_policy_reflection(profile, data, db, _at(3, 5), llm_call=_Llm([RuntimeError("boom")]))["status"] == "model_error"
+    assert pr.run_policy_reflection(profile, data, db, _at(3, 5), llm_call=_Llm([RuntimeError("boom")]))["status"] == "model_error"
+    assert pr.run_policy_reflection(profile, data, db, _at(3, 5), llm_call=None)["status"] == "attempt_limit"
 
 
 def test_no_model_and_no_trigger_degrade(tmp_path):

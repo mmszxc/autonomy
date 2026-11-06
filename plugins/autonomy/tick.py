@@ -12,6 +12,7 @@ from .config import (
     resolve_autonomy_model,
     determine_mode,
     resolve_paths,
+    validate_reflection_profile,
 )
 
 # These outcomes are expected scheduler decisions, not service failures.
@@ -44,12 +45,19 @@ def main(argv=None, *, hermes_home=None):
     paths = resolve_paths(raw_cfg, hermes_home=a.hermes_home)
     mode = determine_mode(raw_cfg, hermes_home=a.hermes_home)
     auto_model = resolve_autonomy_model(raw_cfg)
+    reflect_cfg = auto_cfg.get("policy_reflect") if isinstance(auto_cfg.get("policy_reflect"), dict) else {}
+    reflection_profile = str(reflect_cfg.get("profile") or "").strip()
+    reflection_safe, reflection_reason, _ = validate_reflection_profile(
+        a.hermes_home, Path(a.hermes_home).name, reflection_profile
+    )
 
     base = os.environ.get("AUTONOMY_DB_PATH") or paths["db_path"]
     stop = os.environ.get("AUTONOMY_STOP_FILE") or paths["stop_file"]
     db = AutonomyDB(base)
     if a.dry_run:
-        print("dry_run db=%s stop=%s mode=%s" % (base, stop, mode))
+        print("dry_run db=%s stop=%s mode=%s reflection_profile=%s reflection_safe=%s reason=%s" % (
+            base, stop, mode, reflection_profile or "-", reflection_safe, reflection_reason or "-"
+        ))
         return 0
 
     activity = os.environ.get("AUTONOMY_ACTIVITY_FILE") or paths["activity_file"]
@@ -143,6 +151,9 @@ def main(argv=None, *, hermes_home=None):
         worker_timeout_s=int(limits_cfg.get("worker_timeout_s", 360) or 360),
         seed_queue_dir=((raw_cfg.get("memory") or {}).get("seed_memory") or {}).get("queue_dir"),
         journal_config=auto_cfg.get("journal") if isinstance(auto_cfg.get("journal"), dict) else {"enabled": True, "window_local": "21:00-23:59", "tz": "Asia/Shanghai", "reflection_max_chars": 800, "inject_max_chars": 400},
+        reflection_profile=reflection_profile,
+        reflection_profile_safe=reflection_safe,
+        reflection_profile_reason=reflection_reason,
     )
 
     if a.resume_if_idle:

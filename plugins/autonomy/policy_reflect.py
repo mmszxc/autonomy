@@ -242,19 +242,37 @@ def build_reflection_input(trigger, profile_home, state_db, autonomy_db, active_
 # ---------------------------------------------------------------- validation
 
 _RE_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+_REQUIRED_OUTPUT_KEYS = {"condition", "action", "tool_family"}
+
+
+def _json_objects(raw):
+    text = _ANSI_RE.sub("", str(raw or "").replace("\r", ""))
+    text = re.sub(r"```(?:json)?|```", "", text, flags=re.I)
+    decoder = json.JSONDecoder()
+    values = []
+    for pos, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[pos:])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            values.append(value)
+    return values
+
+
+def extract_final_json(raw):
+    """Return the last schema-shaped policy object from noisy CLI output."""
+    for value in reversed(_json_objects(raw)):
+        if _REQUIRED_OUTPUT_KEYS <= set(value):
+            return value
+    return None
 
 
 def _parse_json(raw):
-    if not isinstance(raw, str):
-        return None
-    m = re.search(r"\{.*\}", raw, re.S)
-    if not m:
-        return None
-    try:
-        v = json.loads(m.group(0))
-    except Exception:
-        return None
-    return v if isinstance(v, dict) else None
+    return extract_final_json(raw)
 
 
 def validate_rule(obj, trigger, active_rules, rejected_texts=()):
@@ -296,7 +314,7 @@ def validate_rule(obj, trigger, active_rules, rejected_texts=()):
     return True, "", text
 
 
-def generate_rule(trigger, input_text, active_rules, rejected_texts, llm_call, trigger_tool=None):
+def generate_rule(trigger, input_text, active_rules, rejected_texts, llm_call, trigger_tool=None, max_attempts=MAX_ATTEMPTS):
     """Ask the model and validate; up to MAX_ATTEMPTS. Never raises.
 
     Returns {"status": "ok"|"rejected_format"|"model_error", "attempts", "reason", "text", "parsed": {...}}.
@@ -304,17 +322,18 @@ def generate_rule(trigger, input_text, active_rules, rejected_texts, llm_call, t
     if llm_call is None:
         return {"status": "model_error", "attempts": 0, "reason": "no_model", "text": "", "parsed": {}}
     reason, last_text, last_parsed = "", "", {}
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    for attempt in range(1, max_attempts + 1):
         prompt = input_text if attempt == 1 else (
             input_text + "\n\n【上次输出不合格：%s。请重新只输出一个合格的 JSON 对象。】" % reason)
         try:
             raw = llm_call(prompt)
         except Exception as exc:
-            return {"status": "model_error", "attempts": attempt, "reason": type(exc).__name__,
+            return {"status": getattr(exc, "reason", "model_error"),
+                    "attempts": attempt, "reason": getattr(exc, "reason", type(exc).__name__),
                     "text": "", "parsed": {}}
-        obj = _parse_json(raw)
+        obj = extract_final_json(raw)
         if obj is None:
-            reason = "not_json"
+            reason = "reflection_no_valid_json" if not _json_objects(raw) else "reflection_schema_invalid"
             continue
         last_parsed = {k: obj.get(k) for k in ("condition", "action", "tool_family") if isinstance(obj.get(k), str)}
         ok, reason, text = validate_rule(obj, trigger, active_rules, rejected_texts)
@@ -322,7 +341,8 @@ def generate_rule(trigger, input_text, active_rules, rejected_texts, llm_call, t
             return {"status": "ok", "attempts": attempt, "reason": "", "text": text, "parsed": last_parsed}
         last_text = "当%s（工具族 %s）时，%s" % (last_parsed.get("condition", ""), last_parsed.get("tool_family", ""),
                                              last_parsed.get("action", "")) if last_parsed else ""
-    return {"status": "rejected_format", "attempts": MAX_ATTEMPTS, "reason": reason, "text": last_text[:300],
+    status = reason if reason in ("reflection_no_valid_json", "reflection_schema_invalid") else "rejected_format"
+    return {"status": status, "attempts": max_attempts, "reason": reason, "text": last_text[:300],
             "parsed": last_parsed}
 
 # ---------------------------------------------------------------- entry point
@@ -354,13 +374,25 @@ def _already_ran_today(db, loc):
     try:
         with db.lock:
             return db.c.execute("select 1 from events where kind='policy_reflect' "
-                                "and exit_reason!='policy_reflect_skipped' and ts>=? limit 1",
+                                "and exit_reason in ('generated','no_trigger') and ts>=? limit 1",
                                 (day_start,)).fetchone() is not None
     except Exception:
         return True  # cannot prove it has not run: do not risk a double run
 
 
-def _reflect_core(profile_home, data_dir, db, llm_call, profile, now_ts):
+def _attempts_today(db, loc):
+    day_start = loc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    try:
+        with db.lock:
+            rows = db.c.execute(
+                "select summary from events where kind='policy_reflect' and ts>=?", (day_start,)
+            ).fetchall()
+        return sum(int((json.loads(row[0] or "{}") or {}).get("attempts", 0)) for row in rows)
+    except Exception:
+        return MAX_ATTEMPTS
+
+
+def _reflect_core(profile_home, data_dir, db, llm_call, profile, now_ts, max_attempts):
     sdb = P.open_state_db(profile_home)
     adb = P.open_autonomy_db(profile_home)
     try:
@@ -380,12 +412,13 @@ def _reflect_core(profile_home, data_dir, db, llm_call, profile, now_ts):
         text_in, pm = build_reflection_input(trig, profile_home, sdb, adb, active)
         tool = trig["item"].get("tool") if trig["channel"] == "A" else (
             "seed_search" if trig["item"].get("kind") == "seed_search_repeat" else None)
-        gen = generate_rule(trig, text_in, active, rej_texts, llm_call, tool)
+        gen = generate_rule(trig, text_in, active, rej_texts, llm_call, tool, max_attempts=max_attempts)
         if gen["status"] != "ok":
             if gen["status"] == "rejected_format":
                 db.record_policy_event(key, "rejected_format", gen["reason"],
                                        dict(payload, text=gen.get("text", "")), profile)
-            return {"status": gen["status"], "key": key, "reason": gen.get("reason", "")}
+            return {"status": gen["status"], "key": key, "reason": gen.get("reason", ""),
+                    "attempts": gen.get("attempts", 0)}
         p = gen["parsed"]
         rule_id = "pr-" + hashlib.sha1(gen["text"].encode("utf-8")).hexdigest()[:10]
         baseline = P.baseline(adb, sdb, p.get("tool_family", ""), now_ts)
@@ -396,7 +429,8 @@ def _reflect_core(profile_home, data_dir, db, llm_call, profile, now_ts):
         if not res.get("ok"):
             return {"status": "write_failed", "key": key, "reason": res.get("error", "")}
         db.record_policy_event(rule_id, "generated", "", dict(payload, attempts=gen["attempts"]), profile)
-        return {"status": "generated", "key": key, "rule_id": rule_id}
+        return {"status": "generated", "key": key, "rule_id": rule_id,
+                "attempts": gen.get("attempts", 0)}
     finally:
         for c in (sdb, adb):
             try:
@@ -407,7 +441,7 @@ def _reflect_core(profile_home, data_dir, db, llm_call, profile, now_ts):
 
 
 def run_policy_reflection(profile_home, data_dir, db, now=None, llm_call=None, profile="", run_id=None,
-                          has_chat=True):
+                          has_chat=True, skip_reason="transport_no_chat"):
     """Run the nightly reflection once per local day inside 03:00-03:39. Never raises.
 
     Returns {"executed": bool, "status": str, ...}. executed=True means the caller
@@ -421,12 +455,15 @@ def run_policy_reflection(profile_home, data_dir, db, now=None, llm_call=None, p
             return {"executed": False, "status": "outside_window"}
         if _already_ran_today(db, loc):
             return {"executed": False, "status": "already_ran"}
+        used_attempts = _attempts_today(db, loc)
+        if used_attempts >= MAX_ATTEMPTS:
+            return {"executed": False, "status": "attempt_limit"}
     except Exception as exc:
         return {"executed": False, "status": "error", "error": type(exc).__name__}
     now_ts = loc.timestamp()
     run = run_id or uuid.uuid4().hex
     if not has_chat:
-        skip = {"status": "policy_reflect_skipped", "reason": "transport_no_chat"}
+        skip = {"status": "policy_reflect_skipped", "reason": skip_reason or "transport_no_chat"}
         try:
             db.append_event(ts=now_ts, run_id=run, kind="policy_reflect", exit_reason=skip["status"],
                             summary=json.dumps(skip, ensure_ascii=False))
@@ -435,7 +472,10 @@ def run_policy_reflection(profile_home, data_dir, db, now=None, llm_call=None, p
         # A transport skip must not consume the reflection window; normal tick continues.
         return dict(skip, executed=False)
     try:
-        res = _reflect_core(profile_home, data_dir, db, llm_call, profile, now_ts)
+        res = _reflect_core(
+            profile_home, data_dir, db, llm_call, profile, now_ts,
+            max_attempts=MAX_ATTEMPTS - used_attempts,
+        )
     except Exception as exc:
         res = {"status": "error", "error": type(exc).__name__}
     try:

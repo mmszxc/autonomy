@@ -67,6 +67,44 @@ def load_raw_config(hermes_home: Optional[str | Path] = None) -> Dict[str, Any]:
         return {}
 
 
+def validate_reflection_profile(
+    hermes_home: str | Path, source_profile: str, reflection_profile: str | None
+) -> Tuple[bool, str, Optional[Path]]:
+    """Prove a sibling reflection profile resolves to no tools; fail closed."""
+    name = str(reflection_profile or "").strip()
+    if not name:
+        return False, "profile_not_configured", None
+    if name == source_profile or Path(name).name != name:
+        return False, "profile_not_isolated", None
+    profile_home = Path(hermes_home).resolve().parent / name
+    cfg_path = profile_home / "config.yaml"
+    try:
+        raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False, "profile_unreadable", profile_home
+    if not isinstance(raw, dict):
+        return False, "config_not_mapping", profile_home
+    toolsets = raw.get("platform_toolsets")
+    if not isinstance(toolsets, dict) or toolsets.get("cli") != []:
+        return False, "toolsets_not_explicitly_empty", profile_home
+    if raw.get("mcp_servers"):
+        return False, "mcp_servers_configured", profile_home
+    context = raw.get("context_engine")
+    if context not in (None, False, {}) and not (
+        isinstance(context, dict) and context.get("enabled") is False
+    ):
+        return False, "context_engine_enabled", profile_home
+    if raw.get("plugins") or raw.get("enabled_plugins"):
+        return False, "plugins_configured", profile_home
+    plugins_dir = profile_home / "plugins"
+    try:
+        if plugins_dir.exists() and any(plugins_dir.iterdir()):
+            return False, "plugin_directory_not_empty", profile_home
+    except OSError:
+        return False, "plugin_directory_unreadable", profile_home
+    return True, "", profile_home
+
+
 def save_raw_config(raw_cfg: Dict[str, Any], hermes_home: Optional[str | Path] = None) -> Path:
     home = resolve_hermes_home(hermes_home)
     home.mkdir(parents=True, exist_ok=True)

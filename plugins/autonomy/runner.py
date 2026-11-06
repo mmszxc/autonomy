@@ -150,6 +150,9 @@ class Runner:
         worker_timeout_s=360,
         seed_queue_dir=None,
         journal_config=None,
+        reflection_profile="",
+        reflection_profile_safe=False,
+        reflection_profile_reason="profile_not_configured",
     ):
         self.db = db
         self.budget = budget
@@ -164,6 +167,10 @@ class Runner:
         self.seed_queue_dir = Path(seed_queue_dir).expanduser() if seed_queue_dir else None
         self.journal_config = journal_config if isinstance(journal_config, dict) else None
         self.phase1_enabled = self.journal_config is not None
+        self.reflection_profile = reflection_profile
+        self.reflection_profile_safe = bool(reflection_profile_safe)
+        self.reflection_profile_reason = reflection_profile_reason
+        self._last_reflection_usage = {}
         self.active_run_file = os.path.join(os.path.dirname(self.lock_path), "AUTONOMY_REMOTE_RUN")
         self.preempt_file = os.path.join(os.path.dirname(self.lock_path), "PREEMPT_NOW")
         self.stop_wait_s = 600
@@ -447,9 +454,36 @@ class Runner:
             return ""
 
     def _policy_llm_call(self, run):
-        """Prompt->text using the same gateway.chat封装 as the normal tick; None if unsupported."""
+        """Return a budgeted/circuit-protected reflection callable, if safe."""
         gw = self.gateway
-        if gw is None or not callable(getattr(gw, "chat", None)):
+        if gw is None:
+            return None
+        if callable(getattr(gw, "run_reflection", None)):
+            if not self.reflection_profile_safe or not self.reflection_profile:
+                return None
+
+            def _cli_call(prompt):
+                from .cli_transport import ReflectionCallError
+                if not self.budget.allow():
+                    raise ReflectionCallError("reflection_budget_denied")
+                if not self.circuit.allow():
+                    raise ReflectionCallError("reflection_circuit_open")
+                try:
+                    result = gw.run_reflection(
+                        prompt, run, reflection_profile=self.reflection_profile
+                    )
+                except ReflectionCallError as exc:
+                    if exc.reason in ("reflection_timeout", "reflection_transport_failed"):
+                        self.budget.consume()
+                        self.circuit.failure()
+                    raise
+                self.budget.consume()
+                self.circuit.success()
+                self._last_reflection_usage = result.get("usage") or {}
+                return result["text"]
+
+            return _cli_call
+        if not callable(getattr(gw, "chat", None)):
             return None
 
         def _call(prompt):
@@ -467,10 +501,14 @@ class Runner:
         try:
             from . import policy_reflect as _pr
 
+            llm_call = self._policy_llm_call(run)
+            skip_reason = "transport_no_chat"
+            if callable(getattr(self.gateway, "run_reflection", None)):
+                skip_reason = self.reflection_profile_reason or "unsafe_profile"
             res = _pr.run_policy_reflection(
                 self.hermes_home, self.data_dir, self.db, time.time(),
-                llm_call=self._policy_llm_call(run), profile=self._profile_name(), run_id=run,
-                has_chat=callable(getattr(self.gateway, "chat", None)),
+                llm_call=llm_call, profile=self._profile_name(), run_id=run,
+                has_chat=callable(llm_call), skip_reason=skip_reason,
             )
         except Exception:
             return None

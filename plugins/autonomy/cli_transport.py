@@ -1,5 +1,5 @@
 """Hermes CLI transport for runtimes without the HTTP runs API."""
-import os, signal, subprocess, threading, uuid
+import os, signal, subprocess, tempfile, threading, uuid
 try:
     import resource
 except ImportError:
@@ -14,6 +14,27 @@ def _reset_address_space_limit():
         resource.setrlimit(resource.RLIMIT_AS, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
     except (OSError, ValueError):
         pass
+
+
+def build_reflection_command(gateway, run_id, reflection_profile, prompt_file):
+    """Build a no-save oneshot command; tool safety is proved by profile config."""
+    cmd = [gateway.hermes_bin, "-p", reflection_profile, "chat"]
+    if gateway.model:
+        cmd.extend(["--model", gateway.model])
+    if gateway.provider:
+        cmd.extend(["--provider", gateway.provider])
+    session = "autonomy-reflect-%s-%s" % (run_id, uuid.uuid4().hex[:12])
+    cmd.extend([
+        "--prompt-file", str(prompt_file), "--session-id", session,
+        "--timeout", str(gateway.run_budget), "--no-save", "--oneshot", "--quiet",
+    ])
+    return cmd
+
+
+class ReflectionCallError(RuntimeError):
+    def __init__(self, reason, detail=""):
+        super().__init__(detail or reason)
+        self.reason = reason
 
 
 class CliGateway:
@@ -73,5 +94,37 @@ class CliGateway:
     def append_run_message(self, rid, content):
         # One-shot CLI has no mid-run message endpoint; runner records advisory skip.
         raise RuntimeError("cli_transport_has_no_append_message")
+
+    def run_reflection(self, prompt, run_id, *, reflection_profile):
+        fd, prompt_path = tempfile.mkstemp(prefix="autonomy-reflect-", suffix=".txt")
+        os.close(fd)
+        with open(prompt_path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(prompt)
+        cmd = build_reflection_command(self, run_id, reflection_profile, prompt_path)
+        kwargs = {
+            "capture_output": True, "text": True,
+            "errors": "replace", "timeout": self.run_budget + 30,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            kwargs["start_new_session"] = True
+            kwargs["preexec_fn"] = _reset_address_space_limit
+        try:
+            try:
+                proc = subprocess.run(cmd, **kwargs)
+            except subprocess.TimeoutExpired as exc:
+                raise ReflectionCallError("reflection_timeout", str(exc)) from exc
+            text = proc.stdout.strip()
+            if proc.returncode != 0:
+                raise ReflectionCallError("reflection_transport_failed", proc.stderr[-500:])
+            if not text:
+                raise ReflectionCallError("reflection_empty_output")
+            return {"text": text, "usage": {"calls": 1}}
+        finally:
+            try:
+                os.unlink(prompt_path)
+            except OSError:
+                pass
 
     def end(self, sid): pass
