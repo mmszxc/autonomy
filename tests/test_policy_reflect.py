@@ -247,7 +247,7 @@ def test_runner_cli_gateway_skip_continues_normal_tick_end_to_end(tmp_path, monk
     calls = []
     r = Runner(db, Budget(), Circuit(), str(tmp_path / "STOP"),
                lambda: calls.append(1) or {"text": '{"thoughts":"x","proposals":[]}', "completion_tokens": 1, "prompt_tokens": 1},
-               lock_path=str(tmp_path / "lock"))
+               lock_path=str(tmp_path / "lock"), p0_mode="normal")
     monkeypatch.setattr(pr, "in_reflection_window", lambda now=None: True)
     out = r.tick()
     assert calls == [1]  # skipped reflection did not swallow the normal turn
@@ -266,7 +266,7 @@ def test_evaluate_called_once_on_normal_tick(tmp_path, monkeypatch):
     db = AutonomyDB(tmp_path / "a.db")
     r = Runner(db, Budget(), Circuit(), str(tmp_path / "STOP"),
                lambda: {"text": '{"thoughts":"x","proposals":[]}', "completion_tokens": 1, "prompt_tokens": 1},
-               lock_path=str(tmp_path / "lock"))
+               lock_path=str(tmp_path / "lock"), p0_mode="normal")
     monkeypatch.setattr(pr, "run_policy_reflection", lambda *a, **k: {"executed": False, "status": "outside_window"})
     assert r.tick()["status"] == "ok"
     assert len(calls) == 1
@@ -278,7 +278,7 @@ def test_evaluate_not_called_on_reflection_tick(tmp_path, monkeypatch):
     db = AutonomyDB(tmp_path / "a.db")
     r = Runner(db, Budget(), Circuit(), str(tmp_path / "STOP"),
                lambda: {"text": '{"thoughts":"x","proposals":[]}', "completion_tokens": 1, "prompt_tokens": 1},
-               lock_path=str(tmp_path / "lock"))
+               lock_path=str(tmp_path / "lock"), p0_mode="normal")
     monkeypatch.setattr(pr, "run_policy_reflection", lambda *a, **k: {"executed": True, "status": "no_trigger"})
     assert r.tick()["status"] == "policy_reflect"
     assert calls == []
@@ -294,7 +294,7 @@ def test_evaluate_exception_does_not_change_status(tmp_path, monkeypatch):
     db = AutonomyDB(tmp_path / "a.db")
     r = Runner(db, Budget(), Circuit(), str(tmp_path / "STOP"),
                lambda: {"text": '{"thoughts":"x","proposals":[]}', "completion_tokens": 1, "prompt_tokens": 1},
-               lock_path=str(tmp_path / "lock"))
+               lock_path=str(tmp_path / "lock"), p0_mode="normal")
     monkeypatch.setattr(pr, "run_policy_reflection", lambda *a, **k: {"executed": False, "status": "outside_window"})
     assert r.tick()["status"] == "ok"
 
@@ -304,7 +304,7 @@ def test_runner_reflection_slot_skips_l0_and_surprise(tmp_path, monkeypatch):
     lock = tmp_path / "lock"
     r = Runner(db, Budget(), Circuit(), str(tmp_path / "STOP"),
                lambda: {"text": '{"thoughts":"x","proposals":[]}', "completion_tokens": 1, "prompt_tokens": 1},
-               lock_path=str(lock))
+               lock_path=str(lock), p0_mode="normal")
     r._l0_set_counter(2)
     calls = []
 
@@ -321,12 +321,24 @@ def test_runner_reflection_slot_skips_l0_and_surprise(tmp_path, monkeypatch):
     assert "tick" not in kinds and "l0_check" not in kinds
     assert calls and calls[0].get("run_id") == out["run_id"]
 
+    # On the following normal run, verified correct inaction suppresses the
+    # escalation prompt without pretending the external-world streak changed.
+    receipt_id = db.append_receipt(
+        "no_action", "decision-sha", status="verified",
+        run_id="next-run", goal_id="goal-1",
+    )
+    db.append_evidence(
+        receipt_id, "decision", "evidence-sha", 0, status="verified"
+    )
+    assert r._requires_l0_escalation("next-run", "goal-1", r._l0_get_counter()) is False
+    assert r._l0_get_counter() == 2
+
 
 def test_runner_normal_tick_when_not_reflecting(tmp_path, monkeypatch):
     db = AutonomyDB(tmp_path / "a.db")
     r = Runner(db, Budget(), Circuit(), str(tmp_path / "STOP"),
                lambda: {"text": '{"thoughts":"x","proposals":[]}', "completion_tokens": 1, "prompt_tokens": 1},
-               lock_path=str(tmp_path / "lock"))
+               lock_path=str(tmp_path / "lock"), p0_mode="normal")
     monkeypatch.setattr(pr, "run_policy_reflection", lambda *a, **k: {"executed": False, "status": "outside_window"})
     assert r.tick()["status"] == "ok"
     assert "tick" in {x["kind"] for x in db.list_events(50)}
@@ -336,7 +348,7 @@ def test_runner_reflection_exception_degrades(tmp_path, monkeypatch):
     db = AutonomyDB(tmp_path / "a.db")
     r = Runner(db, Budget(), Circuit(), str(tmp_path / "STOP"),
                lambda: {"text": '{"thoughts":"x","proposals":[]}', "completion_tokens": 1, "prompt_tokens": 1},
-               lock_path=str(tmp_path / "lock"))
+               lock_path=str(tmp_path / "lock"), p0_mode="normal")
 
     def boom(*a, **k):
         raise RuntimeError("x")

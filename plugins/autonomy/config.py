@@ -34,6 +34,7 @@ DEFAULT_RESOURCES = {
 @dataclass(frozen=True)
 class P0Config:
     """Restart-scoped P0 thresholds. Mutations require a proposal and restart."""
+    mode: str = "observe_only"
     validator_hashes: Mapping[str, str] = field(default_factory=dict)
     buffer_ttl_s: int = 24 * 3600
     evidence_deadline_s: int = 6 * 3600
@@ -49,6 +50,8 @@ class P0Config:
     evolution_share: float = 0.10
 
     def __post_init__(self) -> None:
+        mode = str(self.mode or "").strip().lower()
+        object.__setattr__(self, "mode", mode if mode in {"observe_only", "normal"} else "observe_only")
         object.__setattr__(self, "validator_hashes", MappingProxyType(dict(self.validator_hashes)))
         if abs(self.normal_share + self.memory_share + self.evolution_share - 1.0) > 1e-9:
             raise ValueError("budget shares must sum to 1")
@@ -114,6 +117,25 @@ def load_raw_config(hermes_home: Optional[str | Path] = None) -> Dict[str, Any]:
         return dict(data) if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def resolve_p0_mode(raw_config: Optional[Mapping[str, Any]]) -> Tuple[str, str]:
+    """Resolve the restart-persistent gate, failing closed on any ambiguity."""
+    raw = raw_config if isinstance(raw_config, Mapping) else {}
+    autonomy = raw.get("autonomy")
+    if not isinstance(autonomy, Mapping):
+        return "observe_only", "missing"
+    p0 = autonomy.get("p0")
+    if not isinstance(p0, Mapping) or "mode" not in p0:
+        return "observe_only", "missing"
+    mode = str(p0.get("mode") or "").strip().lower()
+    if mode not in {"observe_only", "normal"}:
+        return "observe_only", "invalid"
+    return mode, "configured"
+
+
+def load_p0_mode(hermes_home: Optional[str | Path] = None) -> Tuple[str, str]:
+    return resolve_p0_mode(load_raw_config(hermes_home))
 
 
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")

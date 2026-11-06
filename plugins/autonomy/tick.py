@@ -8,6 +8,7 @@ from .runner import Runner
 from .gateway_client import GatewayClient
 from .config import (
     load_raw_config,
+    resolve_p0_mode,
     get_autonomy_section,
     resolve_autonomy_model,
     determine_mode,
@@ -41,6 +42,12 @@ def main(argv=None, *, hermes_home=None):
     a = p.parse_args(argv)
 
     raw_cfg = load_raw_config(a.hermes_home)
+    p0_mode, p0_mode_reason = resolve_p0_mode(raw_cfg)
+    print(
+        f"autonomy startup: p0_mode={p0_mode} reason={p0_mode_reason}",
+        file=sys.stderr,
+        flush=True,
+    )
     auto_cfg = get_autonomy_section(raw_cfg)
     paths = resolve_paths(raw_cfg, hermes_home=a.hermes_home)
     mode = determine_mode(raw_cfg, hermes_home=a.hermes_home)
@@ -154,6 +161,7 @@ def main(argv=None, *, hermes_home=None):
         reflection_profile=reflection_profile,
         reflection_profile_safe=reflection_safe,
         reflection_profile_reason=reflection_reason,
+        p0_mode=p0_mode,
     )
 
     if a.resume_if_idle:

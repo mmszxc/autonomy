@@ -153,10 +153,15 @@ class Runner:
         reflection_profile="",
         reflection_profile_safe=False,
         reflection_profile_reason="profile_not_configured",
+        p0_mode="observe_only",
     ):
         self.db = db
         self.budget = budget
         self.circuit = circuit
+        resolved_mode = str(p0_mode or "").strip().lower()
+        self.p0_mode = resolved_mode if resolved_mode in {"observe_only", "normal"} else "observe_only"
+        if self.p0_mode == "observe_only" and hasattr(self.circuit, "freeze_learning"):
+            self.circuit.freeze_learning("p0_observe_only")
         self.stop_file = stop_file
         self.llm = llm
         self.gateway = gateway
@@ -275,6 +280,8 @@ class Runner:
 
         Both features degrade silently when the P1 columns/tables are absent.
         """
+        if not self._learning_allowed():
+            return {"refs": 0, "expands": 0, "reason": "p0_observe_only"}
         text = str(assistant_text or "")
         expand_ids = {m.group(1) for m in self._EXPAND_REF_RE.finditer(text)}
         ref_ids = []
@@ -374,6 +381,8 @@ class Runner:
         Degrades to an importance-only filter when the shareable column (P1-1)
         is absent, and never raises into the tick path.
         """
+        if not self._learning_allowed():
+            return {"exported": 0, "reason": "p0_observe_only"}
         path = self._seed_db_path()
         if path is None:
             return {"exported": 0, "reason": "db_missing"}
@@ -508,8 +517,30 @@ class Runner:
 
         return _call
 
+    def _learning_allowed(self):
+        if getattr(self, "p0_mode", "normal") != "normal":
+            return False
+        circuit = getattr(self, "circuit", None)
+        return True if circuit is None else circuit.allow_learning()
+
+    def _promotion_allowed(self):
+        if getattr(self, "p0_mode", "normal") != "normal":
+            return False
+        circuit = getattr(self, "circuit", None)
+        return True if circuit is None else circuit.allow_promotion()
+
+    def _policy_rules_for_prompt(self, goal):
+        if not self._learning_allowed():
+            return []
+        provider = getattr(self, "policy", None)
+        if provider is None:
+            from . import policy as provider
+        return provider.rules_for_prompt(goal)
+
     def _policy_reflect_slot(self, run):
         """Return a status dict if this tick was consumed by policy reflection, else None. Never raises."""
+        if not self._learning_allowed():
+            return None
         try:
             from . import policy_reflect as _pr
 
@@ -540,6 +571,8 @@ class Runner:
 
     def _policy_evaluate(self):
         """T6: per-tick rule bookkeeping on normal ticks only. Never raises; returns summary or None."""
+        if not self._learning_allowed() or not self._promotion_allowed():
+            return None
         try:
             from . import policy_eval as _pe
 
@@ -611,6 +644,8 @@ class Runner:
         shape that seed_memory consumes, then invoke its detached worker.  Queue
         creation must never turn an otherwise successful thought into a failure.
         """
+        if not self._learning_allowed():
+            return {"queued": False, "reason": "p0_observe_only", "worker": "not_started", "elapsed_s": 0}
         queue_dir = getattr(self, "seed_queue_dir", None) or (Path(self.hermes_home) / "seed_data" / "seed_queue")
         worker = Path(self.hermes_home) / "plugins" / "seed_memory" / "worker.py"
         if not worker.is_file():
@@ -1101,6 +1136,13 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 return "access"
         return "none"
 
+    def _requires_l0_escalation(self, run_id, goal_id, consecutive_no_change):
+        """Escalate only when a stuck streak lacks verified correct-inaction evidence."""
+        return (
+            int(consecutive_no_change) >= 2
+            and not self._has_correct_no_action_receipt(run_id, goal_id)
+        )
+
     def _has_correct_no_action_receipt(self, run_id, goal_id):
         """Accept only a goal-bound no-action receipt with verified evidence."""
         try:
@@ -1224,8 +1266,7 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                                          exit_reason="refresh", summary=str(exc)[:240])
             rules = load_extra_rules(self.data_dir)
             try:
-                from . import policy as _policy
-                rules = list(rules) + list(_policy.rules_for_prompt(self.data_dir) or [])
+                rules = list(rules) + list(self._policy_rules_for_prompt(self.data_dir) or [])
             except Exception:
                 pass
             bulletin = load_team_bulletin(self.data_dir)
@@ -1247,8 +1288,9 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 journal_injection=journal_injection,
                 journal_invitation=journal_invitation,
             )
-            # L0: append self-reference warning when stuck for >= 2 consecutive rounds
-            if _l0_count >= 2:
+            # A verified, goal-bound correct-inaction receipt suppresses the
+            # escalation without erasing the evidence-based streak.
+            if self._requires_l0_escalation(run, goal_id, _l0_count):
                 prompt = prompt + ("\n\n【L0提示】你已连续%d轮无外部产出。这一轮请做至少一件可被外部验证的事：修复一个报错、改进一个文件、或产出一条他人可引用的洞察。" % _l0_count)
             raw = ""
             usage = {}
