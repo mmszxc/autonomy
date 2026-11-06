@@ -4,8 +4,10 @@ from __future__ import annotations
 import os
 import re
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from types import MappingProxyType
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import yaml
 
@@ -27,6 +29,50 @@ DEFAULT_RESOURCES = {
     "quiet_seconds": 300,
     "min_quiet_start_seconds": 300,
 }
+
+
+@dataclass(frozen=True)
+class P0Config:
+    """Restart-scoped P0 thresholds. Mutations require a proposal and restart."""
+    validator_hashes: Mapping[str, str] = field(default_factory=dict)
+    buffer_ttl_s: int = 24 * 3600
+    evidence_deadline_s: int = 6 * 3600
+    per_call_buffer_bytes: int = 5 * 1024**2
+    permanent_evidence_bytes: int = 1536
+    pool_cap_bytes: int = 10 * 1024**3
+    pool_warn_ratio: float = 0.80
+    pool_freeze_ratio: float = 0.95
+    t2_free_bytes: int = 1024**3
+    evaluation_window_s: int = 7 * 86400
+    normal_share: float = 0.80
+    memory_share: float = 0.10
+    evolution_share: float = 0.10
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "validator_hashes", MappingProxyType(dict(self.validator_hashes)))
+        if abs(self.normal_share + self.memory_share + self.evolution_share - 1.0) > 1e-9:
+            raise ValueError("budget shares must sum to 1")
+        for value in self.validator_hashes.values():
+            if not re.fullmatch(r"[0-9a-f]{64}", str(value)):
+                raise ValueError("validator hashes must be lowercase sha256")
+
+    @classmethod
+    def from_mapping(cls, values: Optional[Mapping[str, Any]] = None) -> "P0Config":
+        from dataclasses import fields
+        values = dict(values or {})
+        allowed = {f.name for f in fields(cls)}
+        unknown = set(values) - allowed
+        if unknown:
+            raise ValueError(f"unknown P0 config keys: {sorted(unknown)}")
+        return cls(**values)
+
+    @staticmethod
+    def t1_free_bytes(filesystem_size: int) -> int:
+        return max(2 * 1024**3, min(int(filesystem_size * 0.05), 10 * 1024**3))
+
+    @staticmethod
+    def pool_cap_for_startup_free_space(free_bytes: int) -> int:
+        return min(10 * 1024**3, int(free_bytes * 0.10))
 
 
 def resolve_hermes_home(hermes_home: Optional[str | Path] = None) -> Path:

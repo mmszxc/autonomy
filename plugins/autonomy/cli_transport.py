@@ -1,9 +1,51 @@
 """Hermes CLI transport for runtimes without the HTTP runs API."""
-import os, signal, subprocess, threading, uuid
+import hashlib, os, re, signal, subprocess, threading, time, uuid
+from pathlib import Path
 try:
     import resource
 except ImportError:
     resource = None
+
+
+_SECRET = re.compile(rb"(?i)(authorization:\s*bearer\s+|password\s*[=:]\s*|api[_-]?key\s*[=:]\s*|token\s*[=:]\s*)[^\s,;]+")
+
+
+def _redact(data: bytes) -> bytes:
+    return _SECRET.sub(lambda m: m.group(1) + b"[REDACTED]", data)
+
+
+def capture_process_evidence(stdout, stderr, exit_code, *, signal_number=None,
+                             timed_out=False, oom=False, buffer_dir=None,
+                             max_buffer=5 * 1024**2):
+    """Capture bounded evidence before any JSON/text parser consumes process output."""
+    stdout = stdout if isinstance(stdout, bytes) else str(stdout or "").encode("utf-8", "replace")
+    stderr = stderr if isinstance(stderr, bytes) else str(stderr or "").encode("utf-8", "replace")
+    out_digest, err_digest = hashlib.sha256(stdout).hexdigest(), hashlib.sha256(stderr).hexdigest()
+    out_head, out_tail = _redact(stdout[:256]), _redact(stdout[-256:])
+    err_head, err_tail = _redact(stderr[:128]), _redact(stderr[-128:])
+    framed = b"STDOUT\n" + stdout + b"\nSTDERR\n" + stderr
+    truncated = len(framed) > max_buffer
+    path = None
+    if buffer_dir is not None:
+        root = Path(buffer_dir); root.mkdir(parents=True, exist_ok=True)
+        path = root / ("evidence-%d-%s.bin" % (time.time_ns(), uuid.uuid4().hex[:8]))
+        # The short-lived buffer may contain secrets; restrict permissions before writing.
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, framed[:max_buffer])
+        finally:
+            os.close(fd)
+    return {
+        "stdout_sha256": out_digest, "stderr_sha256": err_digest,
+        "stdout_bytes": len(stdout), "stderr_bytes": len(stderr),
+        "stdout_head": out_head, "stdout_tail": out_tail,
+        "stderr_head": err_head, "stderr_tail": err_tail,
+        "exit_code": int(exit_code), "signal": signal_number,
+        "timed_out": bool(timed_out), "oom": bool(oom), "truncated": truncated,
+        "buffer_path": str(path) if path else None,
+        "buffer_expires_at": time.time() + 24 * 3600,
+        "permanent_bytes": len(out_head) + len(out_tail) + len(err_head) + len(err_tail),
+    }
 
 
 def _reset_address_space_limit():
@@ -46,7 +88,9 @@ class CliGateway:
         self.provider = str(provider or "").strip()
         self.max_turns = int(max_turns)
         self.run_budget = int(run_budget)
+        self.evidence_dir = os.environ.get("AUTONOMY_EVIDENCE_BUFFER")
         self.runs = {}
+        self.evidence = {}
 
     def start_run(self, goal, run_id, prompt):
         rid = "cli-" + uuid.uuid4().hex
@@ -80,8 +124,14 @@ class CliGateway:
         # Hermes chat may return non-zero after producing a complete answer
         # (for example, a post-run plugin warning). Preserve useful thought as ok.
         status="running" if proc.poll() is None else ("completed" if proc.returncode == 0 or text.strip() else "failed")
+        evidence = None
+        if proc.returncode is not None:
+            evidence = self.evidence.get(rid)
+            if evidence is None:
+                evidence = capture_process_evidence(text, errors, proc.returncode, buffer_dir=self.evidence_dir)
+                self.evidence[rid] = evidence
         # Preserve diagnostics for Runner's partial-output recorder on non-zero exits.
-        return {"status":status,"output":text or errors,"stderr":errors,"usage":{},"returncode":proc.returncode}
+        return {"status":status,"output":text or errors,"stderr":errors,"usage":{},"returncode":proc.returncode,"evidence":evidence}
 
     def stop_run(self, rid):
         proc,_,_=self.runs[rid]
@@ -121,6 +171,8 @@ class CliGateway:
                 self._kill_process_group(proc)
                 proc.communicate()
                 raise
+            evidence = capture_process_evidence(stdout or "", stderr or "", proc.returncode, buffer_dir=self.evidence_dir)
+            self.evidence["reflection:" + str(run_id)] = evidence
             text = (stdout or "").strip()
             if proc.returncode != 0:
                 raise ReflectionCallError("reflection_transport_failed", (stderr or "")[-500:])

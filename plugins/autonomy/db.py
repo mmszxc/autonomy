@@ -4,6 +4,8 @@ from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from .schema import migrate
+
 def locked(fn):
  def wrapped(self,*a,**kw):
   with self.lock: return fn(self,*a,**kw)
@@ -13,20 +15,12 @@ TRANSITIONS={'draft':{'proposed'},'proposed':{'approved','cancelled'},'approved'
 POLICY_EVENT_KINDS=('triggered','generated','rejected_format','vetoed','expired_no_opportunity','expired_neutral','promoted_eligible','promoted','rollback_manual')
 class Conflict(Exception): pass
 class Expired(Exception): pass
+class ImmutableEvidence(Exception): pass
 class AutonomyDB:
  def __init__(self,path):
   self.lock=threading.RLock(); self.path=Path(path); self.path.parent.mkdir(parents=True,exist_ok=True); self.c=sqlite3.connect(self.path,timeout=10,check_same_thread=False); self.c.row_factory=sqlite3.Row; self.c.execute('pragma journal_mode=wal'); self.c.execute('pragma busy_timeout=10000'); self._init()
  def _init(self):
-  self.c.executescript('''create table if not exists goals(id text primary key,title text not null,description text not null,status text not null,risk text not null default 'low',budget_calls integer not null default 24,used_calls integer not null default 0,budget_seconds real not null default 300,stop_reason text,created_by text not null,created_at real not null,updated_at real not null); create table if not exists tasks(id text primary key,goal_id text not null,parent_id text,title text,status text,risk text,created_at real); create table if not exists approvals(approval_id text primary key,goal_id text,tool text,args_hash text, args_len integer,side_effects text,budget text,expires_at real,nonce_hash text,state text not null default 'pending',decided_at real); create table if not exists events(id integer primary key,ts real,run_id text,goal_id text,kind text,tool text,approval_id text,args_hash text,result_hash text,exit_reason text,args_len integer,result_len integer);''');
-  cols={r[1] for r in self.c.execute('pragma table_info(events)')}
-  if 'summary' not in cols: self.c.execute('alter table events add column summary text')
-  self.c.execute("create table if not exists kv(key text primary key,value text,updated_at real)")
-  self.c.execute("create table if not exists usage(day text primary key,calls integer not null default 0,tokens integer not null default 0,prompt integer not null default 0)")
-  self.c.execute("create table if not exists circuit(id integer primary key check(id=1),failures integer not null default 0,state text not null default 'closed',blocked integer not null default 0,opened_at real not null default 0)")
-  self.c.execute("insert or ignore into circuit(id) values(1)")
-  self.c.execute("create table if not exists policy_events(id integer primary key,ts text,profile text,rule_id text,kind text,reason text,payload_json text)")
-  self.c.execute("create table if not exists last_tick(id integer primary key check(id=1),status text,started_at real,finished_at real,summary text)")
-  self.c.commit()
+  migrate(self.c)
  @locked
  def list_goals(self): return [dict(r) for r in self.c.execute('select * from goals order by created_at desc')]
  @locked
@@ -94,3 +88,30 @@ class AutonomyDB:
   self.c.execute('delete from events where ts < ?', (cutoff,))
   self.c.execute('delete from events where id not in (select id from events order by id desc limit ?)', (max(1,max_rows),))
   removed=self.c.total_changes; self.c.commit(); return removed
+ @locked
+ def append_receipt(self,kind,payload_hash,status='unverified',run_id=None,goal_id=None,payload=None,ts=None):
+  import uuid
+  rid=uuid.uuid4().hex
+  self.c.execute('insert into receipts(id,ts,kind,payload_hash,status,run_id,goal_id,payload_json) values(?,?,?,?,?,?,?,?)',(rid,ts or time.time(),kind,payload_hash,status,run_id,goal_id,json.dumps(payload or {},ensure_ascii=False,sort_keys=True,default=str)))
+  self.c.commit(); return rid
+ @locked
+ def append_evidence(self,receipt_id,stream,digest,byte_count,head=b'',tail=b'',buffer_path=None,truncated=False,exit_code=None,signal=None,timed_out=False,oom=False,status='unverified',created_at=None,challenge_deadline=None):
+  created_at=created_at or time.time(); challenge_deadline=challenge_deadline or created_at+6*3600
+  cur=self.c.execute('insert into evidence(receipt_id,stream,digest,byte_count,head,tail,buffer_path,truncated,exit_code,signal,timed_out,oom,status,created_at,challenge_deadline) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(receipt_id,stream,digest,int(byte_count),sqlite3.Binary(head),sqlite3.Binary(tail),buffer_path,int(bool(truncated)),exit_code,signal,int(bool(timed_out)),int(bool(oom)),status,created_at,challenge_deadline))
+  self.c.commit(); return int(cur.lastrowid)
+ @locked
+ def get_evidence(self,evidence_id):
+  row=self.c.execute('select * from evidence where id=?',(int(evidence_id),)).fetchone()
+  if not row: raise KeyError(evidence_id)
+  return dict(row)
+ @locked
+ def list_pending_evidence(self,limit=10000):
+  return [dict(r) for r in self.c.execute("select * from evidence where status='unverified' order by id limit ?",(min(int(limit),100000),))]
+ @locked
+ def transition_evidence(self,evidence_id,target,verified_at=None):
+  allowed={'unverified':{'verified','mismatched','expired'},'verified':set(),'mismatched':set(),'expired':set()}
+  row=self.c.execute('select status from evidence where id=?',(int(evidence_id),)).fetchone()
+  if not row: raise KeyError(evidence_id)
+  if target not in allowed.get(row['status'],set()): raise ImmutableEvidence('%s -> %s' % (row['status'],target))
+  self.c.execute('update evidence set status=?,verified_at=? where id=?',(target,verified_at or time.time(),int(evidence_id)))
+  self.c.commit(); return target
