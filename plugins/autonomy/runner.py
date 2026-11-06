@@ -1068,7 +1068,7 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             )
             # L0: append self-reference warning when stuck for >= 2 consecutive rounds
             if _l0_count >= 2:
-                prompt = prompt + "\n\n【L0提示】连续%d轮未产生外部状态变化，请尝试不同的行动方向。" % _l0_count
+                prompt = prompt + ("\n\n【L0提示】你已连续%d轮无外部产出。这一轮请做至少一件可被外部验证的事：修复一个报错、改进一个文件、或产出一条他人可引用的洞察。" % _l0_count)
             raw = ""
             usage = {}
             is_dialog_first = self.mode != "parallel"
@@ -1253,6 +1253,15 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                     run_id=run, goal_id=goal_id, kind="l0_check",
                     exit_reason="changed" if _l0_changed else "no_change",
                     summary="consecutive_no_change=%d" % _l0_new_count,
+                )
+            except Exception:
+                pass
+            # L0 ext hook: independent low_impact confirmation signal
+            try:
+                from . import ext_hooks as _ext_hooks
+                _ext_hooks.on_session_end(
+                    self, run, transcript if isinstance(transcript, dict) else {},
+                    elapsed_s=(time.time() - started),
                 )
             except Exception:
                 pass
