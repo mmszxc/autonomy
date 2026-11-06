@@ -23,6 +23,7 @@ NORMAL_STATUSES = {
     "preempted",
     "run_timeout",
     "yielded_for_memory",
+    "policy_reflect",
 }
 
 

@@ -436,6 +436,45 @@ class Runner:
         except OSError:
             return ""
 
+    def _policy_llm_call(self, run):
+        """Prompt->text using the same gateway.chat封装 as the normal tick; None if unsupported."""
+        gw = self.gateway
+        if gw is None or not callable(getattr(gw, "chat", None)):
+            return None
+
+        def _call(prompt):
+            sid, raw, _usage = gw.chat({}, run, "", [], prompt)
+            try:
+                gw.end(sid)
+            except Exception:
+                pass
+            return raw
+
+        return _call
+
+    def _policy_reflect_slot(self, run):
+        """Return a status dict if this tick was consumed by policy reflection, else None. Never raises."""
+        try:
+            from . import policy_reflect as _pr
+
+            res = _pr.run_policy_reflection(
+                self.hermes_home, self.data_dir, self.db, time.time(),
+                llm_call=self._policy_llm_call(run), profile=self._profile_name(), run_id=run,
+            )
+        except Exception:
+            return None
+        if not isinstance(res, dict) or not res.get("executed"):
+            return None
+        try:
+            self.db.c.execute(
+                "update last_tick set status=?,finished_at=?,summary=? where id=1",
+                ("policy_reflect", time.time(), "policy_reflect=%s" % res.get("status")),
+            )
+            self.db.c.commit()
+        except Exception:
+            pass
+        return {"status": "policy_reflect", "run_id": run, "reflection": res.get("status")}
+
     def _surprise_importance(self, run_id, elapsed, tool_turns):
         """Score objective surprise against the previous 30 completed ticks."""
         rows = self.db.c.execute(
@@ -976,6 +1015,12 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 return {"status": "stopped", "run_id": run}
             if not self.budget.allow() or not self.circuit.allow():
                 return {"status": "blocked", "run_id": run}
+
+            # T5 policy reflection: 03:00-03:19 local, once per day. When it runs it
+            # replaces this tick; it never touches L0 counter, surprise baseline or prompt.
+            _reflect = self._policy_reflect_slot(run)
+            if _reflect is not None:
+                return _reflect
 
             goals = [g for g in self.db.list_goals() if g.get("status") in ("approved", "active")]
             if goal_id:
