@@ -89,9 +89,11 @@ def resolve_hermes_home(hermes_home: Optional[str | Path] = None) -> Path:
     repo_home = here.parent.parent / "hermes_home"
     if repo_home.exists():
         return repo_home.resolve()
-    opt_home = Path("/var/lib/hermes/hermes_home")
-    if opt_home.exists():
-        return opt_home
+    # 222 production hotfix (2026-11-06): Hermes Life is installed below /opt.
+    # Preserve legacy locations so local/dev layouts remain functional.
+    for opt_home in (Path("/opt/hermes-life/hermes_home"), Path("/var/lib/hermes/hermes_home")):
+        if opt_home.exists():
+            return opt_home
     return Path.home() / ".hermes"
 
 

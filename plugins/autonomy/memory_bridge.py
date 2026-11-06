@@ -26,7 +26,11 @@ def _ensure_memory_provider_base() -> None:
     except ImportError:
         pass
 
+    # 222 hotfix: production Hermes Life installation is rooted at /opt.
+    # Keep prior locations for developer and legacy installations.
     candidates = [
+        Path("/opt/hermes-life/app/hermes-agent"),
+        Path("/opt/hermes-life/hermes-agent"),
         Path("/usr/local/lib/hermes-agent"),
         Path.home() / ".local" / "share" / "hermes" / "hermes-agent",
     ]
@@ -136,6 +140,10 @@ def list_available_memory_plugins(hermes_home: Optional[str | Path] = None) -> L
         base / "plugin",
         repo_root / "plugin",
         repo_root / "hermes_home" / "plugins",
+        Path("/opt/hermes-life/plugin"),
+        Path("/opt/hermes-life/hermes_home/plugins"),
+        Path("/opt/hermes-life/app/hermes-agent/plugins/memory"),
+        Path("/opt/hermes-life/hermes-agent/plugins/memory"),
         Path("/usr/local/lib/hermes-agent/plugins/memory"),
         Path.home() / ".local" / "share" / "hermes" / "hermes-agent" / "plugins" / "memory",
     ]
@@ -198,6 +206,10 @@ def load_memory_provider_instance(
         home / "plugins" / target,
         repo_root / "plugin" / target,
         repo_root / "hermes_home" / "plugins" / target,
+        Path("/opt/hermes-life/plugin") / target,
+        Path("/opt/hermes-life/hermes_home/plugins") / target,
+        Path("/opt/hermes-life/app/hermes-agent/plugins/memory") / target,
+        Path("/opt/hermes-life/hermes-agent/plugins/memory") / target,
         Path("/usr/local/lib/hermes-agent/plugins/memory") / target,
         Path.home() / ".local" / "share" / "hermes" / "hermes-agent" / "plugins" / "memory" / target,
     ]
