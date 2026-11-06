@@ -1,6 +1,8 @@
 from __future__ import annotations
 import hashlib, json, secrets, sqlite3, time, threading
 from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 def locked(fn):
  def wrapped(self,*a,**kw):
@@ -72,7 +74,7 @@ class AutonomyDB:
  @locked
  def record_policy_event(self,rule_id,kind,reason='',payload=None,profile=''):
   try:
-   ts=time.strftime('%Y-%m-%dT%H:%M:%S',time.localtime())
+   ts=datetime.now(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%dT%H:%M:%S')
    self.c.execute('insert into policy_events(ts,profile,rule_id,kind,reason,payload_json) values(?,?,?,?,?,?)',(ts,profile or '',rule_id,kind,(reason or '')[:500],json.dumps(payload or {},ensure_ascii=False,default=str)))
    self.c.commit(); return True
   except Exception:

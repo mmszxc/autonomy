@@ -492,7 +492,7 @@ def remove_rule(data_dir, rule_id, reason="", source="auto", db=None, profile=""
         if db is not None:
             try:
                 kind = "rollback_manual" if source == "manual_rollback" else (
-                    "expired_neutral" if source == "expired" else "vetoed")
+                    source if source in ("expired_neutral", "expired_no_opportunity") else "vetoed")
                 db.record_policy_event(rule_id, kind, reason,
                                        {"source": source, "source_pm_id": hit.get("source_pm_id", "")}, profile)
             except Exception:

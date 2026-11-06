@@ -149,7 +149,7 @@ def _decide_one(rule, ctx, already_promoted=False):
                 "age_days": round(age_days, 3), "post_fails": veto["metrics"].get("post_fails")}
     if veto["vetoed"]:
         decision.update(action=KIND_VETOED, reason=veto["reason"])
-    elif age_days > ttl_days or opps >= ttl_opp:
+    elif rule.get("status", "candidate") == "candidate" and (age_days > ttl_days or opps >= ttl_opp):
         if opps < MIN_OPPORTUNITIES:
             decision.update(action=KIND_EXPIRED_NO_OPP, reason="expired_with_opportunities=%d" % opps)
         else:
@@ -192,13 +192,18 @@ def _summary_of(decided):
 
 # ---------------------------------------------------------------- apply
 
-def _default_outcome_fn(pm_id, failed, counter_seed_id=None, source="auto"):
-    """Lazy import of the seed store (only public call: record_program_memory_outcome)."""
+def _default_outcome_fn(pm_id, failed, counter_seed_id=None, source="auto", profile_home=None):
+    """Record outcomes in the selected profile's seed database."""
     try:
         if str(_SEED_SRC) not in sys.path:
             sys.path.append(str(_SEED_SRC))
-        from hermes.memory.store import record_program_memory_outcome
-        return record_program_memory_outcome(pm_id, failed=failed, counter_seed_id=counter_seed_id, source=source)
+        from hermes.memory import store
+        if profile_home:
+            home = Path(profile_home)
+            store.configure(home / "seed_data" / "seeds" / "seeds.db")
+        return store.record_program_memory_outcome(
+            pm_id, failed=failed, counter_seed_id=counter_seed_id, source=source
+        )
     except Exception as e:
         return {"found": None, "recorded": False, "reason": "error:%s" % type(e).__name__}
 
@@ -253,7 +258,7 @@ def _apply(data_dir, db, profile, decided, outcome_fn):
                                        {"metrics": d["veto"]["metrics"], "source_pm_id": pm_id,
                                         "outcome": outcome}, profile)
             else:  # expired_*
-                res = policy.remove_rule(data_dir, rid, d["reason"], source="expired")
+                res = policy.remove_rule(data_dir, rid, d["reason"], source=act)
                 if not res.get("ok"):
                     continue
                 db.record_policy_event(rid, act, d["reason"],
@@ -268,7 +273,10 @@ def evaluate_rules(profile_home, data_dir, db, now=None, outcome_fn=None):
     """Per-tick bookkeeping. Returns a summary dict; never raises."""
     try:
         now = _f(now, time.time())
-        outcome_fn = outcome_fn or _default_outcome_fn
+        if outcome_fn is None:
+            outcome_fn = lambda **kwargs: _default_outcome_fn(
+                **kwargs, profile_home=profile_home
+            )
         profile = Path(profile_home).name if profile_home else ""
         rules = policy.load_active_rules(data_dir)
         if not rules:
@@ -278,8 +286,10 @@ def evaluate_rules(profile_home, data_dir, db, now=None, outcome_fn=None):
         try:
             promoted = {r["id"]: _has_event(db, r["id"], KIND_PROMOTED_ELIGIBLE) for r in rules}
             decided = decide_rules(rules, _ctx(sdb, adb, now, promoted))
-            _apply_stats(data_dir, decided)
             actions = _apply(data_dir, db, profile, decided, outcome_fn)
+            # Apply stats after actions, from a fresh active.json read, so a
+            # concurrent rollback cannot be overwritten by stale state.
+            _apply_stats(data_dir, decided)
             summary = _summary_of(decided)
             summary.update(ok=True, actions=actions)
             return summary

@@ -771,9 +771,8 @@ def save_semantic_memory(
                 merged_evidence = row["evidence_count"] + 1
                 # Bayesian-smoothed, can fall again (no ratchet). Legacy rows keep their
                 # stored confidence until first touched here/in outcome (no deploy-time jump).
-                merged_confidence = _bayes_confidence(
-                    merged_evidence, len(existing_counters) + len(new_counters))
-                merged_failures = max(0, int(row["consecutive_failures"] or 0) - 1)
+                # Semantic memories have no counter evidence or breaker state.
+                merged_confidence = _bayes_confidence(merged_evidence, 0)
                 merged_sources = existing_seeds + new_seeds
                 conn.execute(
                     "UPDATE semantic_memories SET evidence_count=?, confidence=?, "
