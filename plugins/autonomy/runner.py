@@ -987,6 +987,11 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             _l0_count = self._l0_get_counter()
             memory_review, memory_seed_ids = self._prefetch_memory(run, recent_events, goals=goals)
             rules = load_extra_rules(self.data_dir)
+            try:
+                from . import policy as _policy
+                rules = list(rules) + list(_policy.rules_for_prompt(self.data_dir) or [])
+            except Exception:
+                pass
             bulletin = load_team_bulletin(self.data_dir)
             chassis_status = ""
             journal = None

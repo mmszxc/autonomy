@@ -8,6 +8,7 @@ def locked(fn):
  wrapped.__name__=fn.__name__; return wrapped
 
 TRANSITIONS={'draft':{'proposed'},'proposed':{'approved','cancelled'},'approved':{'active','paused','cancelled'},'active':{'paused','completed','failed','cancelled'},'paused':{'active','cancelled'},'completed':set(),'failed':set(),'cancelled':set()}
+POLICY_EVENT_KINDS=('triggered','generated','rejected_format','vetoed','expired_no_opportunity','expired_neutral','promoted_eligible','promoted','rollback_manual')
 class Conflict(Exception): pass
 class Expired(Exception): pass
 class AutonomyDB:
@@ -20,6 +21,7 @@ class AutonomyDB:
   self.c.execute("create table if not exists usage(day text primary key,calls integer not null default 0,tokens integer not null default 0,prompt integer not null default 0)")
   self.c.execute("create table if not exists circuit(id integer primary key check(id=1),failures integer not null default 0,state text not null default 'closed',blocked integer not null default 0,opened_at real not null default 0)")
   self.c.execute("insert or ignore into circuit(id) values(1)")
+  self.c.execute("create table if not exists policy_events(id integer primary key,ts text,profile text,rule_id text,kind text,reason text,payload_json text)")
   self.c.execute("create table if not exists last_tick(id integer primary key check(id=1),status text,started_at real,finished_at real,summary text)")
   self.c.commit()
  @locked
@@ -67,6 +69,16 @@ class AutonomyDB:
  @locked
  def append_event(self,**kw):
   vals={k:kw.get(k) for k in ('ts','run_id','goal_id','kind','tool','approval_id','args_hash','result_hash','exit_reason','args_len','result_len','summary')}; vals['ts']=vals['ts'] or time.time(); self.c.execute('insert into events(ts,run_id,goal_id,kind,tool,approval_id,args_hash,result_hash,exit_reason,args_len,result_len,summary) values(:ts,:run_id,:goal_id,:kind,:tool,:approval_id,:args_hash,:result_hash,:exit_reason,:args_len,:result_len,:summary)',vals); self.c.commit()
+ @locked
+ def record_policy_event(self,rule_id,kind,reason='',payload=None,profile=''):
+  try:
+   ts=time.strftime('%Y-%m-%dT%H:%M:%S',time.localtime())
+   self.c.execute('insert into policy_events(ts,profile,rule_id,kind,reason,payload_json) values(?,?,?,?,?,?)',(ts,profile or '',rule_id,kind,(reason or '')[:500],json.dumps(payload or {},ensure_ascii=False,default=str)))
+   self.c.commit(); return True
+  except Exception:
+   try: self.c.rollback()
+   except Exception: pass
+   return False
  @locked
  def list_events(self,limit=50): return [dict(r) for r in self.c.execute('select * from events order by id desc limit ?',(min(limit,500),))]
  @locked

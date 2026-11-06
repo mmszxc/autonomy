@@ -18,6 +18,8 @@ so a tick can never be broken by this module.
 import argparse
 import hashlib
 import json
+import logging
+import os
 import re
 import sqlite3
 import time
@@ -370,6 +372,143 @@ def baseline(autonomy_db, state_db, tool_family, until_ts, days=WINDOW_DAYS):
             "attempts_per_tick": round(attempts / n_ticks, 3) if n_ticks else 0.0,
             "l0_checks": l0_total,
             "l0_changed_rate": round(l0d.get("changed", 0) / l0_total, 4) if l0_total else 0.0}
+
+# ---------------------------------------------------------------- rule store (T3)
+
+MAX_RULES = 5
+_log = logging.getLogger(__name__)
+_REQUIRED = ("id", "text")
+
+
+def _rules_path(data_dir):
+    return Path(data_dir) / "policy" / "active.json"
+
+
+def _norm_rule(r):
+    if not isinstance(r, dict) or not all(isinstance(r.get(k), str) and r.get(k).strip() for k in _REQUIRED):
+        return None
+    r = dict(r)
+    r.setdefault("channel", "A")
+    r.setdefault("tool_family", "")
+    r.setdefault("condition", "")
+    r.setdefault("source_pm_id", "")
+    r.setdefault("source_signature", "")
+    r.setdefault("created_at", time.time())
+    r.setdefault("created_run", "")
+    r.setdefault("ttl_opportunities", 30)
+    r.setdefault("ttl_days", 7)
+    r.setdefault("status", "candidate")
+    r.setdefault("baseline", {"fail_rate": 0.0, "attempts_per_tick": 0.0, "l0_changed_rate": 0.0})
+    r.setdefault("stats", {"opportunities": 0, "fails": 0, "reuse_sessions": []})
+    return r
+
+
+def load_active_rules(data_dir):
+    """Rules from active.json; [] on missing/corrupt/invalid. Never raises."""
+    try:
+        if not data_dir:
+            return []
+        p = _rules_path(data_dir)
+        if not p.is_file():
+            return []
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            return []
+        out = [x for x in (_norm_rule(r) for r in data) if x is not None]
+        return out[:MAX_RULES]
+    except Exception as e:
+        _log.debug("policy: load_active_rules failed: %s", type(e).__name__)
+        return []
+
+
+def save_active_rules(data_dir, rules):
+    """Atomic write. Returns {"ok": True} or {"ok": False, "error": ...}; never raises."""
+    tmp = None
+    try:
+        if not isinstance(rules, list):
+            return {"ok": False, "error": "rules_not_list"}
+        if len(rules) > MAX_RULES:
+            return {"ok": False, "error": "limit_exceeded", "max": MAX_RULES, "got": len(rules)}
+        p = _rules_path(data_dir)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name("%s.%d.tmp" % (p.name, os.getpid()))
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(rules, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)
+        return {"ok": True}
+    except Exception as e:
+        try:
+            if tmp is not None and Path(tmp).exists():
+                Path(tmp).unlink()
+        except Exception:
+            pass
+        return {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:120])}
+
+
+def add_rule(data_dir, rule_id, text, channel="A", tool_family="", condition="", source_pm_id="",
+             source_signature="", created_run="", ttl_opportunities=30, ttl_days=7, baseline=None):
+    """Append a candidate rule. Returns {"ok", "rule"|"error"}; 6th rule is rejected."""
+    try:
+        rules = load_active_rules(data_dir)
+        if any(r["id"] == rule_id for r in rules):
+            return {"ok": False, "error": "duplicate_id"}
+        if len(rules) >= MAX_RULES:
+            return {"ok": False, "error": "limit_exceeded", "max": MAX_RULES}
+        r = _norm_rule({
+            "id": rule_id, "text": text, "channel": channel, "tool_family": tool_family,
+            "condition": condition, "source_pm_id": source_pm_id, "source_signature": source_signature,
+            "created_at": time.time(), "created_run": created_run,
+            "ttl_opportunities": ttl_opportunities, "ttl_days": ttl_days, "status": "candidate",
+            "baseline": baseline or {"fail_rate": 0.0, "attempts_per_tick": 0.0, "l0_changed_rate": 0.0},
+            "stats": {"opportunities": 0, "fails": 0, "reuse_sessions": []}})
+        if r is None:
+            return {"ok": False, "error": "invalid_rule"}
+        res = save_active_rules(data_dir, rules + [r])
+        if not res.get("ok"):
+            return res
+        return {"ok": True, "rule": r}
+    except Exception as e:
+        return {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:120])}
+
+
+def remove_rule(data_dir, rule_id, reason="", source="auto", db=None, profile=""):
+    """Remove a rule; if db (AutonomyDB) is given, record a policy_events row.
+
+    source="manual_rollback" -> kind rollback_manual (T4 then calls
+    record_program_memory_outcome(..., source="manual_rollback")). Event only; no store call here.
+    source="expired" -> expired_neutral; anything else -> vetoed.
+    Returns {"ok", "removed": rule|None, "source", "reason"}.
+    """
+    try:
+        rules = load_active_rules(data_dir)
+        hit = next((r for r in rules if r["id"] == rule_id), None)
+        if hit is None:
+            return {"ok": False, "error": "not_found", "removed": None}
+        res = save_active_rules(data_dir, [r for r in rules if r["id"] != rule_id])
+        if not res.get("ok"):
+            return dict(res, removed=None)
+        if db is not None:
+            try:
+                kind = "rollback_manual" if source == "manual_rollback" else (
+                    "expired_neutral" if source == "expired" else "vetoed")
+                db.record_policy_event(rule_id, kind, reason,
+                                       {"source": source, "source_pm_id": hit.get("source_pm_id", "")}, profile)
+            except Exception:
+                pass
+        return {"ok": True, "removed": hit, "source": source, "reason": reason}
+    except Exception as e:
+        return {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:120]), "removed": None}
+
+
+def rules_for_prompt(data_dir):
+    """['[policy:<id>] text', ...] for candidate/promoted rules. [] on any failure."""
+    try:
+        return ["[policy:%s] %s" % (r["id"], " ".join(r["text"].split()))
+                for r in load_active_rules(data_dir) if r.get("status") in ("candidate", "promoted")]
+    except Exception:
+        return []
 
 # ---------------------------------------------------------------- report / CLI
 
