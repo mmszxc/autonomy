@@ -1252,6 +1252,9 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 prompt = prompt + ("\n\n【L0提示】你已连续%d轮无外部产出。这一轮请做至少一件可被外部验证的事：修复一个报错、改进一个文件、或产出一条他人可引用的洞察。" % _l0_count)
             raw = ""
             usage = {}
+            # Legacy adapters do not provide process evidence and therefore
+            # cannot claim a successful evidence-bound receipt.
+            state = {}
             is_dialog_first = self.mode != "parallel"
 
             if self.gateway and hasattr(self.gateway, "start_run"):

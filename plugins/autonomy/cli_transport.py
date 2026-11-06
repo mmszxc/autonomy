@@ -121,9 +121,9 @@ class CliGateway:
     def get_run(self, rid):
         proc,out,err=self.runs[rid]
         text, errors = "".join(out), "".join(err)
-        # Hermes chat may return non-zero after producing a complete answer
-        # (for example, a post-run plugin warning). Preserve useful thought as ok.
-        status="running" if proc.poll() is None else ("completed" if proc.returncode == 0 or text.strip() else "failed")
+        # Output is diagnostic evidence, not proof of success.  Preserve it for
+        # failure recording, but never reclassify a non-zero process as completed.
+        status="running" if proc.poll() is None else ("completed" if proc.returncode == 0 else "failed")
         evidence = None
         if proc.returncode is not None:
             evidence = self.evidence.get(rid)

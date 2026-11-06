@@ -315,7 +315,8 @@ def test_runner_reflection_slot_skips_l0_and_surprise(tmp_path, monkeypatch):
     monkeypatch.setattr(pr, "run_policy_reflection", fake)
     out = r.tick()
     assert out["status"] == "policy_reflect"
-    assert r._l0_get_counter() == 0
+    # Internal reflection is not evidence of an external-world change.
+    assert r._l0_get_counter() == 2
     kinds = {x["kind"] for x in db.list_events(50)}
     assert "tick" not in kinds and "l0_check" not in kinds
     assert calls and calls[0].get("run_id") == out["run_id"]

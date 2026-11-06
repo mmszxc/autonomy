@@ -126,10 +126,17 @@ def find_program_memory(profile_home, terms):
         conn = P._open_ro(Path(profile_home) / "seed_data" / "seeds" / "seeds.db")
         if conn is None:
             return None
+        columns = {row[1] for row in P._q(conn, "pragma table_info(program_memories)")}
+        required = {"writer", "owner", "provenance", "consecutive_failures"}
+        if not required.issubset(columns):
+            return None
         for term in [t for t in terms if t]:
             rows = P._q(conn,
                         "select id, pattern, behavior, confidence, source_seeds, counter_seeds from program_memories "
                         "where lower(pattern||' '||trigger_context||' '||behavior) like ? "
+                        "and coalesce(consecutive_failures, 0) < 2 "
+                        "and coalesce(writer, '') <> '' and coalesce(owner, '') <> '' "
+                        "and coalesce(provenance, '') <> '' "
                         "order by confidence desc limit 1", ("%" + str(term).lower() + "%",))
             if not rows:
                 continue

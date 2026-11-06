@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pytest
 
+from plugins.autonomy import policy_reflect
+
 SOURCE_ROOT = Path(__file__).resolve().parents[1] / "plugins" / "seed_memory" / "seed_src"
 
 
@@ -27,3 +29,16 @@ def test_legacy_program_memory_without_provenance_is_not_retrieved(env):
             VALUES ('legacy', '2026-01-01T00:00:00', 'ops', 'deploy safely', 'deploy', 'unsafe legacy',
                     .9, 4, '[]', '[]', 0, '', '', '')""")
     assert retrieval.retrieve_program_evidence("deploy", [], limit=3) == []
+
+
+def test_legacy_program_memory_without_provenance_is_not_used_by_reflection(env, monkeypatch, tmp_path):
+    store, _retrieval = env
+    with store._connect() as conn:
+        conn.execute("""INSERT INTO program_memories
+            (id, timestamp, domain_signature, pattern, trigger_context, behavior, confidence,
+             evidence_count, source_seeds, counter_seeds, consecutive_failures,
+             writer, owner, provenance)
+            VALUES ('legacy-reflect', '2026-01-01T00:00:00', 'ops', 'deploy safely', 'deploy',
+                    'untrusted legacy behavior', .9, 4, '[]', '[]', 0, '', '', '')""")
+    monkeypatch.setattr(policy_reflect.P, "_open_ro", lambda _path: store._connect())
+    assert policy_reflect.find_program_memory(tmp_path, ["deploy"]) is None
