@@ -55,11 +55,11 @@ def _rule(rid, family="terminal", created=None, baseline=None, ttl_days=7, ttl_o
 
 def _write_rules(data_dir, rules):
     (data_dir / "policy").mkdir(parents=True, exist_ok=True)
-    (data_dir / "policy" / "active.json").write_text(json.dumps(rules), encoding="utf-8")
+    (data_dir / "policy" / "candidates.json").write_text(json.dumps(rules), encoding="utf-8")
 
 
 def _active_ids(data_dir):
-    return [r["id"] for r in policy.load_active_rules(data_dir)]
+    return [r["id"] for r in policy.load_candidate_rules(data_dir)]
 
 
 def _home(tmp_path, rows, events=(), name="prof"):
@@ -237,7 +237,7 @@ def test_promoted_eligible_keeps_status_and_is_recorded_once(tmp_path):
     db = AutonomyDB(data / "autonomy.db")
     policy_eval.evaluate_rules(home, data, db, now=NOW, outcome_fn=lambda *a, **k: {})
     policy_eval.evaluate_rules(home, data, db, now=NOW, outcome_fn=lambda *a, **k: {})
-    rules = policy.load_active_rules(data)
+    rules = policy.load_candidate_rules(data)
     assert len(rules) == 1 and rules[0]["status"] == "candidate"
     assert len(rules[0]["stats"]["reuse_sessions"]) == 10
     n = db.c.execute("select count(*) from policy_events where kind='promoted_eligible'").fetchone()[0]
@@ -314,8 +314,8 @@ def test_dry_run_is_read_only(tmp_path):
     data = home / "autonomy_data"
     _write_rules(data, [_rule("r1")])
     db = AutonomyDB(data / "autonomy.db")
-    before = (data / "policy" / "active.json").read_text(encoding="utf-8")
+    before = (data / "policy" / "candidates.json").read_text(encoding="utf-8")
     rep = policy_eval.dry_run(home, now=NOW)
     assert rep["ok"] is True and [v["id"] for v in rep["vetoed"]] == ["r1"]
-    assert (data / "policy" / "active.json").read_text(encoding="utf-8") == before
+    assert (data / "policy" / "candidates.json").read_text(encoding="utf-8") == before
     assert db.c.execute("select count(*) from policy_events").fetchone()[0] == 0
