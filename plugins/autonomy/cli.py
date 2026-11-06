@@ -321,10 +321,16 @@ def setup_cli_parser(subparser: argparse.ArgumentParser) -> None:
         "action",
         nargs="?",
         default="status",
-        choices=["init", "stop", "resume", "status", "log", "reset-circuit", "tick", "seed-show"],
-        help="Autonomy command: init | stop | resume | status | tick | seed-show",
+        choices=["init", "stop", "resume", "status", "log", "reset-circuit", "tick", "seed-show", "policy"],
+        help="Autonomy command: init | stop | resume | status | tick | seed-show | policy",
     )
-    subparser.add_argument("seed_id", nargs="?", default=None, help="Seed ID for seed-show")
+    subparser.add_argument("seed_id", nargs="?", default=None,
+                           help="Seed ID for seed-show; sub-command for policy: show | history | rollback")
+    subparser.add_argument("policy_args", nargs="*", default=[],
+                           help="policy rollback: <rule_id>. show: list active rules + inspection fields. "
+                                "history [--limit N]: most recent policy events (default 20, max 200). "
+                                "rollback <rule_id>: remove an active rule manually (no failure record).")
+    subparser.add_argument("--limit", type=int, default=20, help="policy history: number of events (max 200)")
     subparser.add_argument("--hermes-home", default=None, help="Override HERMES_HOME path")
     subparser.add_argument("--json", action="store_true", help="Output JSON")
     subparser.add_argument("--dry-run", action="store_true", help="Dry run for tick")
@@ -352,11 +358,112 @@ def cmd_reset_circuit(hermes_home: Optional[str | Path] = None, as_json: bool = 
     return {"ok": True, "action": "reset-circuit", "database": str(db_path), "backup": str(backup) if backup else None}
 
 
+def _policy_paths(hermes_home):
+    home = resolve_hermes_home(hermes_home)
+    raw_cfg = load_raw_config(home)
+    paths = resolve_paths(raw_cfg, hermes_home=home)
+    db_path = os.environ.get("AUTONOMY_DB_PATH") or paths["db_path"]
+    return home, Path(db_path).parent, db_path
+
+
+def _policy_text(s: Any, limit: int = 200) -> str:
+    from .policy_reflect import redact
+
+    return " ".join(redact(str(s or "")).split())[:limit]
+
+
+def cmd_policy(sub: str, rest: List[str], hermes_home=None, as_json=False, limit=20) -> int:
+    """`autonomy policy show|history|rollback`. Never prints .env/secret content; rule text <= 200 chars."""
+    from . import policy as P
+    from . import policy_eval as PE
+
+    sub = (sub or "").lower()
+    home, data_dir, db_path = _policy_paths(hermes_home)
+    if sub == "show":
+        rows = PE.rule_rows(home, data_dir)
+        summary = P.policy_summary(home, data_dir)
+        for r in rows:
+            r["text"] = _policy_text(r.get("text"))
+        if as_json:
+            print(json.dumps({"rules": rows, "summary": summary}, ensure_ascii=False, indent=2, default=str))
+            return 0 if summary.get("ok") else 1
+        print("规则 %d/%d" % (len(rows), P.MAX_RULES))
+        print("%-16s %-10s %-7s %-14s %-6s %s" % ("id", "status", "channel", "ttl", "机会数", "否决指标"))
+        for r in rows:
+            vm = json.dumps(r.get("veto_metrics") or {}, ensure_ascii=False, default=str)[:120]
+            print("%-16s %-10s %-7s %-14s %-6s %s %s" % (r["id"], r["status"], r["channel"], r["ttl"],
+                                                       r["opportunities"], r["veto_reason"], vm))
+            print("    text: %s" % r["text"])
+        print("--- 巡检 ---")
+        if not summary.get("ok"):
+            print("巡检失败: %s" % summary.get("error"))
+            return 1
+        tty = sys.stdout.isatty()
+        ratio = summary["opportunity_shortage_ratio"]
+        shortage = "机会不足占比: %.1f%%" % (ratio * 100)
+        if summary["opportunity_shortage_alert"]:
+            shortage = ("[31m%s  [红色告警: >60%%][0m" % shortage) if tty else shortage + "  [红色告警: >60%]"
+        for line in (
+            "候选数: %d (active %d)" % (summary["candidates"], summary["active_rules"]),
+            "promoted_eligible 数: %d" % summary["promoted_eligible"],
+            "到期分类: expired_no_opportunity=%d expired_neutral=%d" % (
+                summary["expired_no_opportunity"], summary["expired_neutral"]),
+            "否决数 vetoed: %d" % summary["vetoed"],
+            "rejected_format 数: %d" % summary["rejected_format"],
+            "今日反思触发次数: %d" % summary["reflect_today"],
+            "映射覆盖率: %s" % summary.get("mapping_coverage"),
+            shortage,
+        ):
+            print(line)
+        return 0
+    if sub == "history":
+        n = max(1, min(int(limit or 20), 200))
+        conn = P._open_ro(db_path)
+        if conn is None:
+            print("policy history: 无法打开 %s" % db_path)
+            return 1
+        try:
+            rows = conn.execute("select ts,rule_id,kind,reason from policy_events order by id desc limit ?",
+                                (n,)).fetchall()
+        except Exception as e:
+            print("policy history: 查询失败 %s" % type(e).__name__)
+            return 1
+        finally:
+            conn.close()
+        if as_json:
+            print(json.dumps([{"ts": a, "rule_id": b, "kind": c, "reason": _policy_text(d)} for a, b, c, d in rows],
+                             ensure_ascii=False, indent=2))
+            return 0
+        for ts, rid, kind, reason in rows:
+            print("%s  %-16s %-22s %s" % (ts, rid, kind, _policy_text(reason)))
+        if not rows:
+            print("(no policy events)")
+        return 0
+    if sub == "rollback":
+        if len(rest) != 1:
+            print("usage: autonomy policy rollback <rule_id>")
+            return 2
+        rule_id = rest[0]
+        res = P.remove_rule(data_dir, rule_id, reason="manual rollback (cli)", source="manual_rollback",
+                            db=AutonomyDB(db_path), profile=home.name)
+        if not res.get("ok"):
+            print("rollback failed: %s" % (res.get("error") or "unknown"))
+            return 1
+        print("rolled back %s" % rule_id)
+        return 0
+    print("usage: autonomy policy show | history [--limit N] | rollback <rule_id>")
+    return 2
+
+
 def handle_cli(args: argparse.Namespace) -> int:
     _utf8_stdio()
     action = getattr(args, "action", "status") or "status"
     hermes_home = getattr(args, "hermes_home", None)
     as_json = bool(getattr(args, "json", False))
+
+    if action == "policy":
+        return cmd_policy(getattr(args, "seed_id", None) or "", list(getattr(args, "policy_args", None) or []),
+                          hermes_home=hermes_home, as_json=as_json, limit=getattr(args, "limit", 20))
 
     if action == "init":
         res = run_init_wizard(hermes_home=hermes_home)

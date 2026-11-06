@@ -460,6 +460,7 @@ class Runner:
             res = _pr.run_policy_reflection(
                 self.hermes_home, self.data_dir, self.db, time.time(),
                 llm_call=self._policy_llm_call(run), profile=self._profile_name(), run_id=run,
+                has_chat=callable(getattr(self.gateway, "chat", None)),
             )
         except Exception:
             return None
@@ -474,6 +475,15 @@ class Runner:
         except Exception:
             pass
         return {"status": "policy_reflect", "run_id": run, "reflection": res.get("status")}
+
+    def _policy_evaluate(self):
+        """T6: per-tick rule bookkeeping on normal ticks only. Never raises; returns summary or None."""
+        try:
+            from . import policy_eval as _pe
+
+            return _pe.evaluate_rules(self.hermes_home, self.data_dir, self.db, time.time())
+        except Exception:
+            return None
 
     def _surprise_importance(self, run_id, elapsed, tool_turns):
         """Score objective surprise against the previous 30 completed ticks."""
@@ -1302,6 +1312,7 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 # never report silent evidence loss.
                 self.db.append_event(run_id=run, goal_id=goal_id, kind="thought_log_error", exit_reason=type(log_error).__name__, summary=str(log_error)[:300])
 
+            self._policy_evaluate()
             return {
                 "status": "ok",
                 "run_id": run,

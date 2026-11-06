@@ -132,7 +132,7 @@ def test_limit_does_not_generate(env):
 def test_window_and_once_per_day(env):
     profile, data, db = env
     llm = _Llm([GOOD])
-    for h, m in ((2, 59), (3, 20), (4, 0), (15, 0)):
+    for h, m in ((2, 59), (3, 40), (4, 0), (15, 0)):
         assert pr.run_policy_reflection(profile, data, db, _at(h, m), llm_call=llm)["executed"] is False
     assert llm.calls == 0
     assert pr.run_policy_reflection(profile, data, db, _at(3, 0), llm_call=llm)["executed"] is True
@@ -194,8 +194,95 @@ def test_fragment_capped_at_800():
 
 
 def test_window_helper():
-    assert pr.in_reflection_window(_at(3, 0)) and pr.in_reflection_window(_at(3, 19))
-    assert not pr.in_reflection_window(_at(3, 20)) and not pr.in_reflection_window(_at(2, 59))
+    assert pr.in_reflection_window(_at(3, 0)) and pr.in_reflection_window(_at(3, 39))
+    assert not pr.in_reflection_window(_at(3, 40)) and not pr.in_reflection_window(_at(2, 59))
+
+
+def test_window_boundary_0339_runs_0340_does_not(env):
+    profile, data, db = env
+    llm = _Llm([GOOD])
+    assert pr.run_policy_reflection(profile, data, db, _at(3, 40), llm_call=llm)["executed"] is False
+    assert pr.run_policy_reflection(profile, data, db, _at(3, 39), llm_call=llm)["executed"] is True
+    assert llm.calls == 1
+
+
+def test_transport_without_chat_records_skip(env):
+    profile, data, db = env
+    llm = _Llm([GOOD])
+    res = pr.run_policy_reflection(profile, data, db, _at(3, 5), llm_call=None, has_chat=False)
+    assert res["executed"] is True and res["status"] == "policy_reflect_skipped"
+    assert res["reason"] == "transport_no_chat"
+    assert llm.calls == 0
+    assert policy.load_active_rules(data) == []
+    rows = db.c.execute("select exit_reason,summary from events where kind='policy_reflect'").fetchall()
+    assert len(rows) == 1 and rows[0][0] == "policy_reflect_skipped"
+    assert "transport_no_chat" in rows[0][1]
+    # once per day: a later window tick does not write a second skip record
+    again = pr.run_policy_reflection(profile, data, db, _at(3, 10), llm_call=None, has_chat=False)
+    assert again == {"executed": False, "status": "already_ran"}
+    assert db.c.execute("select count(*) from events where kind='policy_reflect'").fetchone()[0] == 1
+
+
+def test_runner_passes_has_chat_false_for_cli_gateway(tmp_path, monkeypatch):
+    db = AutonomyDB(tmp_path / "a.db")
+    r = Runner(db, Budget(), Circuit(), str(tmp_path / "STOP"),
+               lambda: {"text": '{"thoughts":"x","proposals":[]}', "completion_tokens": 1, "prompt_tokens": 1},
+               lock_path=str(tmp_path / "lock"))
+    seen = {}
+
+    def fake(*a, **k):
+        seen.update(k)
+        return {"executed": True, "status": "policy_reflect_skipped", "reason": "transport_no_chat"}
+
+    monkeypatch.setattr(pr, "run_policy_reflection", fake)
+    out = r.tick()
+    assert seen.get("has_chat") is False
+    assert out["status"] == "policy_reflect" and out["reflection"] == "policy_reflect_skipped"
+
+
+def _eval_counter(monkeypatch):
+    from autonomy import policy_eval
+    calls = []
+    monkeypatch.setattr(policy_eval, "evaluate_rules", lambda *a, **k: calls.append(a) or {"ok": True})
+    return calls
+
+
+def test_evaluate_called_once_on_normal_tick(tmp_path, monkeypatch):
+    calls = _eval_counter(monkeypatch)
+    db = AutonomyDB(tmp_path / "a.db")
+    r = Runner(db, Budget(), Circuit(), str(tmp_path / "STOP"),
+               lambda: {"text": '{"thoughts":"x","proposals":[]}', "completion_tokens": 1, "prompt_tokens": 1},
+               lock_path=str(tmp_path / "lock"))
+    monkeypatch.setattr(pr, "run_policy_reflection", lambda *a, **k: {"executed": False, "status": "outside_window"})
+    assert r.tick()["status"] == "ok"
+    assert len(calls) == 1
+    assert calls[0][1] == r.data_dir and calls[0][2] is db
+
+
+def test_evaluate_not_called_on_reflection_tick(tmp_path, monkeypatch):
+    calls = _eval_counter(monkeypatch)
+    db = AutonomyDB(tmp_path / "a.db")
+    r = Runner(db, Budget(), Circuit(), str(tmp_path / "STOP"),
+               lambda: {"text": '{"thoughts":"x","proposals":[]}', "completion_tokens": 1, "prompt_tokens": 1},
+               lock_path=str(tmp_path / "lock"))
+    monkeypatch.setattr(pr, "run_policy_reflection", lambda *a, **k: {"executed": True, "status": "no_trigger"})
+    assert r.tick()["status"] == "policy_reflect"
+    assert calls == []
+
+
+def test_evaluate_exception_does_not_change_status(tmp_path, monkeypatch):
+    from autonomy import policy_eval
+
+    def boom(*a, **k):
+        raise RuntimeError("x")
+
+    monkeypatch.setattr(policy_eval, "evaluate_rules", boom)
+    db = AutonomyDB(tmp_path / "a.db")
+    r = Runner(db, Budget(), Circuit(), str(tmp_path / "STOP"),
+               lambda: {"text": '{"thoughts":"x","proposals":[]}', "completion_tokens": 1, "prompt_tokens": 1},
+               lock_path=str(tmp_path / "lock"))
+    monkeypatch.setattr(pr, "run_policy_reflection", lambda *a, **k: {"executed": False, "status": "outside_window"})
+    assert r.tick()["status"] == "ok"
 
 
 def test_runner_reflection_slot_skips_l0_and_surprise(tmp_path, monkeypatch):

@@ -295,6 +295,39 @@ def evaluate_rules(profile_home, data_dir, db, now=None, outcome_fn=None):
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:120]), "actions": []}
 
 
+def rule_rows(profile_home, data_dir=None, now=None):
+    """Read-only per-rule view for `autonomy policy show`: [] on any failure, never raises."""
+    try:
+        now = _f(now, time.time())
+        home = Path(profile_home)
+        data_dir = data_dir or (home / "autonomy_data")
+        rules = policy.load_active_rules(data_dir)
+        sdb = policy.open_state_db(home)
+        adb = policy.open_autonomy_db(home)
+        try:
+            decided = decide_rules(rules, _ctx(sdb, adb, now))
+        finally:
+            for c in (sdb, adb):
+                try:
+                    if c is not None:
+                        c.close()
+                except Exception:
+                    pass
+        rows = []
+        for r, d in decided:
+            veto = d.get("veto") or {}
+            rows.append({
+                "id": r.get("id"), "status": r.get("status"), "channel": r.get("channel"),
+                "ttl": "%sd/%sopp" % (r.get("ttl_days"), r.get("ttl_opportunities")),
+                "opportunities": (r.get("stats") or {}).get("opportunities", 0),
+                "veto_reason": veto.get("reason", "n/a"), "veto_metrics": veto.get("metrics") or {},
+                "text": r.get("text", ""),
+            })
+        return rows
+    except Exception:
+        return []
+
+
 def dry_run(profile_home, data_dir=None, now=None):
     """Read-only report: no active.json write, no DB write, no outcome call."""
     try:

@@ -510,6 +510,68 @@ def rules_for_prompt(data_dir):
     except Exception:
         return []
 
+# ---------------------------------------------------------------- inspection summary (T6)
+
+SHORTAGE_ALERT = 0.6
+_SUMMARY_TZ = "Asia/Shanghai"
+
+
+def _ro_query(conn, sql, args=()):
+    if conn is None:
+        return []
+    try:
+        return conn.execute(sql, args).fetchall()
+    except Exception:
+        return []
+
+
+def policy_summary(profile_home, data_dir=None, now=None):
+    """Read-only inspection fields for the policy layer. Never raises.
+
+    Counts for policy_events are cumulative. opportunity_shortage_ratio is
+    expired_no_opportunity / all expirations; above SHORTAGE_ALERT it is flagged.
+    """
+    out = {"ok": True}
+    try:
+        import datetime as _dt
+        from zoneinfo import ZoneInfo
+        home = Path(profile_home)
+        data_dir = data_dir or (home / "autonomy_data")
+        ts_now = float(now) if now is not None else time.time()
+        day_start = _dt.datetime.fromtimestamp(ts_now, ZoneInfo(_SUMMARY_TZ)).replace(
+            hour=0, minute=0, second=0, microsecond=0).timestamp()
+        rules = load_active_rules(data_dir)
+        out["active_rules"] = len(rules)
+        out["candidates"] = sum(1 for r in rules if r.get("status") == "candidate")
+        adb = open_autonomy_db(home)
+        try:
+            counts = {k: 0 for k in ("expired_no_opportunity", "expired_neutral", "vetoed", "rejected_format")}
+            for kind, n in _ro_query(adb, "select kind,count(*) from policy_events group by kind"):
+                if kind in counts:
+                    counts[kind] = n
+            out.update(counts)
+            out["promoted_eligible"] = (_ro_query(adb, "select count(distinct rule_id) from policy_events "
+                                                  "where kind='promoted_eligible'") or [(0,)])[0][0]
+            out["reflect_today"] = (_ro_query(adb, "select count(*) from events where kind='policy_reflect' "
+                                              "and ts>=?", (day_start,)) or [(0,)])[0][0]
+            out["reflect_triggered_today"] = out["reflect_today"] > 0
+        finally:
+            if adb is not None:
+                try:
+                    adb.close()
+                except Exception:
+                    pass
+        expired = out["expired_no_opportunity"] + out["expired_neutral"]
+        ratio = (out["expired_no_opportunity"] / expired) if expired else 0.0
+        out["opportunity_shortage_ratio"] = round(ratio, 3)
+        out["opportunity_shortage_alert"] = ratio > SHORTAGE_ALERT
+        rep = build_report(profile_home)
+        out["mapping_coverage"] = (rep.get("coverage") or {}).get("ratio")
+    except Exception as e:
+        out = {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:120])}
+    return out
+
+
 # ---------------------------------------------------------------- report / CLI
 
 

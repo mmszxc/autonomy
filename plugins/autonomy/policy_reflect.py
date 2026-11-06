@@ -1,6 +1,6 @@
 """Nightly policy reflection (T5): distil one advisory rule from failures/inefficiency.
 
-Runs only inside the local 03:00-03:19 window (Asia/Shanghai), at most once per
+Runs only inside the local 03:00-03:39 window (Asia/Shanghai), at most once per
 local day, and only from the tick entry in runner.py.  Every public entry
 degrades (returns a status dict) instead of raising, so a tick can never be
 broken by this module.  Stdlib only; the model call is injected by the caller
@@ -31,7 +31,8 @@ from . import policy as P
 
 REFLECT_TZ = "Asia/Shanghai"
 REFLECT_HOUR = 3
-REFLECT_MINUTE_MAX = 19          # window 03:00-03:19 local
+# window 03:00-03:39 local; a 02:40 tick may hold the run lock until 03:20
+REFLECT_MINUTE_MAX = 39
 MAX_SAMPLES = 3
 SAMPLE_MAX_CHARS = 800
 INPUT_MAX_CHARS = 6000
@@ -401,11 +402,14 @@ def _reflect_core(profile_home, data_dir, db, llm_call, profile, now_ts):
                 pass
 
 
-def run_policy_reflection(profile_home, data_dir, db, now=None, llm_call=None, profile="", run_id=None):
-    """Run the nightly reflection once per local day inside 03:00-03:19. Never raises.
+def run_policy_reflection(profile_home, data_dir, db, now=None, llm_call=None, profile="", run_id=None,
+                          has_chat=True):
+    """Run the nightly reflection once per local day inside 03:00-03:39. Never raises.
 
     Returns {"executed": bool, "status": str, ...}. executed=True means the caller
     should treat this tick as the reflection run (skip normal prompt/L0/surprise).
+    has_chat=False (CLI transport has no chat) records policy_reflect_skipped instead of
+    running: no rule is produced and it is not counted as a success.
     """
     try:
         loc = _local(now)
@@ -417,6 +421,14 @@ def run_policy_reflection(profile_home, data_dir, db, now=None, llm_call=None, p
         return {"executed": False, "status": "error", "error": type(exc).__name__}
     now_ts = loc.timestamp()
     run = run_id or uuid.uuid4().hex
+    if not has_chat:
+        skip = {"status": "policy_reflect_skipped", "reason": "transport_no_chat"}
+        try:
+            db.append_event(ts=now_ts, run_id=run, kind="policy_reflect", exit_reason=skip["status"],
+                            summary=json.dumps(skip, ensure_ascii=False))
+        except Exception:
+            pass
+        return dict(skip, executed=True)
     try:
         res = _reflect_core(profile_home, data_dir, db, llm_call, profile, now_ts)
     except Exception as exc:
