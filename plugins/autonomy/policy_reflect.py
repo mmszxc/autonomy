@@ -273,6 +273,8 @@ def validate_rule(obj, trigger, active_rules, rejected_texts=()):
         return False, "unknown_tool_family", ""
     text = "当%s（工具族 %s）时，%s" % (cond, fam, act)
     tool_names = set(P._FAMILY) | ({trigger["item"].get("tool")} if trigger["channel"] == "A" else set())
+    if trigger["channel"] == "B" and fam in P._FAMILY:
+        tool_names.add(fam)
     tool_names.discard(None)
     tokens = {t.lower() for t in _RE_IDENT.findall(cond)}
     low_cond = cond.lower()
@@ -351,7 +353,8 @@ def _already_ran_today(db, loc):
     day_start = loc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     try:
         with db.lock:
-            return db.c.execute("select 1 from events where kind='policy_reflect' and ts>=? limit 1",
+            return db.c.execute("select 1 from events where kind='policy_reflect' "
+                                "and exit_reason!='policy_reflect_skipped' and ts>=? limit 1",
                                 (day_start,)).fetchone() is not None
     except Exception:
         return True  # cannot prove it has not run: do not risk a double run
@@ -385,10 +388,11 @@ def _reflect_core(profile_home, data_dir, db, llm_call, profile, now_ts):
             return {"status": gen["status"], "key": key, "reason": gen.get("reason", "")}
         p = gen["parsed"]
         rule_id = "pr-" + hashlib.sha1(gen["text"].encode("utf-8")).hexdigest()[:10]
+        baseline = P.baseline(adb, sdb, p.get("tool_family", ""), now_ts)
         res = P.add_rule(data_dir, rule_id, gen["text"], channel=trig["channel"],
                          tool_family=p.get("tool_family", ""), condition=p.get("condition", ""),
                          source_pm_id=(pm or {}).get("id", ""), source_signature=key,
-                         created_run=profile or "")
+                         created_run=profile or "", baseline=baseline)
         if not res.get("ok"):
             return {"status": "write_failed", "key": key, "reason": res.get("error", "")}
         db.record_policy_event(rule_id, "generated", "", dict(payload, attempts=gen["attempts"]), profile)
@@ -428,7 +432,8 @@ def run_policy_reflection(profile_home, data_dir, db, now=None, llm_call=None, p
                             summary=json.dumps(skip, ensure_ascii=False))
         except Exception:
             pass
-        return dict(skip, executed=True)
+        # A transport skip must not consume the reflection window; normal tick continues.
+        return dict(skip, executed=False)
     try:
         res = _reflect_core(profile_home, data_dir, db, llm_call, profile, now_ts)
     except Exception as exc:

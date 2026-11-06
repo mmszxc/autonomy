@@ -210,17 +210,17 @@ def test_transport_without_chat_records_skip(env):
     profile, data, db = env
     llm = _Llm([GOOD])
     res = pr.run_policy_reflection(profile, data, db, _at(3, 5), llm_call=None, has_chat=False)
-    assert res["executed"] is True and res["status"] == "policy_reflect_skipped"
+    assert res["executed"] is False and res["status"] == "policy_reflect_skipped"
     assert res["reason"] == "transport_no_chat"
     assert llm.calls == 0
     assert policy.load_active_rules(data) == []
     rows = db.c.execute("select exit_reason,summary from events where kind='policy_reflect'").fetchall()
     assert len(rows) == 1 and rows[0][0] == "policy_reflect_skipped"
     assert "transport_no_chat" in rows[0][1]
-    # once per day: a later window tick does not write a second skip record
+    # A skipped transport does not lock the day; a later tick may retry.
     again = pr.run_policy_reflection(profile, data, db, _at(3, 10), llm_call=None, has_chat=False)
-    assert again == {"executed": False, "status": "already_ran"}
-    assert db.c.execute("select count(*) from events where kind='policy_reflect'").fetchone()[0] == 1
+    assert again["executed"] is False and again["status"] == "policy_reflect_skipped"
+    assert db.c.execute("select count(*) from events where kind='policy_reflect'").fetchone()[0] == 2
 
 
 def test_runner_passes_has_chat_false_for_cli_gateway(tmp_path, monkeypatch):

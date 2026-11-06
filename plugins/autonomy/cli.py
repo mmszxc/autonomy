@@ -376,12 +376,13 @@ def cmd_policy(sub: str, rest: List[str], hermes_home=None, as_json=False, limit
     """`autonomy policy show|history|rollback`. Never prints .env/secret content; rule text <= 200 chars."""
     from . import policy as P
     from . import policy_eval as PE
+    from . import policy_report as PR
 
     sub = (sub or "").lower()
     home, data_dir, db_path = _policy_paths(hermes_home)
     if sub == "show":
         rows = PE.rule_rows(home, data_dir)
-        summary = P.policy_summary(home, data_dir)
+        summary = PR.policy_summary(home, data_dir)
         for r in rows:
             r["text"] = _policy_text(r.get("text"))
         if as_json:
