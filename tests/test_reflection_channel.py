@@ -1,4 +1,5 @@
 from pathlib import Path
+from pathlib import Path
 from types import SimpleNamespace
 import subprocess
 
@@ -8,7 +9,7 @@ from autonomy.cli_transport import (
     CliGateway, ReflectionCallError, build_reflection_command,
 )
 from autonomy.config import validate_reflection_profile
-from autonomy.policy_reflect import extract_final_json
+from autonomy.policy_reflect import extract_final_json, redact
 from autonomy.runner import Runner
 
 
@@ -66,34 +67,53 @@ def test_reflection_command_is_unique_oneshot_and_has_no_toolset_flag():
     second = build_reflection_command(_gateway(), "run-1", "xiaoai-reflect", "/tmp/prompt")
     assert first != second
     assert first[:4] == ["hermes", "-p", "xiaoai-reflect", "chat"]
-    assert "--no-save" in first and "--oneshot" in first and "--prompt-file" in first
+    assert "--no-save" in first and "--oneshot" in first and "--quiet" in first
+    assert "--prompt-file" not in first and first[-1] == "/tmp/prompt"
     assert "-t" not in first and "--toolsets" not in first
+    supported = {line.strip() for line in (Path(__file__).parent / "fixtures" / "hermes_chat_supported_options.txt").read_text().splitlines() if line.startswith("-")}
+    assert {arg for arg in first if arg.startswith("-")} <= supported
     sid = first[first.index("--session-id") + 1]
     assert sid.startswith("autonomy-reflect-run-1-")
+
+
+class _FakePopen:
+    def __init__(self, cmd, **kwargs):
+        self.cmd, self.kwargs, self.returncode, self.pid = cmd, kwargs, 0, 123
+    def communicate(self, timeout=None):
+        return '{"ok":true}\n', ""
+    def poll(self):
+        return self.returncode
 
 
 def test_run_reflection_uses_fake_subprocess(monkeypatch):
     gateway = CliGateway(profile="xiaoai", model="m", provider="p", run_budget=10, hermes_bin="hermes")
     seen = {}
-
-    def fake_run(cmd, **kwargs):
+    def factory(cmd, **kwargs):
         seen.update(cmd=cmd, kwargs=kwargs)
-        return SimpleNamespace(returncode=0, stdout='{"ok":true}\n', stderr="")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    result = gateway.run_reflection("prompt", "r", reflection_profile="xiaoai-reflect")
+        return _FakePopen(cmd, **kwargs)
+    monkeypatch.setattr(subprocess, "Popen", factory)
+    result = gateway.run_reflection("prompt with 'quotes'\nand lines", "r", reflection_profile="xiaoai-reflect")
     assert result["text"] == '{"ok":true}'
-    prompt_path = seen["cmd"][seen["cmd"].index("--prompt-file") + 1]
-    assert not Path(prompt_path).exists()
-    assert "input" not in seen["kwargs"]
+    assert seen["cmd"][-1] == "prompt with 'quotes'\nand lines"
+    assert "--prompt-file" not in seen["cmd"]
 
 
-def test_run_reflection_classifies_timeout(monkeypatch):
+def test_run_reflection_classifies_timeout_and_kills_group(monkeypatch):
     gateway = CliGateway(profile="xiaoai", model="m", provider="p", run_budget=10, hermes_bin="hermes")
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("x", 1)))
+    class Timed(_FakePopen):
+        calls = 0
+        def communicate(self, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise subprocess.TimeoutExpired("x", 1)
+            self.returncode = -9
+            return "", ""
+    killed = []
+    monkeypatch.setattr(subprocess, "Popen", Timed)
+    monkeypatch.setattr(CliGateway, "_kill_process_group", lambda self, proc: killed.append(proc.pid))
     with pytest.raises(ReflectionCallError, match="timed out") as exc:
         gateway.run_reflection("p", "r", reflection_profile="xiaoai-reflect")
-    assert exc.value.reason == "reflection_timeout"
+    assert exc.value.reason == "reflection_timeout" and killed == [123]
 
 
 def test_extract_final_json_ignores_ansi_fences_and_earlier_objects():
@@ -124,8 +144,11 @@ class _Counter:
         self.succeeded += 1
 
 
-def test_runner_reflection_call_consumes_budget_and_updates_circuit():
+def test_runner_reflection_call_consumes_budget_and_updates_circuit(monkeypatch):
+    monkeypatch.setattr("autonomy.runner.validate_reflection_profile", lambda *a: (True, "", Path("reflect")))
     runner = Runner.__new__(Runner)
+    runner.hermes_home = Path("source")
+    runner._profile_name = lambda: "xiaoai"
     runner.reflection_profile_safe = True
     runner.reflection_profile = "xiaoai-reflect"
     runner.budget = _Counter()

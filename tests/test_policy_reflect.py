@@ -125,7 +125,8 @@ def test_limit_does_not_generate(env):
     res = pr.run_policy_reflection(profile, data, db, _at(3, 5), llm_call=llm, profile="p")
     assert res["status"] == "limit" and llm.calls == 0
     row = db.c.execute("select kind, reason from policy_events").fetchall()
-    assert ("triggered", "limit") in [tuple(r) for r in row]
+    assert row == []
+    assert res["executed"] is False
     assert len(policy.load_active_rules(data)) == 5
 
 
@@ -155,10 +156,25 @@ def test_model_error_degrades(env):
     assert pr.run_policy_reflection(profile, data, db, _at(3, 5), llm_call=None)["status"] == "attempt_limit"
 
 
+def test_non_attempted_budget_rejection_does_not_consume_attempt():
+    from autonomy.cli_transport import ReflectionCallError
+    def denied(_prompt):
+        raise ReflectionCallError("reflection_budget_denied", attempted=False)
+    out = pr.generate_rule(_trig_a(), "x", [], [], denied, max_attempts=3)
+    assert out["status"] == "reflection_budget_denied" and out["attempts"] == 0
+
+
+def test_write_failed_preserves_model_attempts(env, monkeypatch):
+    profile, data, db = env
+    monkeypatch.setattr(policy, "add_rule", lambda *a, **k: {"ok": False, "error": "disk"})
+    out = pr.run_policy_reflection(profile, data, db, _at(3, 5), llm_call=_Llm([GOOD]))
+    assert out["status"] == "write_failed" and out["attempts"] == 1
+
+
 def test_no_model_and_no_trigger_degrade(tmp_path):
     db = AutonomyDB(tmp_path / "a.db")
     res = pr.run_policy_reflection(tmp_path / "missing", tmp_path, db, _at(3, 5), llm_call=_Llm([GOOD]))
-    assert res["executed"] is True and res["status"] == "no_trigger"
+    assert res["executed"] is False and res["status"] == "db_unavailable"
 
 
 def test_pick_trigger_prefers_a_and_excludes_covered():
@@ -226,21 +242,16 @@ def test_transport_without_chat_records_skip(env):
     assert db.c.execute("select count(*) from events where kind='policy_reflect'").fetchone()[0] == 2
 
 
-def test_runner_passes_has_chat_false_for_cli_gateway(tmp_path, monkeypatch):
+def test_runner_cli_gateway_skip_continues_normal_tick_end_to_end(tmp_path, monkeypatch):
     db = AutonomyDB(tmp_path / "a.db")
+    calls = []
     r = Runner(db, Budget(), Circuit(), str(tmp_path / "STOP"),
-               lambda: {"text": '{"thoughts":"x","proposals":[]}', "completion_tokens": 1, "prompt_tokens": 1},
+               lambda: calls.append(1) or {"text": '{"thoughts":"x","proposals":[]}', "completion_tokens": 1, "prompt_tokens": 1},
                lock_path=str(tmp_path / "lock"))
-    seen = {}
-
-    def fake(*a, **k):
-        seen.update(k)
-        return {"executed": True, "status": "policy_reflect_skipped", "reason": "transport_no_chat"}
-
-    monkeypatch.setattr(pr, "run_policy_reflection", fake)
+    monkeypatch.setattr(pr, "in_reflection_window", lambda now=None: True)
     out = r.tick()
-    assert seen.get("has_chat") is False
-    assert out["status"] == "policy_reflect" and out["reflection"] == "policy_reflect_skipped"
+    assert calls == [1]  # skipped reflection did not swallow the normal turn
+    assert out["status"] != "policy_reflect"
 
 
 def _eval_counter(monkeypatch):

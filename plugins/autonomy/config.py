@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -67,38 +68,71 @@ def load_raw_config(hermes_home: Optional[str | Path] = None) -> Dict[str, Any]:
         return {}
 
 
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
+
+
+def _reflection_profile_paths(hermes_home, source_profile, name):
+    """Mirror `hermes -p NAME`: named profiles live below ROOT/profiles."""
+    home = Path(hermes_home).expanduser().absolute()
+    if home.parent.name.lower() == "profiles":
+        return home, home.parent / name
+    profiles_root = home / "profiles"
+    candidate = profiles_root / str(source_profile or "")
+    return (candidate if candidate.exists() else home), profiles_root / name
+
+
 def validate_reflection_profile(
     hermes_home: str | Path, source_profile: str, reflection_profile: str | None
 ) -> Tuple[bool, str, Optional[Path]]:
-    """Prove a sibling reflection profile resolves to no tools; fail closed."""
+    """Fail closed unless a separate profile explicitly proves it has no tools.
+
+    Portable MCP and built-in plugin resolution are an intentional extension
+    point pending live Hermes resolver measurements.
+    """
     name = str(reflection_profile or "").strip()
+    source_name = str(source_profile or "").strip()
     if not name:
         return False, "profile_not_configured", None
-    if name == source_profile or Path(name).name != name:
+    if not _PROFILE_NAME_RE.fullmatch(name) or name.startswith("-"):
+        return False, "profile_name_invalid", None
+    if name.casefold() == source_name.casefold():
         return False, "profile_not_isolated", None
-    profile_home = Path(hermes_home).resolve().parent / name
-    cfg_path = profile_home / "config.yaml"
+    source_home, profile_home = _reflection_profile_paths(hermes_home, source_profile, name)
+    cfg_path, plugins_dir = profile_home / "config.yaml", profile_home / "plugins"
+    if profile_home.is_symlink():
+        return False, "profile_symlink", profile_home
+    if cfg_path.is_symlink():
+        return False, "config_symlink", profile_home
+    if plugins_dir.is_symlink():
+        return False, "plugins_symlink", profile_home
+    if not profile_home.is_dir() or not cfg_path.is_file():
+        return False, "profile_unreadable", profile_home
     try:
+        resolved_profile, resolved_source = profile_home.resolve(strict=True), source_home.resolve(strict=True)
+        if resolved_profile == resolved_source or os.path.samefile(resolved_profile, resolved_source):
+            return False, "profile_not_isolated", profile_home
         raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     except Exception:
         return False, "profile_unreadable", profile_home
     if not isinstance(raw, dict):
         return False, "config_not_mapping", profile_home
     toolsets = raw.get("platform_toolsets")
-    if not isinstance(toolsets, dict) or toolsets.get("cli") != []:
+    if not isinstance(toolsets, dict) or "cli" not in toolsets or toolsets.get("cli") != []:
         return False, "toolsets_not_explicitly_empty", profile_home
-    if raw.get("mcp_servers"):
+    if raw.get("mcp_servers") not in (None, False, {}, []):
         return False, "mcp_servers_configured", profile_home
-    context = raw.get("context_engine")
-    if context not in (None, False, {}) and not (
-        isinstance(context, dict) and context.get("enabled") is False
-    ):
+    if raw.get("memory") not in (None, False, {}, []):
+        return False, "memory_configured", profile_home
+    if raw.get("context_engine") not in (None, False, {}, []):
         return False, "context_engine_enabled", profile_home
-    if raw.get("plugins") or raw.get("enabled_plugins"):
+    context = raw.get("context")
+    if context not in (None, False, {}, []):
+        if not isinstance(context, dict) or context.get("engine") not in (None, False, {}, []):
+            return False, "context_engine_enabled", profile_home
+    if raw.get("plugins") not in (None, False, {}, []) or raw.get("enabled_plugins") not in (None, False, {}, []):
         return False, "plugins_configured", profile_home
-    plugins_dir = profile_home / "plugins"
     try:
-        if plugins_dir.exists() and any(plugins_dir.iterdir()):
+        if plugins_dir.exists() and (not plugins_dir.is_dir() or any(plugins_dir.iterdir())):
             return False, "plugin_directory_not_empty", profile_home
     except OSError:
         return False, "plugin_directory_unreadable", profile_home

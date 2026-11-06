@@ -48,8 +48,10 @@ _log = logging.getLogger(__name__)
 # ---------------------------------------------------------------- redaction
 
 _RE_ENV_LINE = re.compile(r"(?m)^[ \t]*(?:export[ \t]+)?[A-Z][A-Z0-9_]{2,}[ \t]*=[^\n]*$")
-_RE_KV_SECRET = re.compile(r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|passwd|authorization)\b([ \t]*[:=][ \t]*)\S+")
-_RE_BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]+")
+_RE_KV_SECRET = re.compile(r'''(?ix)(["']?\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|passwd|authorization)\b["']?\s*[:=]\s*)(["']?)[^\s,}\]]+\2''')
+_RE_BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+\-/=]+")
+_RE_URL_AUTH = re.compile(r"(?i)(https?://)([^/@\s:]+):([^/@\s]+)@")
+_RE_PRIVATE_KEY = re.compile(r"(?s)-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?-----END [^-\r\n]*PRIVATE KEY-----")
 _RE_PREFIX_TOKEN = re.compile(r"\b(?:sk|ghp|gho|xox[bpa]|AKIA)[-_A-Za-z0-9]{12,}\b")
 _RE_LONG_RANDOM = re.compile(r"\b[A-Za-z0-9_\-]{40,}\b")
 
@@ -58,8 +60,10 @@ def redact(text):
     """Drop suspected secrets, tokens and .env assignment lines. Never raises."""
     s = str(text or "")
     s = _RE_ENV_LINE.sub("[REDACTED_ENV_LINE]", s)
-    s = _RE_KV_SECRET.sub(lambda m: m.group(1) + m.group(2) + "[REDACTED]", s)
+    s = _RE_PRIVATE_KEY.sub("[REDACTED_PRIVATE_KEY]", s)
+    s = _RE_URL_AUTH.sub(r"\1[REDACTED]@", s)
     s = _RE_BEARER.sub("Bearer [REDACTED]", s)
+    s = _RE_KV_SECRET.sub(lambda m: m.group(1) + m.group(2) + "[REDACTED]" + m.group(2), s)
     s = _RE_PREFIX_TOKEN.sub("[REDACTED]", s)
     s = _RE_LONG_RANDOM.sub("[REDACTED]", s)
     return s
@@ -247,19 +251,24 @@ _REQUIRED_OUTPUT_KEYS = {"condition", "action", "tool_family"}
 
 
 def _json_objects(raw):
-    text = _ANSI_RE.sub("", str(raw or "").replace("\r", ""))
-    text = re.sub(r"```(?:json)?|```", "", text, flags=re.I)
-    decoder = json.JSONDecoder()
-    values = []
-    for pos, char in enumerate(text):
-        if char != "{":
-            continue
+    text = _ANSI_RE.sub("", str(raw or "")[-100_000:].replace("\r", ""))
+    stripped = text.strip()
+    fence = re.fullmatch(r"```(?:json)?\s*\n?(.*?)\n?```", stripped, flags=re.I | re.S)
+    if fence:
+        text = fence.group(1)
+    decoder, values, pos = json.JSONDecoder(), [], 0
+    while pos < len(text):
+        start = text.find("{", pos)
+        if start < 0:
+            break
         try:
-            value, _ = decoder.raw_decode(text[pos:])
+            value, end = decoder.raw_decode(text, start)
         except (TypeError, ValueError, json.JSONDecodeError):
+            pos = start + 1
             continue
         if isinstance(value, dict):
             values.append(value)
+        pos = max(start + 1, end)  # skip nested objects inside this root
     return values
 
 
@@ -328,8 +337,10 @@ def generate_rule(trigger, input_text, active_rules, rejected_texts, llm_call, t
         try:
             raw = llm_call(prompt)
         except Exception as exc:
+            attempted = getattr(exc, "attempted", True)
             return {"status": getattr(exc, "reason", "model_error"),
-                    "attempts": attempt, "reason": getattr(exc, "reason", type(exc).__name__),
+                    "attempts": attempt if attempted else attempt - 1,
+                    "reason": getattr(exc, "reason", type(exc).__name__),
                     "text": "", "parsed": {}}
         obj = extract_final_json(raw)
         if obj is None:
@@ -396,6 +407,13 @@ def _reflect_core(profile_home, data_dir, db, llm_call, profile, now_ts, max_att
     sdb = P.open_state_db(profile_home)
     adb = P.open_autonomy_db(profile_home)
     try:
+        if sdb is None:
+            return {"status": "db_unavailable", "attempts": 0}
+        try:
+            if not sdb.execute("select 1 from sqlite_master where type='table' limit 1").fetchone():
+                return {"status": "db_unavailable", "attempts": 0}
+        except Exception:
+            return {"status": "db_unavailable", "attempts": 0}
         sigs = P.failure_signatures(sdb)
         ineff = P.inefficiency_triggers(adb, sdb)
         active = P.load_active_rules(data_dir)
@@ -405,10 +423,11 @@ def _reflect_core(profile_home, data_dir, db, llm_call, profile, now_ts, max_att
             return {"status": "no_trigger"}
         key = trig["key"]
         payload = {"channel": trig["channel"], "source_signature": key}
-        db.record_policy_event(key, "triggered", "", payload, profile)
         if len(active) >= P.MAX_RULES:
-            db.record_policy_event(key, "triggered", "limit", payload, profile)
-            return {"status": "limit", "key": key}
+            # A capacity condition is not a reflection run and should not spam
+            # one event per tick during the window.
+            return {"status": "limit", "key": key, "attempts": 0}
+        db.record_policy_event(key, "triggered", "", payload, profile)
         text_in, pm = build_reflection_input(trig, profile_home, sdb, adb, active)
         tool = trig["item"].get("tool") if trig["channel"] == "A" else (
             "seed_search" if trig["item"].get("kind") == "seed_search_repeat" else None)
@@ -427,7 +446,8 @@ def _reflect_core(profile_home, data_dir, db, llm_call, profile, now_ts, max_att
                          source_pm_id=(pm or {}).get("id", ""), source_signature=key,
                          created_run=profile or "", baseline=baseline)
         if not res.get("ok"):
-            return {"status": "write_failed", "key": key, "reason": res.get("error", "")}
+            return {"status": "write_failed", "key": key, "reason": res.get("error", ""),
+                    "attempts": gen.get("attempts", 0)}
         db.record_policy_event(rule_id, "generated", "", dict(payload, attempts=gen["attempts"]), profile)
         return {"status": "generated", "key": key, "rule_id": rule_id,
                 "attempts": gen.get("attempts", 0)}
@@ -477,11 +497,12 @@ def run_policy_reflection(profile_home, data_dir, db, now=None, llm_call=None, p
             max_attempts=MAX_ATTEMPTS - used_attempts,
         )
     except Exception as exc:
-        res = {"status": "error", "error": type(exc).__name__}
+        res = {"status": "error", "error": type(exc).__name__,
+               "attempts": int(getattr(exc, "attempts", 0) or 0)}
     try:
         db.append_event(ts=now_ts, run_id=run, kind="policy_reflect", exit_reason=str(res.get("status")),
                         summary=json.dumps({k: v for k, v in res.items() if k != "text"}, ensure_ascii=False,
                                            default=str)[:1200])
     except Exception:
         pass
-    return dict(res, executed=True)
+    return dict(res, executed=res.get("status") not in ("limit", "db_unavailable"))

@@ -47,7 +47,7 @@ def _file_lock(path):
 
 from .prompt import build_tick_prompt, load_extra_rules, load_team_bulletin
 from .proposals import parse
-from .config import determine_mode
+from .config import determine_mode, validate_reflection_profile
 from .thought_log import append_thought_log, resolve_thought_log_path
 from .journal import JournalManager, build_chassis_status
 from .transcript import extract_run_transcript
@@ -464,23 +464,35 @@ class Runner:
 
             def _cli_call(prompt):
                 from .cli_transport import ReflectionCallError
+                # Revalidate immediately before every model call; the startup
+                # result is informational only and must not create a TOCTOU gap.
+                safe, reason, _ = validate_reflection_profile(
+                    self.hermes_home, self._profile_name(), self.reflection_profile
+                )
+                if not safe:
+                    raise ReflectionCallError("reflection_unsafe_profile", reason, attempted=False)
                 if not self.budget.allow():
-                    raise ReflectionCallError("reflection_budget_denied")
+                    raise ReflectionCallError("reflection_budget_denied", attempted=False)
                 if not self.circuit.allow():
-                    raise ReflectionCallError("reflection_circuit_open")
+                    raise ReflectionCallError("reflection_circuit_open", attempted=False)
                 try:
                     result = gw.run_reflection(
                         prompt, run, reflection_profile=self.reflection_profile
                     )
                 except ReflectionCallError as exc:
-                    if exc.reason in ("reflection_timeout", "reflection_transport_failed"):
+                    if exc.attempted:
                         self.budget.consume()
+                    if exc.reason in ("reflection_timeout", "reflection_transport_failed", "reflection_provider_error"):
                         self.circuit.failure()
                     raise
                 self.budget.consume()
-                self.circuit.success()
                 self._last_reflection_usage = result.get("usage") or {}
-                return result["text"]
+                text = result.get("text", "")
+                if re.search(r"(?i)\b(provider|authentication|rate.?limit|api)\s+error\b", text):
+                    self.circuit.failure()
+                    raise ReflectionCallError("reflection_provider_error")
+                self.circuit.success()
+                return text
 
             return _cli_call
         if not callable(getattr(gw, "chat", None)):

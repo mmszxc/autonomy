@@ -1,5 +1,5 @@
 """Hermes CLI transport for runtimes without the HTTP runs API."""
-import os, signal, subprocess, tempfile, threading, uuid
+import os, signal, subprocess, threading, uuid
 try:
     import resource
 except ImportError:
@@ -16,8 +16,8 @@ def _reset_address_space_limit():
         pass
 
 
-def build_reflection_command(gateway, run_id, reflection_profile, prompt_file):
-    """Build a no-save oneshot command; tool safety is proved by profile config."""
+def build_reflection_command(gateway, run_id, reflection_profile, prompt):
+    """Build against the deployed `hermes chat --help` contract."""
     cmd = [gateway.hermes_bin, "-p", reflection_profile, "chat"]
     if gateway.model:
         cmd.extend(["--model", gateway.model])
@@ -25,16 +25,17 @@ def build_reflection_command(gateway, run_id, reflection_profile, prompt_file):
         cmd.extend(["--provider", gateway.provider])
     session = "autonomy-reflect-%s-%s" % (run_id, uuid.uuid4().hex[:12])
     cmd.extend([
-        "--prompt-file", str(prompt_file), "--session-id", session,
-        "--timeout", str(gateway.run_budget), "--no-save", "--oneshot", "--quiet",
+        "--session-id", session, "--timeout", str(gateway.run_budget),
+        "--no-save", "--oneshot", "--quiet", str(prompt),
     ])
     return cmd
 
 
 class ReflectionCallError(RuntimeError):
-    def __init__(self, reason, detail=""):
+    def __init__(self, reason, detail="", *, attempted=True):
         super().__init__(detail or reason)
         self.reason = reason
+        self.attempted = attempted
 
 
 class CliGateway:
@@ -96,35 +97,48 @@ class CliGateway:
         raise RuntimeError("cli_transport_has_no_append_message")
 
     def run_reflection(self, prompt, run_id, *, reflection_profile):
-        fd, prompt_path = tempfile.mkstemp(prefix="autonomy-reflect-", suffix=".txt")
-        os.close(fd)
-        with open(prompt_path, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(prompt)
-        cmd = build_reflection_command(self, run_id, reflection_profile, prompt_path)
+        # The deployed CLI has no --prompt-file/stdin option for chat. Passing
+        # one argv element preserves newlines and quotes without shell parsing.
+        cmd = build_reflection_command(self, run_id, reflection_profile, prompt)
         kwargs = {
-            "capture_output": True, "text": True,
-            "errors": "replace", "timeout": self.run_budget + 30,
+            "stdout": subprocess.PIPE, "stderr": subprocess.PIPE,
+            "text": True, "errors": "replace",
         }
         if os.name == "nt":
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         else:
             kwargs["start_new_session"] = True
             kwargs["preexec_fn"] = _reset_address_space_limit
+        proc = subprocess.Popen(cmd, **kwargs)
         try:
             try:
-                proc = subprocess.run(cmd, **kwargs)
+                stdout, stderr = proc.communicate(timeout=self.run_budget + 30)
             except subprocess.TimeoutExpired as exc:
+                self._kill_process_group(proc)
+                proc.communicate()
                 raise ReflectionCallError("reflection_timeout", str(exc)) from exc
-            text = proc.stdout.strip()
+            except BaseException:
+                self._kill_process_group(proc)
+                proc.communicate()
+                raise
+            text = (stdout or "").strip()
             if proc.returncode != 0:
-                raise ReflectionCallError("reflection_transport_failed", proc.stderr[-500:])
+                raise ReflectionCallError("reflection_transport_failed", (stderr or "")[-500:])
             if not text:
                 raise ReflectionCallError("reflection_empty_output")
             return {"text": text, "usage": {"calls": 1}}
         finally:
-            try:
-                os.unlink(prompt_path)
-            except OSError:
-                pass
+            if proc.poll() is None:
+                self._kill_process_group(proc)
+
+    @staticmethod
+    def _kill_process_group(proc):
+        try:
+            if os.name == "nt":
+                proc.kill()
+            else:
+                os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
 
     def end(self, sid): pass
