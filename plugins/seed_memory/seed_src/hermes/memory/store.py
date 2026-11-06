@@ -206,7 +206,10 @@ def init_db(db_path: str | os.PathLike[str] | None = None) -> None:
                 normalised_behavior TEXT,
                 domain_signature TEXT NOT NULL DEFAULT '',
                 counter_seeds TEXT NOT NULL DEFAULT '[]',
-                consecutive_failures INTEGER NOT NULL DEFAULT 0
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                writer TEXT NOT NULL DEFAULT '',
+                owner TEXT NOT NULL DEFAULT '',
+                provenance TEXT NOT NULL DEFAULT ''
             )"""
         )
         program_columns = {
@@ -218,6 +221,9 @@ def init_db(db_path: str | os.PathLike[str] | None = None) -> None:
             "consecutive_failures": "INTEGER DEFAULT 0",
             "normalised_pattern": "TEXT",
             "normalised_behavior": "TEXT",
+            "writer": "TEXT DEFAULT ''",
+            "owner": "TEXT DEFAULT ''",
+            "provenance": "TEXT DEFAULT ''",
         }.items():
             if column not in program_columns:
                 conn.execute(
@@ -866,13 +872,14 @@ def save_program_memory(
         fields = ["id", "timestamp", "category", "pattern", "trigger_context",
                   "behavior", "domain_signature", "confidence", "evidence_count",
                   "source_seeds", "counter_seeds", "consecutive_failures",
-                  "last_reinforced", "access_count", "last_accessed"]
+                  "writer", "owner", "provenance", "last_reinforced", "access_count", "last_accessed"]
         values = [memory.id, now.isoformat(), memory.category, memory.pattern,
                   memory.trigger_context, memory.behavior, memory.domain_signature,
                   memory.confidence, memory.evidence_count,
                   json.dumps(memory.source_seeds, ensure_ascii=False),
                   json.dumps(memory.counter_seeds, ensure_ascii=False),
-                  memory.consecutive_failures, now.isoformat(), memory.access_count, None]
+                  memory.consecutive_failures, memory.writer, memory.owner, memory.provenance,
+                  now.isoformat(), memory.access_count, None]
         conn.execute(
             f"INSERT OR IGNORE INTO program_memories ({', '.join(fields)}) "
             f"VALUES ({', '.join(['?'] * len(fields))})",

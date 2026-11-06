@@ -384,6 +384,43 @@ def _rules_path(data_dir):
     return Path(data_dir) / "policy" / "active.json"
 
 
+def _candidate_rules_path(data_dir):
+    """Offline proposals are deliberately kept out of the production rule store."""
+    return Path(data_dir) / "policy" / "candidates.json"
+
+
+def load_candidate_rules(data_dir):
+    """Candidate-only rule library; malformed/missing data degrades to []."""
+    try:
+        p = _candidate_rules_path(data_dir)
+        data = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else []
+        return [x for x in (_norm_rule(r) for r in data) if x is not None and x.get("status") == "candidate"]
+    except Exception:
+        return []
+
+
+def save_candidate_rules(data_dir, rules):
+    """Atomically save offline candidates without ever touching active.json."""
+    tmp = None
+    try:
+        p = _candidate_rules_path(data_dir)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name("%s.%d.tmp" % (p.name, os.getpid()))
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(rules, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)
+        return {"ok": True}
+    except Exception as e:
+        try:
+            if tmp is not None and Path(tmp).exists():
+                Path(tmp).unlink()
+        except Exception:
+            pass
+        return {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:120])}
+
+
 def _norm_rule(r):
     if not isinstance(r, dict) or not all(isinstance(r.get(k), str) and r.get(k).strip() for k in _REQUIRED):
         return None
@@ -451,7 +488,8 @@ def add_rule(data_dir, rule_id, text, channel="A", tool_family="", condition="",
              source_signature="", created_run="", ttl_opportunities=30, ttl_days=7, baseline=None):
     """Append a candidate rule. Returns {"ok", "rule"|"error"}; 6th rule is rejected."""
     try:
-        rules = load_active_rules(data_dir)
+        # Reflection proposals are offline candidates, never production rules.
+        rules = load_candidate_rules(data_dir)
         if any(r["id"] == rule_id for r in rules):
             return {"ok": False, "error": "duplicate_id"}
         if len(rules) >= MAX_RULES:
@@ -465,7 +503,7 @@ def add_rule(data_dir, rule_id, text, channel="A", tool_family="", condition="",
             "stats": {"opportunities": 0, "fails": 0, "reuse_sessions": []}})
         if r is None:
             return {"ok": False, "error": "invalid_rule"}
-        res = save_active_rules(data_dir, rules + [r])
+        res = save_candidate_rules(data_dir, rules + [r])
         if not res.get("ok"):
             return res
         return {"ok": True, "rule": r}
@@ -503,10 +541,11 @@ def remove_rule(data_dir, rule_id, reason="", source="auto", db=None, profile=""
 
 
 def rules_for_prompt(data_dir):
-    """['[policy:<id>] text', ...] for candidate/promoted rules. [] on any failure."""
+    """Production prompt rules: only explicitly approved/promoted records."""
     try:
         return ["[policy:%s] %s" % (r["id"], " ".join(r["text"].split()))
-                for r in load_active_rules(data_dir) if r.get("status") in ("candidate", "promoted")]
+                for r in load_active_rules(data_dir)
+                if r.get("status") in ("approved", "promoted")]
     except Exception:
         return []
 

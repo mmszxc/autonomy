@@ -416,22 +416,24 @@ def _reflect_core(profile_home, data_dir, db, llm_call, profile, now_ts, max_att
             return {"status": "db_unavailable", "attempts": 0}
         sigs = P.failure_signatures(sdb)
         ineff = P.inefficiency_triggers(adb, sdb)
-        active = P.load_active_rules(data_dir)
+        # 03:00 remains an offline proposal batch.  It works solely on the
+        # candidate library; active production rules are not a write target.
+        candidates = P.load_candidate_rules(data_dir)
         rej_keys, rej_texts = _recent_rejected(db, now_ts)
-        trig = pick_trigger(sigs, ineff, active, rej_keys)
+        trig = pick_trigger(sigs, ineff, candidates, rej_keys)
         if trig is None:
             return {"status": "no_trigger"}
         key = trig["key"]
         payload = {"channel": trig["channel"], "source_signature": key}
-        if len(active) >= P.MAX_RULES:
+        if len(candidates) >= P.MAX_RULES:
             # A capacity condition is not a reflection run and should not spam
             # one event per tick during the window.
             return {"status": "limit", "key": key, "attempts": 0}
         db.record_policy_event(key, "triggered", "", payload, profile)
-        text_in, pm = build_reflection_input(trig, profile_home, sdb, adb, active)
+        text_in, pm = build_reflection_input(trig, profile_home, sdb, adb, candidates)
         tool = trig["item"].get("tool") if trig["channel"] == "A" else (
             "seed_search" if trig["item"].get("kind") == "seed_search_repeat" else None)
-        gen = generate_rule(trig, text_in, active, rej_texts, llm_call, tool, max_attempts=max_attempts)
+        gen = generate_rule(trig, text_in, candidates, rej_texts, llm_call, tool, max_attempts=max_attempts)
         if gen["status"] != "ok":
             if gen["status"] == "rejected_format":
                 db.record_policy_event(key, "rejected_format", gen["reason"],

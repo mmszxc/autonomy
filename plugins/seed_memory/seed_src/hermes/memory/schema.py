@@ -66,6 +66,10 @@ class ProgramMemory:
     source_seeds: List[str] = field(default_factory=list)
     counter_seeds: List[str] = field(default_factory=list)
     consecutive_failures: int = 0
+    # Program memories are executable guidance: provenance is mandatory before use.
+    writer: str = ""
+    owner: str = ""
+    provenance: str = ""
     last_reinforced: Optional[datetime] = None
     access_count: int = 0
     last_accessed: Optional[datetime] = None

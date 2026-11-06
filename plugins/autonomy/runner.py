@@ -527,6 +527,8 @@ class Runner:
         if not isinstance(res, dict) or not res.get("executed"):
             return None
         try:
+            # Reflection consumes the no-change signal; do not immediately retrigger it.
+            self._l0_set_counter(0)
             self.db.c.execute(
                 "update last_tick set status=?,finished_at=?,summary=? where id=1",
                 ("policy_reflect", time.time(), "policy_reflect=%s" % res.get("status")),
@@ -545,8 +547,14 @@ class Runner:
         except Exception:
             return None
 
-    def _surprise_importance(self, run_id, elapsed, tool_turns):
-        """Score objective surprise against the previous 30 completed ticks."""
+    def _surprise_importance(self, run_id, elapsed, tool_turns, has_receipt=False):
+        """Score objective surprise against completed *evidenced* ticks.
+
+        A short failed/empty turn is not a positive surprise: it has no receipt
+        establishing that anything useful happened, so it cannot receive 0.9.
+        """
+        if not has_receipt or not tool_turns:
+            return 0.2
         rows = self.db.c.execute(
             "SELECT e.summary, COALESCE(t.summary,'') FROM events e LEFT JOIN events t "
             "ON t.run_id=e.run_id AND t.kind='transcript' WHERE e.kind='tick' "
@@ -1036,14 +1044,25 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             return False
 
     def _l0_detect_change(self, tick_started, recall_before):
-        """Return True if any external state (git / recall_count) changed this tick."""
+        """Return the observed L0 source: ``git``, ``recall``, or ``none``."""
         if self._l0_has_git_change(tick_started):
-            return True
+            return "git"
         if recall_before >= 0:
             recall_after = self._l0_snapshot_recall()
             if recall_after >= 0 and recall_after != recall_before:
-                return True
-        return False
+                return "recall"
+        return "none"
+
+    def _has_correct_no_action_receipt(self, run_id):
+        """A verified receipt can establish that an intentional no-op was correct."""
+        try:
+            row = self.db.c.execute(
+                "SELECT 1 FROM receipts WHERE run_id=? AND kind IN ('no_action', 'no_change') "
+                "AND status IN ('verified', 'accepted', 'ok') LIMIT 1", (run_id,)
+            ).fetchone()
+            return bool(row)
+        except Exception:
+            return False
 
     def _dormant_flag_enabled(self, run):
         prompt_path = Path(self.hermes_home) / "plugins" / "autonomy" / "prompt.py"
@@ -1355,13 +1374,16 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
 
             # L0: detect external state change and update consecutive_no_change counter
             try:
-                _l0_changed = self._l0_detect_change(started, _l0_recall_before)
-                _l0_new_count = 0 if _l0_changed else _l0_count + 1
+                _l0_source = self._l0_detect_change(started, _l0_recall_before)
+                _l0_changed = _l0_source != "none"
+                _correct_no_action = (not _l0_changed and self._has_correct_no_action_receipt(run))
+                _l0_new_count = 0 if _l0_changed else (_l0_count if _correct_no_action else _l0_count + 1)
                 self._l0_set_counter(_l0_new_count)
                 self.db.append_event(
                     run_id=run, goal_id=goal_id, kind="l0_check",
-                    exit_reason="changed" if _l0_changed else "no_change",
-                    summary="consecutive_no_change=%d" % _l0_new_count,
+                    exit_reason=_l0_source,
+                    summary="source=%s consecutive_no_change=%d correct_no_action=%s" % (
+                        _l0_source, _l0_new_count, str(_correct_no_action).lower()),
                 )
             except Exception:
                 pass
@@ -1383,8 +1405,12 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                     self.db.append_event(run_id=run, goal_id=goal_id, kind="transcript", exit_reason="ok", summary=transcript_meta[1:][:1200])
                 elif transcript.get("error"):
                     self.db.append_event(run_id=run, goal_id=goal_id, kind="transcript", exit_reason="unavailable", summary=str(transcript["error"])[:1200])
+                _tool_count = int(transcript.get("tool_call_count", 0) or 0)
+                # A transcript session plus at least one tool receipt is the minimum
+                # evidence required before an unusually fast run can be rewarded.
+                _has_receipt = bool(transcript.get("session_id") and transcript_text.strip() and _tool_count)
                 importance_override = self._surprise_importance(
-                    run, elapsed, int(transcript.get("tool_call_count", 0) or 0)
+                    run, elapsed, _tool_count, has_receipt=_has_receipt
                 )
                 queue_result = self._enqueue_completed_turn(
                     run, summary, transcript_text, importance_override

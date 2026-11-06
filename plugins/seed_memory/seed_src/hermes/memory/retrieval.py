@@ -174,12 +174,17 @@ def retrieve_program_evidence(
         columns = {
             row[1] for row in conn.execute("PRAGMA table_info(program_memories)")
         }
-        required = {"source_seeds", "counter_seeds", "consecutive_failures"}
+        # Legacy program memories predate provenance fields. They are quarantined
+        # read-only: absence of a trusted writer/L0 provenance means no injection.
+        required = {"source_seeds", "counter_seeds", "consecutive_failures", "writer", "owner", "provenance"}
         if not required.issubset(columns):
             return []
         rows = conn.execute(
             """SELECT * FROM program_memories
                WHERE COALESCE(consecutive_failures, 0) < 2
+                 AND COALESCE(writer, '') <> ''
+                 AND COALESCE(owner, '') <> ''
+                 AND COALESCE(provenance, '') <> ''
                ORDER BY confidence DESC, evidence_count DESC"""
         ).fetchall()
         recalled_ids = {seed.id for seed in recalled_seeds}
