@@ -1,0 +1,29 @@
+                has_recall = "recall_count" in columns
+                has_lra = "last_real_access" in columns
+                for seed_id in ref_ids:
+                    try:
+                        # D-20261105T1600: the column is `last_accessed`, not
+                        # `last_accessed_at` — that column does not exist on seeds,
+                        # so every prior UPDATE threw OperationalError and was
+                        # swallowed by the bare except. access_count was never
+                        # touched either, because the whole statement failed.
+                        # last_real_access is the signal the incremental reinforce
+                        # path actually reads; write it when the column exists.
+                        sets = [
+                            "access_count=COALESCE(access_count,0)+1",
+                            "last_accessed=?",
+                        ]
+                        params = [time.time()]
+                        if has_recall:
+                            sets.append("recall_count=COALESCE(recall_count,0)+1")
+                        if has_lra:
+                            sets.append("last_real_access=?")
+                            params.append(time.time())
+                        conn.execute(
+                            "UPDATE seeds SET " + ", ".join(sets) + " WHERE id=?",
+                            tuple(params) + (seed_id,),
+                        )
+                        touched += 1
+                    except sqlite3.Error:
+                        # per-row failure: skip this one, keep going
+                        pass

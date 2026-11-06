@@ -1,0 +1,26 @@
+    def _refresh_dormant_flag(self):
+        """Write an accurate dormant_flag for load_dormant_flag() to read.
+
+        autonomy/prompt.py surfaces seed_data/seeds/dormant_flag as a live
+        health signal in every tick prompt, but nothing ever wrote it: it
+        carried a manual scan from 2026-11-05T09:36 (total=319) while the real
+        state was 1052 ac=0 seeds out of 2465. Stale telemetry presented as
+        live data is worse than no signal, so query the DB and refresh it.
+        """
+        db_path = Path(self.hermes_home) / "seed_data" / "seeds" / "seeds.db"
+        flag_path = db_path.parent / "dormant_flag"
+        if not db_path.exists():
+            return
+        conn = sqlite3.connect(str(db_path))
+        try:
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM seeds"); total = c.fetchone()[0]
+            c.execute("SELECT COUNT(*) FROM seeds WHERE access_count=0"); ac0 = c.fetchone()[0]
+            c.execute("SELECT COUNT(*) FROM seeds WHERE last_accessed IS NULL"); la_null = c.fetchone()[0]
+        finally:
+            conn.close()
+        ts = datetime.now(timezone.utc).isoformat()
+        flag_path.write_text(
+            f"invalid=0,{ac0},{la_null} total={total} ts={ts}",
+            encoding="utf-8",
+        )

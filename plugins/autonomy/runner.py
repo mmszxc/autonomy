@@ -1,4 +1,5 @@
 import os, uuid, json, threading, time, signal, re, subprocess, sys, statistics
+from datetime import datetime, timezone
 try:
     import fcntl
 except ImportError:
@@ -22,7 +23,6 @@ import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -290,25 +290,33 @@ class Runner:
             if ref_ids:
                 columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(seeds)")}
                 has_recall = "recall_count" in columns
+                has_lra = "last_real_access" in columns
                 for seed_id in ref_ids:
                     try:
-                        now_iso = datetime.now().isoformat(timespec="seconds")
+                        # D-20261105T1600: the column is `last_accessed`, not
+                        # `last_accessed_at` — that column does not exist on seeds,
+                        # so every prior UPDATE threw OperationalError and was
+                        # swallowed by the bare except. access_count was never
+                        # touched either, because the whole statement failed.
+                        # last_real_access is the signal the incremental reinforce
+                        # path actually reads; write it when the column exists.
+                        sets = [
+                            "access_count=COALESCE(access_count,0)+1",
+                            "last_accessed=?",
+                        ]
+                        params = [time.time()]
                         if has_recall:
-                            conn.execute(
-                                "UPDATE seeds SET access_count=COALESCE(access_count,0)+1, "
-                                "recall_count=COALESCE(recall_count,0)+1, "
-                                "last_accessed=?, last_real_access=? WHERE id=?",
-                                (now_iso, now_iso, seed_id),
-                            )
-                        else:
-                            conn.execute(
-                                "UPDATE seeds SET access_count=COALESCE(access_count,0)+1, "
-                                "last_accessed=?, last_real_access=? WHERE id=?",
-                                (now_iso, now_iso, seed_id),
-                            )
-                        touched += conn.total_changes and 1 or 0
+                            sets.append("recall_count=COALESCE(recall_count,0)+1")
+                        if has_lra:
+                            sets.append("last_real_access=?")
+                            params.append(time.time())
+                        conn.execute(
+                            "UPDATE seeds SET " + ", ".join(sets) + " WHERE id=?",
+                            tuple(params) + (seed_id,),
+                        )
+                        touched += 1
                     except sqlite3.Error:
-                        # recall_count column missing or per-row failure: skip
+                        # per-row failure: skip this one, keep going
                         pass
             if expand_ids:
                 tables = {
@@ -987,35 +995,43 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 return True
         return False
 
-    def _refresh_dormant_flag(self):
-        """Refresh xiaoai's dormant counters; profiles without its loader stay off."""
+    def _dormant_flag_enabled(self, run):
         prompt_path = Path(self.hermes_home) / "plugins" / "autonomy" / "prompt.py"
         try:
-            if "def load_dormant_flag" not in prompt_path.read_text(encoding="utf-8"):
-                return False
-            seed_dir = Path(self.hermes_home) / "seed_data" / "seeds"
-            conn = sqlite3.connect(str(seed_dir / "seeds.db"))
-            counts = []
-            for table in ("semantic_memories", "program_memories", "seeds"):
-                cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-                if {"access_count", "last_accessed"} <= cols:
-                    counts.append(conn.execute(
-                        f"SELECT count(*) FROM {table} WHERE COALESCE(access_count,0)=0 AND last_accessed IS NULL"
-                    ).fetchone()[0])
-                else:
-                    counts.append(0)
-            total = conn.execute("SELECT count(*) FROM seeds").fetchone()[0]
-            conn.close()
-            text = "invalid=%s total=%s ts=%s\n" % (
-                ",".join(map(str, counts)), total,
-                datetime.now(timezone.utc).isoformat()
+            return "def load_dormant_flag" in prompt_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            self.db.append_event(
+                run_id=run, kind="dormant_flag_gate_error",
+                exit_reason=type(exc).__name__, summary=str(exc)[:200],
             )
-            tmp = seed_dir / ".dormant_flag.tmp"
-            tmp.write_text(text, encoding="utf-8")
-            os.replace(tmp, seed_dir / "dormant_flag")
             return True
-        except (OSError, sqlite3.Error, UnicodeError):
-            return False
+
+    def _refresh_dormant_flag(self):
+        """Write an accurate dormant_flag for load_dormant_flag() to read.
+
+        autonomy/prompt.py surfaces seed_data/seeds/dormant_flag as a live
+        health signal in every tick prompt, but nothing ever wrote it: it
+        carried a manual scan from 2026-11-05T09:36 (total=319) while the real
+        state was 1052 ac=0 seeds out of 2465. Stale telemetry presented as
+        live data is worse than no signal, so query the DB and refresh it.
+        """
+        db_path = Path(self.hermes_home) / "seed_data" / "seeds" / "seeds.db"
+        flag_path = db_path.parent / "dormant_flag"
+        if not db_path.exists():
+            return
+        conn = sqlite3.connect(str(db_path))
+        try:
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM seeds"); total = c.fetchone()[0]
+            c.execute("SELECT COUNT(*) FROM seeds WHERE access_count=0"); ac0 = c.fetchone()[0]
+            c.execute("SELECT COUNT(*) FROM seeds WHERE last_accessed IS NULL"); la_null = c.fetchone()[0]
+        finally:
+            conn.close()
+        ts = datetime.now(timezone.utc).isoformat()
+        flag_path.write_text(
+            f"invalid=0,{ac0},{la_null} total={total} ts={ts}",
+            encoding="utf-8",
+        )
 
     def tick(self, goal_id=None):
         run = uuid.uuid4().hex
@@ -1073,7 +1089,17 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             # L0: read consecutive_no_change counter to decide whether to inject hint
             _l0_count = self._l0_get_counter()
             memory_review, memory_seed_ids = self._prefetch_memory(run, recent_events, goals=goals)
-            self._refresh_dormant_flag()
+            if self._dormant_flag_enabled(run):
+                # D-20261105T1420: refresh dormant_flag before the prompt reads it.
+                # load_dormant_flag() surfaces this file as a live health signal, but
+                # nothing was ever writing it — it carried a manual scan from 09:36
+                # (total=319) while the real state was 1052 ac=0 seeds. Stale data
+                # presented as live telemetry is worse than no data.
+                try:
+                    self._refresh_dormant_flag()
+                except Exception as exc:
+                    self.db.append_event(run_id=run, kind="dormant_flag_error",
+                                         exit_reason="refresh", summary=str(exc)[:240])
             rules = load_extra_rules(self.data_dir)
             try:
                 from . import policy as _policy
