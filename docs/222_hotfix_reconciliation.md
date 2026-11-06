@@ -12,7 +12,7 @@
 | `cli_transport.py` | `RLIMIT_AS=2GiB`，stderr 空输出回退 | 同 | P0 evidence/process 元数据 | **合并**：保留 rlimit + stderr 回退；P0 transport/evidence 不覆盖 |
 | `config.py` | `/opt/hermes-life/hermes_home` 路径 | 无 `/opt` 路径 | P0 config/evaluation | **已吸收**：本地路径候选加入 `/opt` 再回退 legacy；P0 上线 |
 | `memory_bridge.py` | `/opt/hermes-life/{app/hermes-agent,hermes-agent}` 和 plugin scan | 同 | P0 memory contract | **已吸收**：加入 `/opt` 候选/scan，并保留 legacy 路径/P0 |
-| `runner.py` | 外部 context rotate、L0 access snapshot、若干 `.bak` 链 | 主要是大量 `return`/移除 lineage/summary，疑似回退 | receipt gate、L0 source/no-action/P0 | **不整文件吸收**；只从 xiaoai 逐 hunk 取不冲突的 context rotation、access snapshot，并将 L0 结果适配为 P0 `git/recall/none`；xiaozhi 回退不吸收 |
+| `runner.py` | 外部 context rotate、L0 access snapshot、若干 `.bak` 链 | 主要是大量 `return`/移除 lineage/summary，已裁决为回退 | receipt gate、L0 source/no-action/P0 | **已合并 xiaoai 两项 hunk**：external prefetch rotation、L0 `access` 证据源（仍保留 P0 receipt gate/no-action）；**已裁决 xiaozhi 回退不合并，以仓库为准覆盖** |
 | `policy.py`,`policy_eval.py`,`policy_reflect.py` | 旧 candidate active-store 语义 | 同 | candidate library、offline reflect | 直接上 P0（线上旧语义违反 P0 隔离） |
 | `db.py`,`audit.py`,`budget.py`,`circuit.py` | 在线旧/热修版本 | profile 不同 | P0 schema/evidence/budget/circuit | 直接上 P0；禁止覆盖 DB 文件，migration 独立执行 |
 | `gateway_client.py`,`thought_log.py`,`wizard.py` | xiaoai-only 修改 | 不同或基线 | 无/轻微 P0 | 逐 hunk 人工复核；默认不吸收，部署前 diff gate |
@@ -26,12 +26,14 @@
 
 ## 已吸收本地 commit
 
-`<待提交>` — `fix: retain 222 /opt Hermes Life discovery hotfix`：将线上确认的 `/opt/hermes-life` Hermes home、agent 和 memory plugin 路径以 fallback 方式纳入 `config.py`/`memory_bridge.py`。不删除现有开发/legacy 路径。
+`59c79b3` — `fix: retain 222 Hermes Life discovery hotfix`：将线上确认的 `/opt/hermes-life` Hermes home、agent 和 memory plugin 路径以 fallback 方式纳入 `config.py`/`memory_bridge.py`。不删除现有开发/legacy 路径。
+
+`<本次提交>` — `fix: retain selected xiaoai runner hotfixes`：吸收 xiaoai 的 external-world prefetch rotation 与 access-count L0 snapshot；保留 P0 的 receipt gate、no-action 计数和 `git/recall/none` 行为。
 
 ## Runner 三方合并门（未完成前不得发包）
 
 1. 从 xiaoai current 与对应 `.bak` 建 patch，仅选择：external context 的 rotate/clean、access snapshot 两种功能 hunk。
-2. 将 access snapshot 映射到 P0 `_l0_detect_change()` 返回 `git/recall/none`，不得恢复 boolean API；保留 receipt 支撑 no-action 不递增和 surprise receipt gate。
-3. 使用 xiaozhi 只作反例：任何删除 lineage/summary、过早 return、移除 timeout/receipt 的 hunk 均拒绝。
+2. 已将 access snapshot 映射到 P0 `_l0_detect_change()` 的新 `access` 来源（保留字符串 API，未恢复 boolean）；receipt 支撑 no-action 不递增和 surprise receipt gate 均保留。
+3. **Lead 预裁决**：xiaozhi 的删除 lineage/summary、过早 return、移除 timeout/receipt 的 hunk 均为被改坏的残留，拒绝合并；部署 diff 再见到它们标记“已裁决：以仓库为准”，不重新争议。
 4. 对 merge 后 runner 增加 hotfix regression 测试（/opt 路径、L0 access change、external context rotate）并跑全套 pytest。
 5. 上线包对每 profile 重新 `diff -u`；剩余差异必须逐项标为 profile config/data 或已拒绝 patch，绝不“静默覆盖”。

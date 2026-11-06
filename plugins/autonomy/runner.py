@@ -527,8 +527,8 @@ class Runner:
         if not isinstance(res, dict) or not res.get("executed"):
             return None
         try:
-            # Reflection consumes the no-change signal; do not immediately retrigger it.
-            self._l0_set_counter(0)
+            # Reflection is internal learning, not evidence of an external-world
+            # change. Preserve the L0 streak; only a normal tick may reset it.
             self.db.c.execute(
                 "update last_tick set status=?,finished_at=?,summary=? where id=1",
                 ("policy_reflect", time.time(), "policy_reflect=%s" % res.get("status")),
@@ -546,6 +546,27 @@ class Runner:
             return _pe.evaluate_rules(self.hermes_home, self.data_dir, self.db, time.time())
         except Exception:
             return None
+
+    @staticmethod
+    def _has_successful_run_receipt(run_state, transcript):
+        """Return true only for a successful process plus a substantive transcript."""
+        evidence = run_state.get("evidence") or {}
+        try:
+            exit_code = int(evidence.get("exit_code"))
+        except (TypeError, ValueError):
+            return False
+        process_ok = (
+            run_state.get("status") == "completed"
+            and exit_code == 0
+            and not evidence.get("timed_out")
+            and not evidence.get("oom")
+        )
+        return bool(
+            process_ok
+            and transcript.get("session_id")
+            and str(transcript.get("text") or "").strip()
+            and int(transcript.get("tool_call_count", 0) or 0) > 0
+        )
 
     def _surprise_importance(self, run_id, elapsed, tool_turns, has_receipt=False):
         """Score objective surprise against completed *evidenced* ticks.
@@ -789,6 +810,10 @@ class Runner:
             "我做过的最困难的选择",
             "边界代谢、批量吞并、休眠信号、增量强化",
             "dormant、access_count、last_reinforced、caused_by、种子表",
+            # 222 xiaoai hotfix: external-world terms prevent a purely inward
+            # retrieval loop and make stale/current world-memory visible.
+            "CrowdStrike、国际安全事件、技术基础设施、外部世界变化",
+            "数字货币、宏观经济、监管变化、现实世界反馈",
         ]
         try:
             idx = hash(str(run)) % len(_rotation)
@@ -1043,22 +1068,49 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
         except Exception:
             return False
 
-    def _l0_detect_change(self, tick_started, recall_before):
-        """Return the observed L0 source: ``git``, ``recall``, or ``none``."""
+    def _l0_snapshot_access(self):
+        """Return seed access total, or -1 if unavailable (222 hotfix, 2026-11-06)."""
+        db_path = self._seed_db_path()
+        if db_path is None:
+            return -1
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=2.0)
+            try:
+                columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(seeds)")}
+                if "access_count" not in columns:
+                    return -1
+                row = conn.execute("SELECT COALESCE(SUM(access_count), 0) FROM seeds").fetchone()
+                return int(row[0]) if row else 0
+            finally:
+                conn.close()
+        except Exception:
+            return -1
+
+    def _l0_detect_change(self, tick_started, recall_before, access_before=-1):
+        """Return L0 evidence source: ``git``, ``recall``, ``access`` or ``none``."""
         if self._l0_has_git_change(tick_started):
             return "git"
         if recall_before >= 0:
             recall_after = self._l0_snapshot_recall()
             if recall_after >= 0 and recall_after != recall_before:
                 return "recall"
+        if access_before >= 0:
+            access_after = self._l0_snapshot_access()
+            # 222 hotfix used this coarse threshold to avoid normal read noise.
+            if access_after >= 0 and access_after - access_before >= 5:
+                return "access"
         return "none"
 
-    def _has_correct_no_action_receipt(self, run_id):
-        """A verified receipt can establish that an intentional no-op was correct."""
+    def _has_correct_no_action_receipt(self, run_id, goal_id):
+        """Accept only a goal-bound no-action receipt with verified evidence."""
         try:
             row = self.db.c.execute(
-                "SELECT 1 FROM receipts WHERE run_id=? AND kind IN ('no_action', 'no_change') "
-                "AND status IN ('verified', 'accepted', 'ok') LIMIT 1", (run_id,)
+                "SELECT 1 FROM receipts r "
+                "WHERE r.run_id=? AND r.goal_id=? AND r.kind='no_action' "
+                "AND r.status='verified' AND EXISTS ("
+                "SELECT 1 FROM evidence e WHERE e.receipt_id=r.id AND e.status='verified'"
+                ") LIMIT 1",
+                (run_id, goal_id),
             ).fetchone()
             return bool(row)
         except Exception:
@@ -1153,8 +1205,9 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             if goal_id:
                 goals = [g for g in goals if g.get("id") == goal_id]
             recent_events = self.db.recent_runs(5)
-            # L0: snapshot recall_count before this tick starts
+            # L0: snapshot recall/access counters before this tick starts.
             _l0_recall_before = self._l0_snapshot_recall()
+            _l0_access_before = self._l0_snapshot_access()
             # L0: read consecutive_no_change counter to decide whether to inject hint
             _l0_count = self._l0_get_counter()
             memory_review, memory_seed_ids = self._prefetch_memory(run, recent_events, goals=goals)
@@ -1374,9 +1427,12 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
 
             # L0: detect external state change and update consecutive_no_change counter
             try:
-                _l0_source = self._l0_detect_change(started, _l0_recall_before)
+                _l0_source = self._l0_detect_change(started, _l0_recall_before, _l0_access_before)
                 _l0_changed = _l0_source != "none"
-                _correct_no_action = (not _l0_changed and self._has_correct_no_action_receipt(run))
+                _correct_no_action = (
+                    not _l0_changed
+                    and self._has_correct_no_action_receipt(run, goal_id)
+                )
                 _l0_new_count = 0 if _l0_changed else (_l0_count if _correct_no_action else _l0_count + 1)
                 self._l0_set_counter(_l0_new_count)
                 self.db.append_event(
@@ -1406,9 +1462,9 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 elif transcript.get("error"):
                     self.db.append_event(run_id=run, goal_id=goal_id, kind="transcript", exit_reason="unavailable", summary=str(transcript["error"])[:1200])
                 _tool_count = int(transcript.get("tool_call_count", 0) or 0)
-                # A transcript session plus at least one tool receipt is the minimum
-                # evidence required before an unusually fast run can be rewarded.
-                _has_receipt = bool(transcript.get("session_id") and transcript_text.strip() and _tool_count)
+                # Process evidence is part of the receipt: failed, timed-out, or
+                # OOM runs stay capped even if they emitted text and tool records.
+                _has_receipt = self._has_successful_run_receipt(state, transcript)
                 importance_override = self._surprise_importance(
                     run, elapsed, _tool_count, has_receipt=_has_receipt
                 )
