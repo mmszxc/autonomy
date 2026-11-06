@@ -1,4 +1,5 @@
 """Seed retrieval with embedding/FTS tracks and reciprocal-rank fusion."""
+# xiaoai 专用，部署时不要同步到 xiaozhi。
 
 from __future__ import annotations
 
@@ -8,6 +9,7 @@ import json
 import os
 import re
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -341,9 +343,120 @@ def retrieve(query: str, top_k: int = 5) -> List[Seed]:
             candidates[seed.id] = seed
             scores[seed.id] = scores.get(seed.id, 0.0) + 0.45 / (k_rrf + rank)
 
+        # Lift long-dormant seeds into the candidate pool BEFORE RRF truncation.
+        # The ext_hook can only REORDER what retrieve() hands it; a seed that
+        # never enters the top_n window can never be woken by the hook, no
+        # matter how high it scores in ext_hooks._score().  This is the
+        # caller's own pool expansion -- the hook's no-injection contract is
+        # untouched; it still only reorders.
+        injected = _inject_dormant_candidates(candidates, scores, all_seeds, top_k)
+
         ranked_ids = sorted(scores, key=lambda seed_id: (-scores[seed_id], seed_id))
         results = [candidates[seed_id] for seed_id in ranked_ids[:top_k]]
+        # Injected dormant seeds carry a floor score and would be truncated
+        # away here.  Reserve their slots so the injection is not a no-op:
+        # they displace the lowest-scoring ordinary matches, not each other.
+        if injected:
+            injected_ids = {s.id for s in injected if s.id in candidates}
+            # Make room first: drop the lowest-scoring ordinary results until
+            # every injected seed fits.  If the pool is already smaller than
+            # top_k (rare -- top_n < top_k), nothing is dropped.
+            for sid in injected_ids:
+                if sid in results:
+                    continue
+                while len(results) >= top_k:
+                    ordinary = [
+                        i for i, s in enumerate(results)
+                        if s.id not in injected_ids
+                    ]
+                    if not ordinary:
+                        break  # pool is all injected seeds; nothing to drop
+                    results.pop(ordinary[-1])
+                if len(results) < top_k:
+                    results.append(candidates[sid])
         for seed in results:
             touch_seed(seed.id)
 
     return _rerank_with_ext_hook(results, query)
+
+
+_DORMANT_INJECT_DAYS = 7.0
+_DORMANT_INJECT_MAX = 5
+
+
+def _dormant_seeds_from_db(
+    all_seeds: List[Seed], top_k: int
+) -> List[Seed]:
+    """Return long-sleeping unretrieved seeds, capped and age-filtered.
+
+    The Seed dataclass carries no last_real_access column (that lives only in
+    the DB), so the age check is done here against the raw row rather than
+    against the in-memory object.  Seeds already in the candidate pool are
+    excluded by the caller.
+    """
+    if top_k <= 0:
+        return []
+    try:
+        from .store import DB_PATH
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        cutoff = datetime.now(timezone.utc) - timedelta(days=_DORMANT_INJECT_DAYS)
+        rows = conn.execute(
+            "SELECT id, access_count, last_real_access, timestamp, importance "
+            "FROM seeds WHERE access_count = 0 "
+            "ORDER BY importance DESC, timestamp ASC"
+        ).fetchall()
+        conn.close()
+    except (OSError, sqlite3.Error):
+        return []
+
+    now = datetime.now(timezone.utc)
+    seed_by_id = {s.id: s for s in all_seeds}
+    picked: List[Seed] = []
+    for row in rows:
+        if len(picked) >= _DORMANT_INJECT_MAX:
+            break
+        seed = seed_by_id.get(row["id"])
+        if seed is None:
+            continue
+        ts = row["last_real_access"] or row["timestamp"]
+        try:
+            t = datetime.fromisoformat(ts)
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+            age_days = (now - t).total_seconds() / 86400.0
+        except Exception:
+            age_days = _DORMANT_INJECT_DAYS  # unknown age: treat as eligible
+        if age_days < _DORMANT_INJECT_DAYS:
+            continue
+        picked.append(seed)
+    return picked
+
+
+def _inject_dormant_candidates(
+    candidates: Dict[str, Seed],
+    scores: Dict[str, float],
+    all_seeds: List[Seed],
+    top_k: int,
+) -> List[Seed]:
+    """Add long-sleeping seeds to the RRF candidate pool so the ext_hook can reach them.
+
+    Seeds already in the pool are left alone.  Only seeds that have never been
+    retrieved (access_count == 0) AND have been sleeping for at least
+    _DORMANT_INJECT_DAYS are added, with a floor score so they sit below genuine
+    matches but above noise.  The cap keeps the pool bounded.
+
+    Returns the seeds that were actually injected so the caller can reserve
+    their slots in the final top_k truncation.
+    """
+    if top_k <= 0:
+        return []
+    floor = -float(top_k) - 1.0
+    injected: List[Seed] = []
+    for seed in _dormant_seeds_from_db(all_seeds, top_k):
+        if seed.id in candidates:
+            continue
+        candidates[seed.id] = seed
+        scores[seed.id] = floor
+        injected.append(seed)
+    return injected

@@ -22,6 +22,7 @@ import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 
 
@@ -259,6 +260,35 @@ class Runner:
         except OSError:
             return None
 
+    def _refresh_dormant_flag(self):
+        """Refresh xiaoai's dormant counters; profiles without its loader stay off."""
+        prompt_path = Path(self.hermes_home) / "plugins" / "autonomy" / "prompt.py"
+        try:
+            if "def load_dormant_flag" not in prompt_path.read_text(encoding="utf-8"):
+                return False
+            seed_dir = Path(self.hermes_home) / "seed_data" / "seeds"
+            conn = sqlite3.connect(str(seed_dir / "seeds.db"))
+            counts = []
+            for table in ("semantic_memories", "program_memories", "seeds"):
+                cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+                if {"access_count", "last_accessed"} <= cols:
+                    counts.append(conn.execute(
+                        f"SELECT count(*) FROM {table} WHERE COALESCE(access_count,0)=0 AND last_accessed IS NULL"
+                    ).fetchone()[0])
+                else:
+                    counts.append(0)
+            total = conn.execute("SELECT count(*) FROM seeds").fetchone()[0]
+            conn.close()
+            text = "invalid=%s total=%s ts=%s\n" % (
+                ",".join(map(str, counts)), total, datetime.now().isoformat(timespec="seconds")
+            )
+            tmp = seed_dir / ".dormant_flag.tmp"
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, seed_dir / "dormant_flag")
+            return True
+        except (OSError, sqlite3.Error, UnicodeError):
+            return False
+
     def _handle_seed_references(self, run, assistant_text):
         """Scan assistant text for [#seed_id] / [#expand:seed_id] references.
 
@@ -291,18 +321,19 @@ class Runner:
                 has_recall = "recall_count" in columns
                 for seed_id in ref_ids:
                     try:
+                        now_iso = datetime.now().isoformat(timespec="seconds")
                         if has_recall:
                             conn.execute(
                                 "UPDATE seeds SET access_count=COALESCE(access_count,0)+1, "
                                 "recall_count=COALESCE(recall_count,0)+1, "
-                                "last_accessed_at=? WHERE id=?",
-                                (time.time(), seed_id),
+                                "last_accessed=?, last_real_access=? WHERE id=?",
+                                (now_iso, now_iso, seed_id),
                             )
                         else:
                             conn.execute(
                                 "UPDATE seeds SET access_count=COALESCE(access_count,0)+1, "
-                                "last_accessed_at=? WHERE id=?",
-                                (time.time(), seed_id),
+                                "last_accessed=?, last_real_access=? WHERE id=?",
+                                (now_iso, now_iso, seed_id),
                             )
                         touched += conn.total_changes and 1 or 0
                     except sqlite3.Error:
@@ -1321,6 +1352,7 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 # never report silent evidence loss.
                 self.db.append_event(run_id=run, goal_id=goal_id, kind="thought_log_error", exit_reason=type(log_error).__name__, summary=str(log_error)[:300])
 
+            self._refresh_dormant_flag()
             self._policy_evaluate()
             return {
                 "status": "ok",
