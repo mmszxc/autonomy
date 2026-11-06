@@ -14,7 +14,7 @@ import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -584,6 +584,70 @@ def get_all_program_memories() -> List[ProgramMemory]:
     return [_row_to_program(row) for row in rows]
 
 
+def _bayes_confidence(evidence_count: int, counter_count: int) -> float:
+    """(e+1)/(e+c+2), clamped to [0.01, 0.99]."""
+    e = max(0, int(evidence_count or 0))
+    c = max(0, int(counter_count or 0))
+    return min(0.99, max(0.01, (e + 1) / (e + c + 2)))
+
+
+def record_program_memory_outcome(
+    pm_id: str,
+    failed: bool,
+    counter_seed_id: str | None = None,
+    source: str = "auto",
+) -> Dict[str, Any]:
+    """Atomically record an outcome for a program memory.
+
+    failed=True: consecutive_failures+1, counter_seed_id appended to counter_seeds
+    (deduplicated; a repeated counter_seed_id is a no-op so retries/concurrency
+    never double count), confidence recomputed.
+    failed=False: treated as reinforcement: evidence_count+1, consecutive_failures-1
+    (floor 0), confidence recomputed.
+    source="manual_rollback": nothing is recorded (human rollbacks must not pollute stats).
+    Returns {"found", "recorded", "reason", "confidence", "consecutive_failures"}.
+    """
+    if source == "manual_rollback":
+        return {"found": None, "recorded": False, "reason": "manual_rollback"}
+    init_db()
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT evidence_count, confidence, counter_seeds, consecutive_failures "
+            "FROM program_memories WHERE id=?", (pm_id,)).fetchone()
+        if row is None:
+            conn.rollback()
+            return {"found": False, "recorded": False, "reason": "not_found"}
+        counters = _json_list(row["counter_seeds"])
+        evidence = int(row["evidence_count"] or 0)
+        failures = int(row["consecutive_failures"] or 0)
+        if failed:
+            if counter_seed_id is not None and str(counter_seed_id) in [str(c) for c in counters]:
+                conn.rollback()
+                return {"found": True, "recorded": False, "reason": "duplicate",
+                        "confidence": row["confidence"], "consecutive_failures": failures}
+            failures += 1
+            if counter_seed_id is not None:
+                counters.append(str(counter_seed_id))
+        else:
+            evidence += 1
+            failures = max(0, failures - 1)
+        conf = _bayes_confidence(evidence, len(counters))
+        conn.execute(
+            "UPDATE program_memories SET evidence_count=?, confidence=?, counter_seeds=?, "
+            "consecutive_failures=? WHERE id=?",
+            (evidence, conf, json.dumps(counters, ensure_ascii=False), failures, pm_id))
+        conn.commit()
+        return {"found": True, "recorded": True, "reason": "ok",
+                "confidence": conf, "consecutive_failures": failures}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def update_program_memory_failure(memory_id: str, failed: bool = True) -> bool:
     """Increment the circuit breaker on failure, or reset it after success."""
     init_db()
@@ -705,7 +769,11 @@ def save_semantic_memory(
                 existing_seeds = _json_list(row["source_seeds"])
                 new_seeds = [s for s in memory.source_seeds if s not in existing_seeds]
                 merged_evidence = row["evidence_count"] + 1
-                merged_confidence = min(0.99, max(row["confidence"], memory.confidence))
+                # Bayesian-smoothed, can fall again (no ratchet). Legacy rows keep their
+                # stored confidence until first touched here/in outcome (no deploy-time jump).
+                merged_confidence = _bayes_confidence(
+                    merged_evidence, len(existing_counters) + len(new_counters))
+                merged_failures = max(0, int(row["consecutive_failures"] or 0) - 1)
                 merged_sources = existing_seeds + new_seeds
                 conn.execute(
                     "UPDATE semantic_memories SET evidence_count=?, confidence=?, "
@@ -766,8 +834,8 @@ def save_program_memory(
     with _connect() as conn:
         if merge:
             row = conn.execute(
-                "SELECT id, evidence_count, confidence, source_seeds, counter_seeds "
-                "FROM program_memories "
+                "SELECT id, evidence_count, confidence, source_seeds, counter_seeds, "
+                "consecutive_failures FROM program_memories "
                 "WHERE normalised_pattern = ? AND normalised_behavior = ?",
                 (norm_pattern, norm_behavior),
             ).fetchone()
@@ -777,15 +845,19 @@ def save_program_memory(
                 existing_counters = _json_list(row["counter_seeds"])
                 new_counters = [s for s in memory.counter_seeds if s not in existing_counters]
                 merged_evidence = row["evidence_count"] + 1
-                merged_confidence = min(0.99, max(row["confidence"], memory.confidence))
+                # Bayesian-smoothed, can fall again (no ratchet). Legacy rows keep their
+                # stored confidence until first touched here/in outcome (no deploy-time jump).
+                merged_confidence = _bayes_confidence(
+                    merged_evidence, len(existing_counters) + len(new_counters))
+                merged_failures = max(0, int(row["consecutive_failures"] or 0) - 1)
                 conn.execute(
                     "UPDATE program_memories SET evidence_count=?, confidence=?, "
                     "source_seeds=?, counter_seeds=?, domain_signature=?, "
-                    "consecutive_failures=0, last_reinforced=? WHERE id=?",
+                    "consecutive_failures=?, last_reinforced=? WHERE id=?",
                     (merged_evidence, merged_confidence,
                      json.dumps(existing_seeds + new_seeds, ensure_ascii=False),
                      json.dumps(existing_counters + new_counters, ensure_ascii=False),
-                     memory.domain_signature, now.isoformat(), row["id"]),
+                     memory.domain_signature, merged_failures, now.isoformat(), row["id"]),
                 )
                 return row["id"]
 

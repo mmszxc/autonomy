@@ -110,7 +110,7 @@ _RE_PID = re.compile(r"\b(pid|PID|process)[ =:]*\d+")
 _RE_WINPATH = re.compile(r"\b[A-Za-z]:\\[^\s'\"]*")
 _RE_PATH = re.compile(r"(?<![\w.])(?:~|\.{0,2})?(?:/[\w.@+\-~]+){2,}/?")
 _RE_QUOTED = re.compile(r"""'[^'\n]{0,200}'|"[^"\n]{0,200}\"""")
-_RE_NUM = re.compile(r"\d+(\.\d+)?")
+_RE_NUM = re.compile(r"(?<![A-Za-z_])\d+(\.\d+)?")
 _RE_WS = re.compile(r"\s+")
 
 
