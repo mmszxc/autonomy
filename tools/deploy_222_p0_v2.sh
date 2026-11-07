@@ -65,8 +65,10 @@ rollback_profile() {
 }
 rollback_all() {
   # Always attempt both.  A rollback failure is surfaced to the operator.
-  rollback_profile xiaozhi || true
-  rollback_profile xiaoai || true
+  local rc=0
+  rollback_profile xiaozhi || rc=1
+  rollback_profile xiaoai || rc=1
+  return "$rc"
 }
 verify_canonical() {
   local root=$1
@@ -174,7 +176,26 @@ rm -rf stage && mkdir stage && tar -xzf "autonomy-bundle-$RELEASE_ID.tar.gz" -C 
 (cd stage && sha256sum -c "../autonomy-bundle-$RELEASE_ID.tar.gz.manifest.sha256") || exit 1
 [[ $(find stage -type f | wc -l) == 1102 && $(find stage/plugins/autonomy/_vendor -type f | wc -l) == 956 ]] || exit 1
 
-if ! install_profile xiaoai; then rollback_all; exit 1; fi
-if ! install_profile xiaozhi; then rollback_all; exit 1; fi
-echo "DEPLOY_SUCCESS $(date -u --iso-8601=seconds)"
+# DEPLOY_SUCCESS is fail-closed: it is derived only from these explicit gate
+# results, never merely from reaching the end of this script.
+STAGE_GATE_OK=1
+XIAOAI_GATE_OK=0
+XIAOZHI_GATE_OK=0
+if install_profile xiaoai; then
+  XIAOAI_GATE_OK=1
+else
+  rollback_all || fail 'rollback after xiaoai failure also failed'
+  exit 1
+fi
+if install_profile xiaozhi; then
+  XIAOZHI_GATE_OK=1
+else
+  rollback_all || fail 'rollback after xiaozhi failure also failed'
+  exit 1
+fi
+[[ "$STAGE_GATE_OK" == 1 && "$XIAOAI_GATE_OK" == 1 && "$XIAOZHI_GATE_OK" == 1 ]] || {
+  rollback_all || fail 'rollback after aggregate failure also failed'
+  exit 1
+}
+echo "DEPLOY_SUCCESS stage=$STAGE_GATE_OK xiaoai=$XIAOAI_GATE_OK xiaozhi=$XIAOZHI_GATE_OK at=$(date -u --iso-8601=seconds)"
 REMOTE
