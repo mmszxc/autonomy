@@ -1,4 +1,6 @@
 import hashlib
+import os
+import time
 
 import pytest
 
@@ -22,6 +24,22 @@ class TerminalGateway:
 
     def stop_run(self, _run_id):
         return None
+
+
+class PreemptGateway(TerminalGateway):
+    def __init__(self, state, preempt_file):
+        super().__init__(state)
+        self.preempt_file = preempt_file
+        self.stopped = False
+
+    def start_run(self, *_args, **_kwargs):
+        self.preempt_file.write_text("preempt", encoding="utf-8")
+        future_ns = time.time_ns() + 1_000_000
+        os.utime(self.preempt_file, ns=(future_ns, future_ns))
+        return {"run_id": "gateway-run"}
+
+    def stop_run(self, _run_id):
+        self.stopped = True
 
 
 def process_state(*, failed=False, timed_out=False, oom=False):
@@ -99,6 +117,34 @@ def test_complete_tick_persists_terminal_evidence_receipt_and_budget(tmp_path, s
         assert result["status"] == "ok"
     else:
         assert result["status"] == "failed"
+
+
+def test_preempted_tick_persists_interrupted_receipt_evidence_and_one_budget_entry(tmp_path):
+    runner, db = build_runner(tmp_path, process_state())
+    preempt_file = tmp_path / "preempt"
+    gateway = PreemptGateway(process_state(), preempt_file)
+    runner.gateway = gateway
+    runner.preempt_file = str(preempt_file)
+    runner.pending_resume = str(tmp_path / "pending-resume")
+
+    result = runner.tick()
+
+    row = db.c.execute(
+        "select run_id,goal_id,status from receipts where kind='action_interrupted'"
+    ).fetchone()
+    assert result["status"] == "preempted"
+    assert gateway.stopped is True
+    assert row is not None
+    assert row[0] == result["run_id"]
+    assert row[1] == "default"
+    assert row[2] == "verified"
+    assert db.c.execute(
+        "select count(*) from evidence e join receipts r on r.id=e.receipt_id "
+        "where r.kind='action_interrupted'"
+    ).fetchone()[0] == 2
+    assert db.c.execute(
+        "select count(*) from budget_ledger where bucket='normal'"
+    ).fetchone()[0] == 1
 
 
 def test_complete_tick_records_bound_no_action_receipt(tmp_path):
