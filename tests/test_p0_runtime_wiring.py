@@ -109,10 +109,20 @@ def test_complete_tick_persists_terminal_evidence_receipt_and_budget(tmp_path, s
 
     result = runner.tick()
 
-    receipt_kinds = [row[0] for row in db.c.execute("select kind from receipts order by ts,id")]
-    assert expected_kind in receipt_kinds
-    assert db.c.execute("select count(*) from evidence").fetchone()[0] >= 2
-    assert db.c.execute("select count(*) from budget_ledger where bucket='normal'").fetchone()[0] == 1
+    row = db.c.execute(
+        "select id,run_id,goal_id,status from receipts where kind=?",
+        (expected_kind,),
+    ).fetchone()
+    assert row is not None
+    assert row[1] == result["run_id"]
+    assert row[2] == "default"
+    assert row[3] == "verified"
+    assert db.c.execute(
+        "select count(*) from evidence where receipt_id=?", (row[0],)
+    ).fetchone()[0] >= 2
+    assert db.c.execute(
+        "select count(*) from budget_ledger where bucket='normal'"
+    ).fetchone()[0] == 1
     if expected_kind == "action_completed":
         assert result["status"] == "ok"
     else:
