@@ -9,6 +9,7 @@ Provides:
 """
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -17,9 +18,14 @@ from pathlib import Path
 from typing import Any, Dict
 
 _plugins_dir = Path(__file__).resolve().parent.parent
-for _vendor_dir in (_plugins_dir / "_vendor_ml", Path(__file__).resolve().parent / "_vendor"):
-    if _vendor_dir.is_dir() and str(_vendor_dir) not in sys.path:
-        sys.path.insert(0, str(_vendor_dir))
+# The committed runtime tree contains CPython/Linux native extensions.  It is
+# authoritative on the supported Ubuntu target, but must not shadow a local
+# interpreter's packages on unsupported developer platforms (notably Windows).
+_vendor_runtime_enabled = sys.platform.startswith("linux") or os.environ.get("AUTONOMY_VENDOR_FORCE") == "1"
+if _vendor_runtime_enabled:
+    for _vendor_dir in (_plugins_dir / "_vendor_ml", Path(__file__).resolve().parent / "_vendor"):
+        if _vendor_dir.is_dir() and str(_vendor_dir) not in sys.path:
+            sys.path.insert(0, str(_vendor_dir))
 
 # Preserve the loader-provided package name.  Some portable runtimes load
 # __init__.py as a package with an arbitrary name; hard-coding hermes_home

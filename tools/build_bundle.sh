@@ -17,6 +17,15 @@ tar \
 STAGING="$(mktemp -d)"
 trap 'rm -rf "$STAGING"' EXIT
 tar -xzf "$OUT" -C "$STAGING"
+VENDOR_ROOT="$STAGING/plugins/autonomy/_vendor"
+VENDOR_FILES=0
+if [[ -d "$VENDOR_ROOT" ]]; then
+  VENDOR_FILES="$(find "$VENDOR_ROOT" -type f | wc -l | tr -d ' ')"
+fi
+if [[ "$VENDOR_FILES" -le 0 ]]; then
+  echo "release archive is missing plugins/autonomy/_vendor runtime dependencies" >&2
+  exit 1
+fi
 MANIFEST="${OUT}.manifest.sha256"
 (
   cd "$STAGING"

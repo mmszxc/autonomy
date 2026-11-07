@@ -12,4 +12,6 @@ def test_bundle_keeps_dependency_trees_and_manifests_archive_payload():
     assert "tar -xzf \"$OUT\" -C \"$STAGING\"" in script
     assert 'cd "$STAGING"' in script
     assert 'MANIFEST="${OUT}.manifest.sha256"' in script
+    assert 'VENDOR_ROOT="$STAGING/plugins/autonomy/_vendor"' in script
+    assert 'VENDOR_FILES' in script
     assert 'ARCHIVE_FILES' in script and 'MANIFEST_FILES' in script

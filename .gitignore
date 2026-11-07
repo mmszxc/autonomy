@@ -1,8 +1,5 @@
 __pycache__/
 *.pyc
-_vendor/
-_vendor_ml/
-**/seed_src/hermes/model/
 *.db
 *.db-wal
 *.db-shm
@@ -22,3 +19,16 @@ _cleanup_*/
 _removed_*/
 data/
 sessions/
+
+# Runtime dependency trees are release inputs. Track all content (including
+# certificates/data files matched by broad rules above), except reproducible
+# Python bytecode caches excluded by the release contract.
+!plugins/autonomy/_vendor/**
+!plugins/_vendor_ml/**
+!plugins/seed_memory/_vendor/**
+plugins/autonomy/_vendor/**/__pycache__/
+plugins/autonomy/_vendor/**/*.pyc
+plugins/_vendor_ml/**/__pycache__/
+plugins/_vendor_ml/**/*.pyc
+plugins/seed_memory/_vendor/**/__pycache__/
+plugins/seed_memory/_vendor/**/*.pyc
