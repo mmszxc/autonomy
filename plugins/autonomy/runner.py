@@ -136,7 +136,7 @@ BASE_ROTATION_QUERIES = (
     "我做过的最困难的选择",
     "边界代谢、批量吞并、休眠信号、增量强化",
     "dormant、access_count、last_reinforced、caused_by、种子表",
-    "CrowdStrike、国际安全、国际安全事件、技术基础设施、外部世界变化",
+    "CrowdStrike、国际安全事件、技术基础设施、外部世界变化",
     "数字货币、宏观经济、监管变化、现实世界反馈",
 )
 
