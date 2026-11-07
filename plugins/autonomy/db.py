@@ -89,6 +89,14 @@ class AutonomyDB:
   self.c.execute('delete from events where id not in (select id from events order by id desc limit ?)', (max(1,max_rows),))
   removed=self.c.total_changes; self.c.commit(); return removed
  @locked
+ def usage_get(self,day):
+  row=self.c.execute('select calls,tokens,prompt from usage where day=?',(str(day),)).fetchone()
+  return dict(row) if row else {'calls':0,'tokens':0,'prompt':0}
+ @locked
+ def usage_add(self,day,calls=0,tokens=0,prompt=0):
+  self.c.execute('insert into usage(day,calls,tokens,prompt) values(?,?,?,?) on conflict(day) do update set calls=calls+excluded.calls,tokens=tokens+excluded.tokens,prompt=prompt+excluded.prompt',(str(day),int(calls),int(tokens),int(prompt)))
+  self.c.commit(); return self.usage_get(day)
+ @locked
  def append_receipt(self,kind,payload_hash,status='unverified',run_id=None,goal_id=None,payload=None,ts=None):
   import uuid
   rid=uuid.uuid4().hex

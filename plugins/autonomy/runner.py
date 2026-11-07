@@ -1,4 +1,4 @@
-import os, uuid, json, threading, time, signal, re, subprocess, sys, statistics
+import os, uuid, json, hashlib, threading, time, signal, re, subprocess, sys, statistics
 from datetime import datetime, timezone
 try:
     import fcntl
@@ -154,10 +154,14 @@ class Runner:
         reflection_profile_safe=False,
         reflection_profile_reason="profile_not_configured",
         p0_mode="observe_only",
+        event_log=None,
+        budget_ledger=None,
     ):
         self.db = db
         self.budget = budget
         self.circuit = circuit
+        self.event_log = event_log
+        self.budget_ledger = budget_ledger
         resolved_mode = str(p0_mode or "").strip().lower()
         self.p0_mode = resolved_mode if resolved_mode in {"observe_only", "normal"} else "observe_only"
         if self.p0_mode == "observe_only" and hasattr(self.circuit, "freeze_learning"):
@@ -528,6 +532,86 @@ class Runner:
             return False
         circuit = getattr(self, "circuit", None)
         return True if circuit is None else circuit.allow_promotion()
+
+    @staticmethod
+    def _p0_process_kind(state):
+        evidence = state.get("evidence", {}) if isinstance(state, dict) else {}
+        if evidence.get("timed_out"):
+            return "action_timeout"
+        if evidence.get("oom"):
+            return "action_oom"
+        exit_code = evidence.get("exit_code")
+        if state.get("status") == "failed" or (exit_code is not None and int(exit_code) != 0):
+            return "action_failed"
+        return "action_completed"
+
+    def _append_p0_terminal(self, run_id, goal_id, state, *, kind=None):
+        """Persist one terminal receipt plus both captured process streams."""
+        event_log = getattr(self, "event_log", None)
+        if event_log is None:
+            return None
+        evidence = state.get("evidence", {}) if isinstance(state, dict) else {}
+        terminal_kind = kind or self._p0_process_kind(state)
+        payload = {
+            "run_id": run_id,
+            "goal_id": goal_id,
+            "session_id": state.get("session_id", ""),
+            "state_status": state.get("status", ""),
+            "exit_code": evidence.get("exit_code"),
+            "signal_number": evidence.get("signal_number"),
+            "timed_out": bool(evidence.get("timed_out")),
+            "oom": bool(evidence.get("oom")),
+        }
+        payload_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        receipt_id = event_log.append_receipt(
+            run_id=run_id,
+            goal_id=goal_id,
+            kind=terminal_kind,
+            status="verified",
+            payload_hash=hashlib.sha256(payload_bytes).hexdigest(),
+            payload=payload_bytes,
+            ts=time.time(),
+        )
+        for stream in ("stdout", "stderr"):
+            digest = evidence.get(stream + "_sha256")
+            if not digest:
+                continue
+            head = str(evidence.get(stream + "_head", "")).encode("utf-8", "replace")
+            tail = str(evidence.get(stream + "_tail", "")).encode("utf-8", "replace")
+            event_log.append_evidence(
+                receipt_id=receipt_id,
+                stream=stream,
+                data=b"",
+                digest=digest,
+                byte_count=int(evidence.get(stream + "_bytes", 0) or 0),
+                head=head,
+                tail=tail,
+                truncated=bool(evidence.get(stream + "_truncated")),
+                buffer_path=evidence.get("buffer_path"),
+                exit_code=evidence.get("exit_code"),
+                signal=evidence.get("signal_number"),
+                timed_out=bool(evidence.get("timed_out")),
+                oom=bool(evidence.get("oom")),
+                status="unverified",
+                created_at=time.time(),
+            )
+        return receipt_id
+
+    def _account_terminal_call(self, run_id, goal_id, state, *, kind=None):
+        usage = state.get("usage", {}) if isinstance(state, dict) else {}
+        normalized = {
+            "prompt_tokens": int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0),
+            "completion_tokens": int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0),
+            "total_tokens": int(usage.get("total_tokens", 0) or 0),
+        }
+        self.budget.consume(normalized["completion_tokens"], normalized["prompt_tokens"])
+        if getattr(self, "budget_ledger", None) is not None:
+            self.budget_ledger.consume(
+                "normal", 1.0,
+                metadata={"run_id": run_id, "goal_id": goal_id, "operation": "tick"},
+            )
+        self._append_p0_terminal(run_id, goal_id, state, kind=kind)
+        return normalized
 
     def _policy_rules_for_prompt(self, goal):
         if not self._learning_allowed():
@@ -1246,6 +1330,7 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             goals = [g for g in self.db.list_goals() if g.get("status") in ("approved", "active")]
             if goal_id:
                 goals = [g for g in goals if g.get("id") == goal_id]
+            receipt_goal_id = goal_id or (goals[0].get("id") if len(goals) == 1 else None) or "default"
             recent_events = self.db.recent_runs(5)
             # L0: snapshot recall/access counters before this tick starts.
             _l0_recall_before = self._l0_snapshot_recall()
@@ -1297,6 +1382,7 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             # Legacy adapters do not provide process evidence and therefore
             # cannot claim a successful evidence-bound receipt.
             state = {}
+            budget_accounted = False
             is_dialog_first = self.mode != "parallel"
 
             if self.gateway and hasattr(self.gateway, "start_run"):
@@ -1332,6 +1418,7 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                             self.db.append_event(run_id=run, kind="soft_wrap", exit_reason="unsupported", summary=str(exc)[:240])
                     if elapsed_now >= self.max_seconds:
                         self.gateway.stop_run(rid)
+                        final = state
                         deadline = time.time() + self.stop_wait_s
                         while time.time() < deadline:
                             final = self.gateway.get_run(rid)
@@ -1339,7 +1426,15 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                                 break
                             time.sleep(1)
                         elapsed = time.time() - started
-                        raw, usage, tools = self._run_snapshot(final)
+                        final = dict(final or {})
+                        terminal_evidence = dict(final.get("evidence") or {})
+                        terminal_evidence["timed_out"] = True
+                        final["evidence"] = terminal_evidence
+                        usage = self._account_terminal_call(
+                            run, receipt_goal_id, final, kind="action_timeout"
+                        )
+                        budget_accounted = True
+                        raw, _, tools = self._run_snapshot(final)
                         partial, timeout_summary = self._record_partial(run, raw, usage, elapsed, "max_seconds", tools)
                         self.db.c.execute("update last_tick set status=?,finished_at=?,summary=? where id=1", ("run_timeout", time.time(), timeout_summary[:1000]))
                         self.db.c.commit()
@@ -1370,7 +1465,11 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                             fs = final.get("status", "")
                             if fs in ("cancelled", "completed", "failed", "stopped"):
                                 open(self.pending_resume, "a").close()
-                                raw, usage, tools = self._run_snapshot(final)
+                                usage = self._account_terminal_call(
+                                    run, receipt_goal_id, final, kind="action_interrupted"
+                                )
+                                budget_accounted = True
+                                raw, _, tools = self._run_snapshot(final)
                                 partial, _ = self._record_partial(run, raw, usage, time.time() - started, "preempted", tools)
                                 return {"status": "preempted", "run_id": run, "remote_run_id": rid, "partial": partial, "raw_text": raw, "usage": usage}
                             time.sleep(1)
@@ -1382,12 +1481,8 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                     state = self.gateway.get_run(rid)
                     if state.get("status") in ("completed", "failed", "cancelled", "stopped"):
                         raw = state.get("output") or state.get("text") or state.get("content", "")
-                        usage = state.get("usage", {})
-                        usage = {
-                            "prompt_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
-                            "completion_tokens": usage.get("completion_tokens", usage.get("output_tokens", 0)),
-                            "total_tokens": usage.get("total_tokens", 0),
-                        }
+                        usage = self._account_terminal_call(run, receipt_goal_id, state)
+                        budget_accounted = True
                         if state.get("status") == "failed":
                             # Preserve CLI stderr/stdout before propagating the failure.
                             diagnostic = (raw or state.get("stderr") or state.get("error") or "run failed")[-2000:]
@@ -1420,10 +1515,17 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 except Exception as exc:
                     self.db.append_event(run_id=run, kind="journal_error", exit_reason="finalize", summary=str(exc)[:240])
 
-            self.budget.consume(
-                int(usage.get("completion_tokens", 0)),
-                int(usage.get("prompt_tokens", 0)),
-            )
+            if not budget_accounted:
+                self.budget.consume(
+                    int(usage.get("completion_tokens", 0)),
+                    int(usage.get("prompt_tokens", 0)),
+                )
+                if getattr(self, "budget_ledger", None) is not None:
+                    self.budget_ledger.consume(
+                        "normal", 1.0,
+                        metadata={"run_id": run, "goal_id": receipt_goal_id, "operation": "tick"},
+                    )
+                self._append_p0_terminal(run, receipt_goal_id, state)
 
             # Extract transcript before decode so empty-raw (max_turns hit) can
             # synthesize a summary from the actual assistant turns.
@@ -1474,9 +1576,11 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             try:
                 _l0_source = self._l0_detect_change(started, _l0_recall_before, _l0_access_before)
                 _l0_changed = _l0_source != "none"
+                if not _l0_changed and self._has_successful_run_receipt(state, transcript):
+                    self._append_p0_terminal(run, receipt_goal_id, state, kind="no_action")
                 _correct_no_action = (
                     not _l0_changed
-                    and self._has_correct_no_action_receipt(run, goal_id)
+                    and self._has_correct_no_action_receipt(run, receipt_goal_id)
                 )
                 _l0_new_count = 0 if _l0_changed else (_l0_count if _correct_no_action else _l0_count + 1)
                 self._l0_set_counter(_l0_new_count)

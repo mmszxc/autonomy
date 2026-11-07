@@ -2,7 +2,8 @@ from __future__ import annotations
 import argparse, os, sys, time, datetime
 from pathlib import Path
 from .db import AutonomyDB
-from .budget import Budget
+from .budget import Budget, BudgetLedger
+from .event_log import EventLog
 from .circuit import Circuit
 from .runner import Runner
 from .gateway_client import GatewayClient
@@ -14,6 +15,7 @@ from .config import (
     determine_mode,
     resolve_paths,
     validate_reflection_profile,
+    P0Config,
 )
 
 # These outcomes are expected scheduler decisions, not service failures.
@@ -108,6 +110,9 @@ def main(argv=None, *, hermes_home=None):
         tokens=os.environ.get("AUTONOMY_DAILY_TOKENS") or budget_cfg.get("daily_tokens"),
         prompt=os.environ.get("AUTONOMY_DAILY_PROMPT_TOKENS") or budget_cfg.get("daily_prompt_tokens"),
     )
+    p0_cfg = P0Config.from_mapping(auto_cfg.get("p0") if isinstance(auto_cfg.get("p0"), dict) else {})
+    event_log = EventLog(db, challenge_sla_s=p0_cfg.evidence_deadline_s)
+    budget_ledger = BudgetLedger(weekly_units=max(1.0, float(budget.calls) * 7.0), db=db)
     circuit = Circuit(
         db,
         threshold=int(
@@ -127,13 +132,23 @@ def main(argv=None, *, hermes_home=None):
     gw = GatewayClient(model=gw_model, provider=gw_provider)
     if transport == "cli":
         from .cli_transport import CliGateway
-        gw = CliGateway(max_turns=int(limits_cfg.get("max_turns") or 30), run_budget=int(run_max_seconds), profile=Path(hermes_home).name, model=gw_model, provider=gw_provider)
+        gw = CliGateway(
+            max_turns=int(limits_cfg.get("max_turns") or 30), run_budget=int(run_max_seconds),
+            profile=Path(hermes_home).name, model=gw_model, provider=gw_provider,
+            raw_buffer_dir=str(Path(paths["data_dir"]) / "evidence_raw"),
+            raw_buffer_min_free_bytes=p0_cfg.t2_free_bytes,
+        )
     elif transport == "auto":
         try:
             gw._req("GET", "/health")
         except Exception:
             from .cli_transport import CliGateway
-            gw = CliGateway(max_turns=int(limits_cfg.get("max_turns") or 30), run_budget=int(run_max_seconds), profile=Path(hermes_home).name, model=gw_model, provider=gw_provider)
+            gw = CliGateway(
+            max_turns=int(limits_cfg.get("max_turns") or 30), run_budget=int(run_max_seconds),
+            profile=Path(hermes_home).name, model=gw_model, provider=gw_provider,
+            raw_buffer_dir=str(Path(paths["data_dir"]) / "evidence_raw"),
+            raw_buffer_min_free_bytes=p0_cfg.t2_free_bytes,
+        )
 
     r = Runner(
         db,
@@ -162,6 +177,8 @@ def main(argv=None, *, hermes_home=None):
         reflection_profile_safe=reflection_safe,
         reflection_profile_reason=reflection_reason,
         p0_mode=p0_mode,
+        event_log=event_log,
+        budget_ledger=budget_ledger,
     )
 
     if a.resume_if_idle:

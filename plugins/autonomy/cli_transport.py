@@ -1,5 +1,5 @@
 """Hermes CLI transport for runtimes without the HTTP runs API."""
-import hashlib, os, re, signal, subprocess, threading, time, uuid
+import hashlib, os, re, shutil, signal, subprocess, threading, time, uuid
 from pathlib import Path
 try:
     import resource
@@ -16,7 +16,7 @@ def _redact(data: bytes) -> bytes:
 
 def capture_process_evidence(stdout, stderr, exit_code, *, signal_number=None,
                              timed_out=False, oom=False, buffer_dir=None,
-                             max_buffer=5 * 1024**2):
+                             max_buffer=5 * 1024**2, min_free_bytes=1024**3):
     """Capture bounded evidence before any JSON/text parser consumes process output."""
     stdout = stdout if isinstance(stdout, bytes) else str(stdout or "").encode("utf-8", "replace")
     stderr = stderr if isinstance(stderr, bytes) else str(stderr or "").encode("utf-8", "replace")
@@ -28,13 +28,17 @@ def capture_process_evidence(stdout, stderr, exit_code, *, signal_number=None,
     path = None
     if buffer_dir is not None:
         root = Path(buffer_dir); root.mkdir(parents=True, exist_ok=True)
-        path = root / ("evidence-%d-%s.bin" % (time.time_ns(), uuid.uuid4().hex[:8]))
-        # The short-lived buffer may contain secrets; restrict permissions before writing.
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        try:
-            os.write(fd, framed[:max_buffer])
-        finally:
-            os.close(fd)
+        # T2 is a hard stop for raw buffers: permanent hashes/snippets still survive,
+        # but a short-lived buffer must never consume the emergency free-space reserve.
+        buffered = min(len(framed), max_buffer)
+        if shutil.disk_usage(root).free - buffered >= int(min_free_bytes):
+            path = root / ("evidence-%d-%s.bin" % (time.time_ns(), uuid.uuid4().hex[:8]))
+            # The short-lived buffer may contain secrets; restrict permissions before writing.
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                os.write(fd, framed[:max_buffer])
+            finally:
+                os.close(fd)
     return {
         "stdout_sha256": out_digest, "stderr_sha256": err_digest,
         "stdout_bytes": len(stdout), "stderr_bytes": len(stderr),
@@ -81,16 +85,19 @@ class ReflectionCallError(RuntimeError):
 
 
 class CliGateway:
-    def __init__(self, hermes_bin="hermes", max_turns=30, run_budget=2400, profile=None, model=None, provider=None):
+    def __init__(self, hermes_bin="hermes", max_turns=30, run_budget=2400, profile=None, model=None, provider=None,
+                 raw_buffer_dir=None, raw_buffer_min_free_bytes=1024**3):
         self.hermes_bin = os.environ.get("AUTONOMY_HERMES_BIN", hermes_bin)
         self.profile = profile
         self.model = str(model or "").strip()
         self.provider = str(provider or "").strip()
         self.max_turns = int(max_turns)
         self.run_budget = int(run_budget)
-        self.evidence_dir = os.environ.get("AUTONOMY_EVIDENCE_BUFFER")
+        self.evidence_dir = os.environ.get("AUTONOMY_EVIDENCE_BUFFER") or raw_buffer_dir
+        self.raw_buffer_min_free_bytes = int(raw_buffer_min_free_bytes)
         self.runs = {}
         self.evidence = {}
+        self.stopped_runs = set()
 
     def start_run(self, goal, run_id, prompt):
         rid = "cli-" + uuid.uuid4().hex
@@ -128,12 +135,26 @@ class CliGateway:
         if proc.returncode is not None:
             evidence = self.evidence.get(rid)
             if evidence is None:
-                evidence = capture_process_evidence(text, errors, proc.returncode, buffer_dir=self.evidence_dir)
+                returncode = int(proc.returncode)
+                signal_number = -returncode if returncode < 0 else None
+                lowered = errors.lower()
+                oom = returncode in (-9, 137) and any(
+                    marker in lowered for marker in ("out of memory", "oom", "killed")
+                )
+                evidence = capture_process_evidence(
+                    text, errors, returncode,
+                    signal_number=signal_number,
+                    timed_out=rid in self.stopped_runs,
+                    oom=oom,
+                    buffer_dir=self.evidence_dir,
+                    min_free_bytes=self.raw_buffer_min_free_bytes,
+                )
                 self.evidence[rid] = evidence
         # Preserve diagnostics for Runner's partial-output recorder on non-zero exits.
         return {"status":status,"output":text or errors,"stderr":errors,"usage":{},"returncode":proc.returncode,"evidence":evidence}
 
     def stop_run(self, rid):
+        self.stopped_runs.add(rid)
         proc,_,_=self.runs[rid]
         if proc.poll() is None:
             try:
@@ -171,7 +192,12 @@ class CliGateway:
                 self._kill_process_group(proc)
                 proc.communicate()
                 raise
-            evidence = capture_process_evidence(stdout or "", stderr or "", proc.returncode, buffer_dir=self.evidence_dir)
+            evidence = capture_process_evidence(
+                stdout or "", stderr or "", proc.returncode,
+                signal_number=(-proc.returncode if proc.returncode < 0 else None),
+                buffer_dir=self.evidence_dir,
+                min_free_bytes=self.raw_buffer_min_free_bytes,
+            )
             self.evidence["reflection:" + str(run_id)] = evidence
             text = (stdout or "").strip()
             if proc.returncode != 0:

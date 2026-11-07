@@ -15,19 +15,24 @@ class EvidenceStateError(ImmutableEvidence):
 
 
 class EventLog:
-    def __init__(self, db: AutonomyDB):
+    def __init__(self, db: AutonomyDB, challenge_sla_s: float = 6 * 3600):
         self.db = db
+        self.challenge_sla_s = float(challenge_sla_s)
 
     def append_receipt(self, kind: str, payload_hash: str, **kwargs) -> str:
         return self.db.append_receipt(kind, payload_hash, **kwargs)
 
     def append_evidence(self, receipt_id: str, stream: str, data: bytes, **metadata) -> int:
+        """Append evidence without re-hashing redacted snippets from streaming captures."""
         data = data if isinstance(data, bytes) else str(data).encode("utf-8", "replace")
+        digest = str(metadata.pop("digest", hashlib.sha256(data).hexdigest()))
+        byte_count = int(metadata.pop("byte_count", len(data)))
+        metadata.setdefault("challenge_deadline", time.time() + self.challenge_sla_s)
         return self.db.append_evidence(
             receipt_id=receipt_id,
             stream=stream,
-            digest=hashlib.sha256(data).hexdigest(),
-            byte_count=len(data),
+            digest=digest,
+            byte_count=byte_count,
             head=metadata.pop("head", data[:256]),
             tail=metadata.pop("tail", data[-256:]),
             **metadata,
