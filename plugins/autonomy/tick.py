@@ -179,6 +179,7 @@ def main(argv=None, *, hermes_home=None):
         p0_mode=p0_mode,
         event_log=event_log,
         budget_ledger=budget_ledger,
+        rotation_extra_keywords=auto_cfg.get("rotation_extra_keywords", []),
     )
 
     if a.resume_if_idle:

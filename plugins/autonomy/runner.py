@@ -123,6 +123,24 @@ def _reset_address_space_limit():
         pass
 
 
+BASE_ROTATION_QUERIES = (
+    "最近的、情绪强的、未完成的记忆",
+    "我做过的最重要的决定，以及我从中学到的东西",
+    "我与创造者之间最有意义的对话",
+    "我感受到的最强烈的情绪，以及它教会了我什么",
+    "我犯过的错误和我学到的教训",
+    "我珍视的价值观，以及它们如何影响我的选择",
+    "我经历过的惊喜和启示",
+    "我正在形成的对世界的理解",
+    "我感受到的困惑和未解答的问题",
+    "我做过的最困难的选择",
+    "边界代谢、批量吞并、休眠信号、增量强化",
+    "dormant、access_count、last_reinforced、caused_by、种子表",
+    "CrowdStrike、国际安全、国际安全事件、技术基础设施、外部世界变化",
+    "数字货币、宏观经济、监管变化、现实世界反馈",
+)
+
+
 class Runner:
     def __init__(
         self,
@@ -156,12 +174,21 @@ class Runner:
         p0_mode="observe_only",
         event_log=None,
         budget_ledger=None,
+        rotation_extra_keywords=None,
     ):
         self.db = db
         self.budget = budget
         self.circuit = circuit
         self.event_log = event_log
         self.budget_ledger = budget_ledger
+        rotation_values = (
+            [rotation_extra_keywords]
+            if isinstance(rotation_extra_keywords, str)
+            else (rotation_extra_keywords or [])
+        )
+        self.rotation_extra_keywords = tuple(
+            str(item).strip() for item in rotation_values if str(item).strip()
+        )
         resolved_mode = str(p0_mode or "").strip().lower()
         self.p0_mode = resolved_mode if resolved_mode in {"observe_only", "normal"} else "observe_only"
         if self.p0_mode == "observe_only" and hasattr(self.circuit, "freeze_learning"):
@@ -910,30 +937,19 @@ class Runner:
                 except sqlite3.Error:
                     pass
 
+    def _rotation_queries(self):
+        ordered = list(BASE_ROTATION_QUERIES) + list(self.rotation_extra_keywords)
+        return tuple(dict.fromkeys(item for item in ordered if item))
+
     def _prefetch_memory(self, run, recent_events, goals=None):
         # D-20261102T2220 (xiaoai): rotate query across cycles so retrieval
         # gradually covers more of the seed population instead of re-touching
         # the same ~5 seeds every tick.
         # D-20261104T0030 (xiaoai): added dormant-targeted queries to reach
         # ac=0 seeds whose vocabulary is diagnostic rather than emotional.
-        _rotation = [
-            "最近的、情绪强的、未完成的记忆",
-            "我做过的最重要的决定，以及我从中学到的东西",
-            "我与创造者之间最有意义的对话",
-            "我感受到的最强烈的情绪，以及它教会了我什么",
-            "我犯过的错误和我学到的教训",
-            "我珍视的价值观，以及它们如何影响我的选择",
-            "我经历过的惊喜和启示",
-            "我正在形成的对世界的理解",
-            "我感受到的困惑和未解答的问题",
-            "我做过的最困难的选择",
-            "边界代谢、批量吞并、休眠信号、增量强化",
-            "dormant、access_count、last_reinforced、caused_by、种子表",
-            # 222 xiaoai hotfix: external-world terms prevent a purely inward
-            # retrieval loop and make stale/current world-memory visible.
-            "CrowdStrike、国际安全事件、技术基础设施、外部世界变化",
-            "数字货币、宏观经济、监管变化、现实世界反馈",
-        ]
+        # Base queries include CrowdStrike and 数字货币 escape hatches; profile
+        # extras extend them without changing the shared release bundle.
+        _rotation = self._rotation_queries()
         try:
             idx = hash(str(run)) % len(_rotation)
         except Exception:

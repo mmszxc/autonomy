@@ -1,0 +1,6 @@
+# Merge this fragment into the xiaoai profile config; do not replace the profile.
+autonomy:
+  rotation_extra_keywords:
+    - "光伏、半导体、政策、行业、A股、市场日报"
+    - "龙哥、投资、不亏钱、空仓、选股、政策意志"
+    - "外部文件、磁盘痕迹、真实动作、探针、反爬、Cloudflare"

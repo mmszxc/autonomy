@@ -53,7 +53,7 @@ def process_state(*, failed=False, timed_out=False, oom=False):
     }
 
 
-def build_runner(tmp_path, state):
+def build_runner(tmp_path, state, rotation_extra_keywords=None):
     db = AutonomyDB(tmp_path / "autonomy.db")
     runner = Runner(
         db,
@@ -66,6 +66,7 @@ def build_runner(tmp_path, state):
         p0_mode="observe_only",
         event_log=EventLog(db),
         budget_ledger=BudgetLedger(weekly_units=70, db=db),
+        rotation_extra_keywords=rotation_extra_keywords,
     )
     runner._extract_transcript = lambda *_args: {
         "session_id": "session-1",
@@ -118,6 +119,56 @@ def test_complete_tick_records_bound_no_action_receipt(tmp_path):
         "select count(*) from evidence e join receipts r on r.id=e.receipt_id where r.kind='no_action'"
     ).fetchone()[0] == 2
     assert db.c.execute("select count(*) from budget_ledger").fetchone()[0] == 1
+
+
+def test_profile_rotation_keywords_merge_and_cover_online_business_set(tmp_path):
+    extras = [
+        "光伏、半导体、政策、行业、A股、市场日报",
+        "龙哥、投资、不亏钱、空仓、选股、政策意志",
+        "外部文件、磁盘痕迹、真实动作、探针、反爬、Cloudflare",
+    ]
+    runner, _db = build_runner(tmp_path, process_state(), extras)
+
+    queries = runner._rotation_queries()
+    joined = "\n".join(queries)
+    assert len(queries) == len(set(queries))
+    for phrase in (
+        "我正在形成的对世界的理解",
+        "我感受到的困惑和未解答的问题",
+        "我做过的最困难的选择",
+        "CrowdStrike",
+        "国际安全",
+        "数字货币",
+        "宏观经济",
+        "边界代谢",
+        "批量吞并",
+        "休眠信号",
+        "增量强化",
+        "dormant",
+        "access_count",
+        "last_reinforced",
+        "caused_by",
+        "种子表",
+        "光伏",
+        "半导体",
+        "政策",
+        "行业",
+        "A股",
+        "市场日报",
+        "龙哥",
+        "投资",
+        "不亏钱",
+        "空仓",
+        "选股",
+        "政策意志",
+        "外部文件",
+        "磁盘痕迹",
+        "真实动作",
+        "探针",
+        "反爬",
+        "Cloudflare",
+    ):
+        assert phrase in joined
 
 
 def test_raw_buffer_respects_t2_but_keeps_permanent_evidence(tmp_path, monkeypatch):
