@@ -1,0 +1,15 @@
+[Unit]
+Description=Autonomy evidence hash challenge (xiaozhi)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/hermes/.hermes/profiles/xiaozhi/plugins/autonomy
+Environment=HERMES_HOME=/home/hermes/.hermes
+Environment=AUTONOMY_PROFILE=xiaozhi
+Environment=AUTONOMY_DB_PATH=/home/hermes/.hermes/profiles/xiaozhi/autonomy_data/autonomy.db
+ExecStart=/usr/bin/env PYTHONPATH=/home/hermes/.hermes/profiles/xiaozhi/plugins /usr/bin/python3 -m plugins.autonomy.evidence_challenge --db ${AUTONOMY_DB_PATH}
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

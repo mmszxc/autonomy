@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly autonomy evidence challenge (xiaoai)
+
+[Timer]
+OnCalendar=*-*-* *:10:00
+RandomizedDelaySec=30
+Persistent=true
+Unit=xiaoai-autonomy-evidence-challenge.service
+
+[Install]
+WantedBy=timers.target

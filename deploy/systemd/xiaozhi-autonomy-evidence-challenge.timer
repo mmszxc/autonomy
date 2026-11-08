@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly autonomy evidence challenge (xiaozhi)
+
+[Timer]
+OnCalendar=*-*-* *:50:00
+RandomizedDelaySec=30
+Persistent=true
+Unit=xiaozhi-autonomy-evidence-challenge.service
+
+[Install]
+WantedBy=timers.target

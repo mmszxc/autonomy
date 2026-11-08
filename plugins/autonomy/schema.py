@@ -34,6 +34,12 @@ CREATE TABLE IF NOT EXISTS evidence(
  created_at REAL NOT NULL, verified_at REAL, challenge_deadline REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_evidence_status_deadline ON evidence(status,challenge_deadline);
+CREATE TABLE IF NOT EXISTS evidence_challenges(
+ evidence_id INTEGER PRIMARY KEY REFERENCES evidence(id), challenged_at REAL NOT NULL,
+ deadline REAL NOT NULL, status TEXT NOT NULL CHECK(status IN ('verified','mismatched','unavailable','overdue')),
+ observed_digest TEXT, observed_bytes INTEGER, error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_challenges_status ON evidence_challenges(status);
 CREATE TABLE IF NOT EXISTS claims(
  id TEXT PRIMARY KEY, claim TEXT NOT NULL, scope TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL,
  protected INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'hot', provenance_json TEXT NOT NULL,
@@ -81,7 +87,7 @@ CREATE TRIGGER IF NOT EXISTS evidence_no_delete BEFORE DELETE ON evidence BEGIN 
 
 P0_OBJECTS = (
     "receipts", "evidence", "claims", "tombstones", "quarantines", "experiments",
-    "baselines", "checkpoints", "budget_ledger", "schema_meta",
+    "baselines", "checkpoints", "budget_ledger", "evidence_challenges", "schema_meta",
 )
 
 
@@ -110,6 +116,7 @@ def downgrade(conn: sqlite3.Connection, target: int = 0) -> int:
     DROP TRIGGER IF EXISTS evidence_no_update;
     DROP TRIGGER IF EXISTS receipts_no_delete;
     DROP TRIGGER IF EXISTS receipts_no_update;
+    DROP TABLE IF EXISTS evidence_challenges;
     DROP TABLE IF EXISTS budget_ledger;
     DROP TABLE IF EXISTS checkpoints;
     DROP TABLE IF EXISTS baselines;
