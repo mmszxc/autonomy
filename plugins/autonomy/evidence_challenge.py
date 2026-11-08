@@ -30,21 +30,33 @@ class ChallengeResult:
         return self.mismatched > 0 or self.overdue > 0 or self.unverified_ratio > 0.05
 
 
-def _hash_file(path: str) -> tuple[str, int]:
-    digest = hashlib.sha256()
-    count = 0
-    with Path(path).open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-            count += len(block)
-    return digest.hexdigest(), count
+def _hash_bytes(data: bytes) -> tuple[str, int]:
+    return hashlib.sha256(data).hexdigest(), len(data)
+
+
+def _read_framed_streams(path: str) -> dict[str, bytes]:
+    """Parse the exact cli_transport framing without guessing on ambiguity.
+
+    The writer has no escaping or length prefix, so a marker occurring in either
+    stream makes the frame ambiguous.  Refuse it as unavailable rather than
+    silently hashing the wrong bytes.
+    """
+    blob = Path(path).read_bytes()
+    stdout_header = b"STDOUT\n"
+    separator = b"\nSTDERR\n"
+    if not blob.startswith(stdout_header) or blob.count(stdout_header) != 1:
+        raise ValueError("invalid or ambiguous STDOUT frame")
+    if blob.count(separator) != 1:
+        raise ValueError("invalid or ambiguous STDERR frame")
+    stdout, stderr = blob[len(stdout_header):].split(separator, 1)
+    return {"stdout": stdout, "stderr": stderr}
 
 
 def run_challenges(
     conn: sqlite3.Connection,
     *,
     now: Optional[float] = None,
-    hasher: Callable[[str], tuple[str, int]] = _hash_file,
+    hasher: Callable[[str], tuple[str, int]] = _hash_bytes,
 ) -> dict[str, int]:
     """Challenge every pending evidence row, returning status counts.
 
@@ -59,13 +71,20 @@ def run_challenges(
            ORDER BY id"""
     ).fetchall()
     counts = {"verified": 0, "mismatched": 0, "unavailable": 0, "overdue": 0}
+    parsed_cache: dict[str, dict[str, bytes]] = {}
     for evidence_id, expected, expected_bytes, buffer_path, deadline in rows:
         observed_digest = observed_bytes = error = None
         status = "unavailable"
         try:
             if not buffer_path:
                 raise FileNotFoundError("evidence buffer_path is empty")
-            observed_digest, observed_bytes = hasher(buffer_path)
+            if buffer_path not in parsed_cache:
+                parsed_cache[buffer_path] = _read_framed_streams(buffer_path)
+            stream = conn.execute("select stream from evidence where id=?", (evidence_id,)).fetchone()[0]
+            raw = parsed_cache[buffer_path].get(stream)
+            if raw is None:
+                raise ValueError("unknown evidence stream")
+            observed_digest, observed_bytes = _hash_bytes(raw)
             status = "verified" if observed_digest == expected and observed_bytes == expected_bytes else "mismatched"
             if status == "verified":
                 conn.execute("UPDATE evidence SET status='verified', verified_at=? WHERE id=?", (now, evidence_id))
@@ -73,6 +92,8 @@ def run_challenges(
                 conn.execute("UPDATE evidence SET status='mismatched' WHERE id=?", (evidence_id,))
         except (OSError, ValueError) as exc:
             error = str(exc)
+            if isinstance(exc, FileNotFoundError) or "empty" in error:
+                conn.execute("UPDATE evidence SET status='expired', verified_at=? WHERE id=?", (now, evidence_id))
         if now > float(deadline):
             challenge_status = "overdue"
         else:
