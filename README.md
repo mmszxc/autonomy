@@ -30,6 +30,39 @@ systemctl --user status xiaozhi-autonomy.timer
 
 安装器不会覆盖 profile 中的数据库、身份文件、认证文件或环境文件。手工安装、固定模型版本、离线验证、systemd 与回滚说明见 [`docs/install_ubuntu24_profile_xiaozhi.md`](docs/install_ubuntu24_profile_xiaozhi.md)。仓库不包含模型权重或大体积 Python vendor。
 
+## Profile 安装部署（交互式向导）
+
+多 profile 生产部署建议使用 [`scripts/install_profile.sh`](scripts/install_profile.sh)。它自行逐项询问 profile、模型、provider、endpoint、密钥环境变量名、viewer 端口以及 tick/challenge 错峰分钟，不调用 Hermes 自带的交互式 `autonomy init`（无人值守时该命令会卡在模型选择）。执行前必须确认：目标主机已授权、Hermes Agent 正在运行，且本仓库已 checkout 到准备部署的提交。非 login shell 可能找不到 `hermes`，向导默认使用 `/home/hermes/.local/bin/hermes`，也可在询问时指定绝对路径。
+
+```bash
+# 示例值均为占位符；密钥通过隐藏输入写入 profile-local .env
+./scripts/install_profile.sh
+```
+
+向导按以下门禁顺序执行，任一步失败立即停止并逐项回滚：
+
+1. 收集 profile、`model.default`、provider/custom provider、`base_url`、`key_env`、viewer 端口和两个错峰分钟。
+2. 把现有 config、`.env`、两个插件和相关 user unit 备份到带 UTC 时间戳的目录。备份只用于逐文件回滚，**不用于整 profile 恢复**。
+3. 直接从目标 Git commit 读取 blob 原始 bytes，用 Git blob SHA-1 逐文件复核后，原子安装 `autonomy` 与 `seed_memory`。绝不触碰 `state.db`、`state.db-*`、`gateway.lock`、`logs/` 或 `runtime/`。
+4. 逐项更新 `config.yaml`：`plugins.enabled` 同时包含 `autonomy` 与 `seed_memory`；model/provider/endpoint/`${ENV_VAR}` 自洽；custom provider 的 `key_env` 与 `.env` 变量名相同；memory provider 指向 profile-local seed DB/queue/source，并显式设置 `write_enabled: true` 与 tagger model/provider；autonomy 使用 profile-local data/paths，首次部署默认为 `observe_only`。
+5. 以隐藏输入写 credential 到 `.env` 并设置 `0600`，不回显密钥；随后执行配置与环境变量静态门。
+6. 执行 `hermes -p <profile> gateway restart` 刷新该 profile 句柄；必须收到 ACK、共享 gateway PID 不变，且操作后没有新增 `StateDbReplacedError`。
+7. 预检 `plugins list`、`autonomy --help`，并确认 `autonomy`、`seed_memory` 均为 enabled/user 且 seed_memory 已 registered/activated。
+8. 用 `nohup` 非交互执行一次首 tick；必须 `exit_reason=ok`，并确认实际 model/provider 与配置相同。
+9. 验收 `autonomy.db`：`sqlite_master` 至少含 `schema_meta`、`events`、`receipts`、`evidence`、`evidence_challenges`、`budget_ledger`；同时要求 tick 成功、`seeds.db` 存在且 viewer HTTP 200。
+10. 只有所有门禁全绿，才按错峰分钟 enable/start autonomy、challenge 和 viewer units，避免多个 profile 同分钟争抢内存。
+
+### 部署踩坑与安全边界
+
+- **没有 `autonomy migrate` 命令。** DB 在首次打开时自动 migration；验收查 `sqlite_master`，版本表名是 `schema_meta`，不是 `schema_version`。
+- **`seed_memory` 必须写进 `plugins.enabled`。** 它虽是 memory provider，但未进插件目录会报 `not in plugin catalog`，provider 也无法加载。
+- **`memory.seed_memory.write_enabled` 必须为 `true`。** 缺少该项或设为 false 会进入 read-only gray mode，只能读已有记忆，不能写入新种子。`source_root` 应指向当前 profile 的 `plugins/seed_memory/seed_src`；tagger model/provider 可单独指定，留空时向导默认跟随主 model/provider。
+- **严禁整目录替换 profile 或替换 `state.db`。** 常驻共享 gateway 会继续持有旧 inode，触发 `StateDbReplacedError`，还可能被 autonomy 表面化为 `model connection request_failed`。刷新只能用官方 `hermes -p <profile> gateway restart`；它刷新单 profile，不应重启共享进程或影响其他 profile。
+- **传输必须保留原始 bytes。** 使用 Git object/blob SHA 校验；不要用 PowerShell 文本管道或 `Out-File` 传文件，否则 systemd unit 可能被压成单行并报 `Invalid section header`。
+- 模型返回 HTTP 503/`overloaded` 时，先停止部署并换用可用 provider/model；可先只读请求 `<gateway>/v1/models` 核对清单。
+- 密钥只进入权限 `0600` 的 `.env`，不得写入文档、日志或消息；所有示例必须使用占位符。
+- 回滚仅逐项恢复 config、`.env`、插件、units 和本轮创建的 autonomy data；随后做 per-profile restart。绝不整 profile 恢复，绝不改变 `state.db` inode。审计记录只保留时间、命令、返回码和输出路径，不得包含密钥。
+
 ## 它是怎么工作的
 
 一轮 tick 的生命周期可以概括为：
