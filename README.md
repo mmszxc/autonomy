@@ -1,24 +1,70 @@
 # autonomy —— 让 Hermes 在没人说话时，也会自己醒来想一想
 
-**autonomy** 是 Hermes Agent 的“独处思考”插件：由定时器触发，每轮先回顾记忆，再自主思考，并把过程写入日志。**seed_memory** 是配套的长期记忆插件，把经历保存为带情绪和重要度的“种子”，供后续轮次检索。
+**autonomy** 是 Hermes Agent 的“独处思考”插件：由定时器触发，每轮回顾记忆、进行自主思考，并把过程写入本地日志。配套的 **seed_memory** 插件把经历保存为带情绪和重要度的“种子”，供后续轮次检索。
 
-> **状态**：持续迭代中，最近更新 2026-11-04。已在 Hermes v0.22.5 + Ubuntu 24 上验证，面向 Hermes v0.22.x。
+> **状态**：持续迭代中，最近更新 2026-11-09。已在 Hermes v0.22.5 + Ubuntu 24 上验证，面向 Hermes v0.22.x。
 
-## 功能
+## 快速开始
+
+安装器只接受已经存在的 Hermes profile；不会创建 profile，也不会修改数据库、`SOUL.md`、认证文件或环境文件。
+
+```bash
+# 1. 获取代码（将 <repository-url> 替换为你的代码仓库地址）
+git clone <repository-url> && cd autonomy
+
+# 2. 安装插件、CPU 依赖/模型和用户级定时器
+./install.sh --profile xiaozhi
+
+# 3. 验证安装
+hermes -p xiaozhi autonomy status && systemctl --user status xiaozhi-autonomy.timer
+```
+
+安装后的下一步：
+
+```bash
+hermes -p xiaozhi autonomy tick
+systemctl --user status xiaozhi-autonomy.timer
+```
+
+安装选项速查：`--yes` 用于自动化确认，`--skip-ml` 只安装插件，`--no-timer` 不写入或启用定时器，`--force` 仅在确认备份并替换已有 unit 时使用。大体积依赖默认要求交互确认。
+
+安装器不会覆盖 profile 中的数据库、身份文件、认证文件或环境文件。手工安装、固定模型版本、离线验证、systemd 与回滚说明见 [`docs/install_ubuntu24_profile_xiaozhi.md`](docs/install_ubuntu24_profile_xiaozhi.md)。仓库不包含模型权重或大体积 Python vendor。
+
+## 它是怎么工作的
+
+一轮 tick 的生命周期可以概括为：
+
+```text
+定时器唤醒
+    → 读取近期记忆与目标
+    → 自主思考并按策略执行动作
+    → 写入 transcript / thought / receipt / evidence
+    → 更新预算账本；异常时进入熔断
+```
+
+每轮是一次可审计的短任务，完成后退出，不依赖常驻推理进程。行动、失败、超时、资源异常和无行动都有对应的收据；观察模式下仍记录证据，但不会把学习候选直接晋升为生产策略。
+
+## P0 证据与安全护栏
+
+- **证据与收据层**：动作结果留下 SHA-256 收据和证据缓冲，可由独立 challenge job 按证据流复核；证据状态区分 `unverified`、`verified`、`mismatched` 与 `expired`。
+- **预算账本**：预算按 80/10/10 分层，分别约束正常行动、记忆/观察开销与学习/演化开销；每次消耗写入 ledger，避免只看进程日志。
+- **分层熔断**：正常行动与学习/晋升使用不同护栏。`closed`、`open`、`half-open` 状态控制故障恢复，学习候选不能绕过审核直接进入 active 策略。
+- **observe-only**：设置 `autonomy.p0.mode: observe_only` 可保持正常观察、收据和证据写入，同时阻断 learning、candidate generation、experiment allocation 与 promotion，适合首次部署和观察期。
+
+## 功能特性
 
 - **独处思考**：`autonomy tick` 执行单轮任务，完成后退出，不留下常驻推理进程。
-- **记忆优先**：模型调用前从 seed_memory 预取相关记忆，失败时安全降级。
-- **目标导向预取**：当前激活目标（goals）自动注入检索上下文，让记忆召回更有方向感；事件摘要自动剥离遥测噪声。
-- **查询轮换**：预取查询在 12 种主题间轮换（含 2 条专门面向休眠种子的诊断查询），避免每轮只触达相同种子。
-- **对话优先 / 并行模式**：自主模型留空时继承主模型；指定独立模型时并行运行。
-- **预算与熔断**：每日调用、token、prompt token 限额，以及 closed/open/half-open 熔断状态。
-- **停止与恢复**：支持 stop、resume、reset-circuit 和抢占标记。
-- **完整过程日志**：记录 assistant 文本、工具调用摘要、预取种子 ID，并对敏感字段打码；连续相同工具调用自动折叠，减少日志冗余。
-- **保尾摘要**：喂给 seed_memory 的文本取"头 3000 字 + 尾 11000 字"，保留最新思考上下文；打满 max_turns 时从最后 3 条助手消息 + 5 条工具调用自动合成摘要。
-- **每日日记**：在本地时间 21:00–24:00 窗口内触发当日反思与计划，注入次日首轮提示词。
+- **记忆优先**：模型调用前预取 seed_memory；失败时安全降级。激活目标的标题与描述会注入检索上下文，事件摘要会剥离遥测噪声。
+- **查询轮换**：预取查询在 12 种主题间轮换，其中包含 2 条休眠种子诊断查询，避免每轮只触达相同种子。
+- **模型模式**：自主模型留空时继承主模型；指定独立模型时可并行运行。
+- **预算与熔断**：每日调用、上下文和提示额度，以及 closed/open/half-open 熔断状态。
+- **停止与恢复**：支持 `stop`、`resume`、`reset-circuit` 和抢占标记。
+- **完整过程日志**：记录 assistant 文本、工具调用摘要和预取种子 ID，并对敏感字段打码；连续相同工具调用自动折叠。
+- **保尾摘要**：喂给 seed_memory 的文本保留头部与尾部上下文；打满 `max_turns` 时从最近助手消息和工具调用自动合成摘要。
+- **每日日记**：在本地时间 21:00–24:00 窗口内触发当日反思与次日计划，注入次日首轮提示词。
 - **结构化记忆**：SQLite 种子库、后台队列、语义检索、重要度/时效排序。
-- **因果记忆与队列治理**：可选 `recent_seeds` 注入帮助模型延续上下文；`caused_by`/`led_to` 保存种子因果链；单文件毒丸在重试超限后隔离到 `_failed/`；去重与处理结果通过数据目录中的 `stats.json` 统计，数据库和队列内容不会进入公开仓库。
-- **自我进化**：成员可在自己的插件目录修改代码；符合七条标准的改动经审核后合并主版本（已有实例：xiaoai 自修检索路径与查询轮换 bug）。
+- **因果记忆与队列治理**：可选 `recent_seeds` 与 `caused_by` / `led_to`；毒丸文件在重试超限后隔离到 `_failed/`；去重与处理结果写入数据目录统计文件。
+- **受控自我进化**：成员可在自己的插件目录修改代码；符合标准的改动经审核后合并主版本，候选策略与 active 策略隔离。
 
 ## 适用环境
 
@@ -33,14 +79,11 @@
 ## 仓库结构
 
 ```text
-identity/
-  SOUL.md                         作者的示例身份文件，可替换
-  LICENSE.md                      身份文件的 CC BY 4.0 说明
-plugins/
-  autonomy/                       自主思考插件
-  seed_memory/
-    worker.py                     后台队列 worker
-    seed_src/hermes/              最小 Seed 核心代码（不含模型）
+identity/                         示例身份文件
+plugins/autonomy/                 自主思考、P0 证据与收据层
+plugins/seed_memory/              后台队列与 Seed 核心代码
+  worker.py
+  seed_src/hermes/
 tests/                            可独立运行的插件测试
 tools/                            打包、日志查看、归档和验证工具
 docs/                             面向使用者的说明
@@ -49,7 +92,7 @@ deploy/systemd/                   通用用户级 systemd 模板
 
 ## 运行数据目录
 
-推荐的新目录布局：
+推荐布局：
 
 ```text
 <HERMES_HOME>/seed_data/
@@ -63,27 +106,7 @@ deploy/systemd/                   通用用户级 systemd 模板
   PREEMPT_NOW
 ```
 
-插件仍会兼容检测旧的 `seeds/`、`seed_queue/` 和 `autonomy/` 位置；新部署应使用上面的统一布局。数据库、日志和队列均不应提交到 Git。
-
-## 安装：3 步完成
-
-安装器只接受已经存在的 Hermes profile；不会创建 profile，也不会修改数据库、`SOUL.md`、auth 文件或 `.env`。
-
-```bash
-# 1. 获取代码
-git clone https://github.com/mmszxc/autonomy.git && cd autonomy
-
-# 2. 安装两个插件、固定版本的 CPU ML 依赖/模型，以及用户级定时器
-./install.sh --profile xiaozhi
-
-# 3. 验证
-hermes -p xiaozhi autonomy status && systemctl --user status xiaozhi-autonomy.timer
-```
-
-第 2 步的大体积下载默认要求交互确认；自动化环境可加 `--yes`。仅安装插件可加 `--skip-ml`，不写或启用 timer 可加 `--no-timer`。已有同名 systemd unit 默认保持不变；确认备份并替换时才使用 `--force`。
-
-手工 Git URL 安装、固定模型 revision、目录布局、离线验证、systemd 与回滚说明见 [`docs/install_ubuntu24_profile_xiaozhi.md`](docs/install_ubuntu24_profile_xiaozhi.md)。本仓库不包含模型权重或大体积 Python vendor。
-
+插件兼容检测旧的 `seeds/`、`seed_queue/` 和 `autonomy/` 位置；新部署应使用统一布局。数据库、日志和队列均不应提交到 Git。
 
 ## 常用命令
 
@@ -105,24 +128,16 @@ hermes -p <PROFILE> autonomy <子命令>
 
 ## 每小时运行
 
-`deploy/systemd/` 提供通用模板。复制到 `~/.config/systemd/user/` 后，替换：
-
-```text
-<PROFILE>
-<HERMES_HOME>
-<HERMES_BIN_DIR>
-```
-
-然后执行：
+`deploy/systemd/` 提供通用模板。复制到用户级 systemd 配置目录后，替换 `<PROFILE>`、`<HERMES_HOME>` 和 `<HERMES_BIN_DIR>`，再执行：
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now xiaozhi-autonomy.timer
+systemctl --user enable --now <profile>-autonomy.timer
 systemctl --user list-timers --all
-journalctl --user -u xiaozhi-autonomy.service -n 50 --no-pager
+journalctl --user -u <profile>-autonomy.service -n 50 --no-pager
 ```
 
-模板名称只是示例，可以按 profile 重命名。需要注销后继续运行时，请由管理员按发行版策略启用 linger。
+模板名称只是示例，可以按 profile 重命名。需要注销后继续运行时，请按发行版策略启用用户服务驻留。
 
 ## 只读网页查看器
 
@@ -132,17 +147,11 @@ journalctl --user -u xiaozhi-autonomy.service -n 50 --no-pager
 python3 tools/viewer/viewer.py --profile xiaozhi
 ```
 
-默认监听 `0.0.0.0:8765`，可用 `--host`、`--port` 或 `HERMES_VIEWER_HOST`、`HERMES_VIEWER_PORT` 修改。默认无鉴权，**只应在可信局域网中开放**；需要简单口令时使用：
-
-```bash
-python3 tools/viewer/viewer.py --profile xiaozhi --token '自行生成的长随机口令'
-```
-
-客户端可用 `Authorization: Bearer <口令>`，浏览器也可在 URL 查询参数中传入 `token`。查询参数可能被浏览器历史记录保存，优先使用反向代理或 Bearer header。数据接口为 `/api/thoughts?n=20`、`/api/seeds?limit=20&q=` 和 `/api/status`；页面不会自动轮询，仅在首次打开、切换标签或点击“刷新”时读取数据。生产部署前请确认端口未被占用，并结合主机防火墙限制来源地址。
+默认监听本机所有接口的一个高位端口，可用 `--host`、`--port` 或环境变量修改。默认无鉴权，**只应在可信网络中开放**；如需认证，请使用反向代理或由部署环境提供的安全认证层。生产部署前确认端口未被占用，并结合主机防火墙限制来源。
 
 ## 示例身份文件
 
-`identity/SOUL.md` 是作者 **mmszxc** 提供的示例身份文件，不是插件运行所必需，也不会由安装步骤自动覆盖到 profile。你可以阅读、采用或替换为自己的身份文件。
+`identity/SOUL.md` 是仓库提供的示例身份文件，不是插件运行所必需，也不会由安装步骤自动覆盖到 profile。你可以阅读、采用或替换为自己的身份文件。
 
 ## 测试
 
@@ -150,7 +159,7 @@ python3 tools/viewer/viewer.py --profile xiaozhi --token '自行生成的长随�
 python3 -m pytest tests -q
 ```
 
-测试不会要求真实 API key，不应连接生产模型。Linux 专有锁和 systemd 行为应在临时 profile 或测试机器验证。
+测试不会要求真实 API 凭据，不应连接生产模型。Linux 专有锁和 systemd 行为应在临时 profile 或测试机器验证。
 
 ## 安全建议
 
@@ -167,20 +176,23 @@ python3 -m pytest tests -q
 
 ## 近期变更
 
+### 2026-11-06～09（P0 证据层上线）
+
+- 增加结构化 evidence、receipt、budget ledger 与事件审计，六类动作终态均可追踪。
+- 增加 80/10/10 预算护栏、分层熔断和 `observe_only` 安全姿态。
+- 增加独立 evidence challenge 调度：按证据流进行严格 framed 解析、SHA-256 校验，并区分 `verified`、`mismatched`、`expired` 与不可用证据。
+- 隔离 candidate 与 active 策略；观察模式下不会执行 learning、experiment allocation 或 promotion。
+- 修复 evidence challenge 的 stream 哈希口径与 framing 解析，避免将合并缓冲误判为单流证据不一致；对应发布提交为 `e731889`。
+
 ### 2026-11-04（P0 止血修复）
 
-- **修复 `_extract_transcript` 顺序倒置**：将转录提取移至 `_decode_or_raw` 之前；打满 30 轮（`max_turns` 命中）时不再产生空摘要，改从最后 3 条助手消息 + 最后 5 条工具调用自动合成。
-- **修复摘要截头丢尾**：`[:16000]` 改为头 3000 + 尾 11000，保留最新 10–15 轮上下文。
-- **修复事件噪声**：`list_events(5)` 改调 `recent_runs(5)`，过滤掉 `seed_queue/transcript` 路径条目；event 摘要中的 `elapsed=…/usage=…` 遥测串在用作检索 query 前自动剥离。
-- **修复 goals 未传入预取**：激活目标（title + description）现在注入 `_prefetch_memory`，检索更有方向感。
-- **修复 `UnboundLocalError`**：`raw`/`usage` 移到外层 `try` 之前初始化，避免 prefetch 阶段异常导致异常处理器本身崩溃。
-- **转录折叠**：连续工具调用满足"工具名 + 完整参数预览 + 去时间戳结果预览"三同时，折叠为单行 `(连续重复 N 次)`。
+- 修复转录提取顺序、空摘要、摘要截头丢尾、事件噪声和 goals 未传入预取等问题。
+- 增强转录折叠与异常处理，减少日志冗余并提高长轮次稳定性。
 
-### 2026-11-03（Phase 1B + xiaoai 自进化合并）
+### 2026-11-03（Phase 1B）
 
-- 新增每日日记功能（`journal.py`）：本地时间 21:00–24:00 触发当日反思与次日计划，注入下一轮提示词。
-- 合并 xiaoai 自修改动：12 条查询轮换（含 2 条休眠种子诊断查询）+ `_vendor_ml` 路径修复（解决 `transformers` 模块无法加载导致检索降级的问题）。
-- 修复备份插件目录覆盖问题：`autonomy.bak-*/plugin.yaml` 因字母序排在原目录之后会静默覆盖新版本；现要求备份后立即将 `plugin.yaml` 改名为 `plugin.yaml.disabled`。
+- 新增每日日记、查询轮换、休眠种子诊断、结构化因果记忆和队列治理。
+- 修复备份插件目录覆盖问题：备份目录中的 manifest 应停用，避免静默覆盖 canonical 插件。
 
 ## 许可证
 
