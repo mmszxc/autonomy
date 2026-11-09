@@ -84,8 +84,15 @@ def build_tick_prompt(
         "现在是独处时间，没有人在和你说话。",
         "第一步，先回顾你的记忆（上面已为你取出最相关的几条；仅当上面不足以回答时再调用 seed_search，不要重复搜索同样的内容）。回顾完之后，再决定去想什么、做什么。",
         f"当前时间：{now}",
-        "【已批准/进行中的目标】",
     ])
+    if not goals and not recent_events:
+        lines.extend([
+            "【冷启动边界】",
+            "这是一个没有历史目标、事件或种子记忆的新 profile，不是检索失败。",
+            "本轮只做一次有界的启动思考：不要反复搜索不存在的历史，不要调用工具，也不要等待更多上下文。",
+            "请直接形成一段简短总结：说明当前信息为空、提出一个低风险的后续目标，并结束本轮。",
+        ])
+    lines.append("【已批准/进行中的目标】")
     dormant = load_dormant_flag(data_dir)
     if dormant:
         lines.append(dormant)

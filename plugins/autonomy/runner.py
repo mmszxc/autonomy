@@ -1385,7 +1385,8 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             prompt = build_tick_prompt(
                 goals, recent_events, memory_review=memory_review,
                 workspace=self.workspace, extra_rules=rules,
-                team_bulletin=bulletin, chassis_status=chassis_status,
+                team_bulletin=bulletin, data_dir=self.data_dir,
+                chassis_status=chassis_status,
                 journal_injection=journal_injection,
                 journal_invitation=journal_invitation,
             )

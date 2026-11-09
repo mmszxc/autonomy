@@ -56,6 +56,39 @@ for provider, reason in ((Empty(),"empty"),(Broken(),"degraded")):
 ''')
 
 
+def test_empty_profile_first_tick_has_bounded_cold_start_contract():
+    run_isolated(r'''
+import tempfile
+from pathlib import Path
+from autonomy.db import AutonomyDB
+from autonomy.budget import Budget
+from autonomy.circuit import Circuit
+from autonomy.runner import Runner
+class EmptySeedLibrary:
+ def initialize(self,**kwargs): pass
+ def prefetch(self,q): return ""
+ def shutdown(self): pass
+class Gateway:
+ def __init__(self): self.prompt=""
+ def chat(self,*args,**kwargs):
+  self.prompt=args[-1]
+  # A compliant first response terminates without tool/search iteration.
+  return "sid", "当前没有历史；建议下一轮建立一个低风险目标。", {"total_tokens":1}
+ def end(self,*args,**kwargs): pass
+root=Path(tempfile.mkdtemp())
+db=AutonomyDB(root/"autonomy.db")
+gw=Gateway()
+r=Runner(db,Budget(db,calls=20,tokens=100,prompt=100),Circuit(db),stop_file=str(root/"STOP"),gateway=gw,lock_path=str(root/"lock"),thought_log_path=str(root/"thoughts.log"),memory_provider=EmptySeedLibrary(),hermes_home=str(root),mode="parallel")
+out=r.tick()
+assert out["status"]=="ok",out
+assert "【冷启动边界】" in gw.prompt
+assert "不要反复搜索不存在的历史" in gw.prompt
+assert "不要调用工具" in gw.prompt
+assert "并结束本轮" in gw.prompt
+assert "iteration limit" not in out.get("raw_text","").lower()
+''')
+
+
 def test_prefetched_seed_ids_are_logged_and_prompted_first():
     run_isolated(r'''
 import tempfile
