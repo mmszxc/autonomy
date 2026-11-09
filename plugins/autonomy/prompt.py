@@ -24,7 +24,7 @@ def load_team_bulletin(data_dir, max_chars=600):
         return ""
 
 
-def load_dormant_flag(data_dir):
+def load_dormant_flag(data_dir, hermes_home=None):
     """Load the 'alive but unused' memory flag written by the reinforce sweep.
 
     Returns a formatted string for the tick prompt, or "" if no flag exists.
@@ -36,11 +36,10 @@ def load_dormant_flag(data_dir):
     candidates = []
     if data_dir:
         candidates.append(Path(data_dir) / "dormant_flag")
-    # The reinforce sweep writes the flag next to the seed database, which
-    # lives under seed_data/seeds/ — not under autonomy_data.  Check both.
-    candidates.append(
-        Path("/home/hermes/.hermes/profiles/xiaoai/seed_data/seeds/dormant_flag")
-    )
+    # The reinforce sweep writes the flag next to this profile's seed database,
+    # not under autonomy_data. Never fall back to another profile's directory.
+    if hermes_home:
+        candidates.append(Path(hermes_home) / "seed_data" / "seeds" / "dormant_flag")
     for path in candidates:
         try:
             text = path.read_text(encoding="utf-8").strip()
@@ -68,6 +67,7 @@ def build_tick_prompt(
     extra_rules=None,
     team_bulletin="",
     data_dir=None,
+    hermes_home=None,
     chassis_status="",
     journal_injection="",
     journal_invitation="",
@@ -93,7 +93,7 @@ def build_tick_prompt(
             "请直接形成一段简短总结：说明当前信息为空、提出一个低风险的后续目标，并结束本轮。",
         ])
     lines.append("【已批准/进行中的目标】")
-    dormant = load_dormant_flag(data_dir)
+    dormant = load_dormant_flag(data_dir, hermes_home=hermes_home)
     if dormant:
         lines.append(dormant)
         lines.append("")

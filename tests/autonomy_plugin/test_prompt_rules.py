@@ -4,7 +4,12 @@ from pathlib import Path
 ROOT = Path(__file__).parents[2]
 sys.path.insert(0, str(ROOT / "plugins"))
 
-from autonomy.prompt import build_tick_prompt, load_extra_rules, load_team_bulletin
+from autonomy.prompt import (
+    build_tick_prompt,
+    load_dormant_flag,
+    load_extra_rules,
+    load_team_bulletin,
+)
 
 
 def test_empty_rules_add_no_section_or_internal_path():
@@ -61,6 +66,27 @@ def test_team_bulletin_is_reference_and_limited_to_600_chars(tmp_path):
     assert f"{heading}\n{'近' * 600}" in prompt
     assert "【附加约束】\n- RULE_SENTINEL" in prompt
     assert prompt.index(heading) < prompt.index("【附加约束】")
+
+
+def test_dormant_flag_is_scoped_to_current_profile(tmp_path):
+    profile_a = tmp_path / "profiles" / "xiaoai"
+    profile_b = tmp_path / "profiles" / "xiaomei"
+    flag_a = profile_a / "seed_data" / "seeds" / "dormant_flag"
+    flag_a.parent.mkdir(parents=True)
+    flag_a.write_text("xiaoai-private-flag", encoding="utf-8")
+
+    # A profile with no flag must not fall back to another profile's data.
+    assert load_dormant_flag(profile_b / "autonomy_data", profile_b) == ""
+    assert "xiaoai-private-flag" not in build_tick_prompt(
+        [], [], data_dir=profile_b / "autonomy_data", hermes_home=profile_b
+    )
+
+    # The owning profile still reads the same profile-local seed flag.
+    own_flag = load_dormant_flag(profile_a / "autonomy_data", profile_a)
+    assert "xiaoai-private-flag" in own_flag
+    assert "xiaoai-private-flag" in build_tick_prompt(
+        [], [], data_dir=profile_a / "autonomy_data", hermes_home=profile_a
+    )
 
 
 def test_public_prompt_source_has_no_private_opt_path():
