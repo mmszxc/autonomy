@@ -9,8 +9,8 @@
 安装器只接受已经存在的 Hermes profile；不会创建 profile，也不会修改数据库、`SOUL.md`、认证文件或环境文件。
 
 ```bash
-# 1. 获取代码（将 <repository-url> 替换为你的代码仓库地址）
-git clone <repository-url> && cd autonomy
+# 1. 获取代码
+git clone https://github.com/mmszxc/autonomy.git && cd autonomy
 
 # 2. 安装插件、CPU 依赖/模型和用户级定时器
 ./install.sh --profile xiaozhi
@@ -147,7 +147,7 @@ journalctl --user -u <profile>-autonomy.service -n 50 --no-pager
 python3 tools/viewer/viewer.py --profile xiaozhi
 ```
 
-默认监听本机所有接口的一个高位端口，可用 `--host`、`--port` 或环境变量修改。默认无鉴权，**只应在可信网络中开放**；如需认证，请使用反向代理或由部署环境提供的安全认证层。生产部署前确认端口未被占用，并结合主机防火墙限制来源。
+默认监听 `0.0.0.0:8765`。可用 `--host`、`--port` 或环境变量 `HERMES_VIEWER_HOST`、`HERMES_VIEWER_PORT` 修改。默认无鉴权，**只应在可信网络中开放**；如需简单口令保护，可使用 `--token '长随机口令'`，客户端通过 Bearer header 或 URL 参数提交；URL 参数可能进入浏览器历史，生产环境更建议使用 Bearer header、反向代理或其他安全认证层。部署前确认端口未被占用，并结合主机防火墙限制来源。
 
 ## 示例身份文件
 
