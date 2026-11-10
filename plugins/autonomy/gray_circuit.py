@@ -27,6 +27,7 @@ rollback on transient provider overloads. The caller may adjust via the
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import subprocess
@@ -200,6 +201,13 @@ class GrayCircuit:
         Best-effort: failure is logged but never raises.
         """
         try:
+            manifest_path = Path(os.environ.get("AUTONOMY_LAST_GOOD_MANIFEST", str(self.plugin_dir / "last-good-blobs.json")))
+            if manifest_path.is_file():
+                data = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest = data.get("blobs", data) if isinstance(data, dict) else {}
+                if isinstance(manifest, dict) and manifest:
+                    self._last_good_manifest = {str(k): str(v) for k, v in manifest.items() if isinstance(v, str)}
+                    return
             proc = subprocess.run(
                 ["git", "ls-files", "--format=%(objectname) %(path)", "--", str(self.plugin_dir)],
                 cwd=str(self.plugin_dir.parent.parent),

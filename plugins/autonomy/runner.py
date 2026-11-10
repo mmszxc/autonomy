@@ -56,6 +56,7 @@ from .error_classifier import (
     classify_error_text,
     should_circuit_count,
     E2_PROVIDER_EXHAUSTED,
+    E_AUTH_FAILED,
 )
 try:
     from .quarantine_cascade import cascade_quarantine as _cascade_quarantine
@@ -1718,6 +1719,8 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             # E2 (provider exhausted), E3 (turn budget), E_UNCLASSIFIED, and
             # E_AUTH_FAILED are not code bugs and must never trip the circuit.
             _exc_error_kind = getattr(e, "_autonomy_error_kind", None)
+            if _exc_error_kind is None:
+                _exc_error_kind, _, _ = classify_error_text(str(e))
             if _exc_error_kind is None and http_status is not None:
                 # Derive from HTTP status when available
                 from .error_classifier import classify as _clf
@@ -1729,7 +1732,7 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 run_id=run,
                 goal_id=goal_id,
                 kind="tick",
-                exit_reason=type(e).__name__,
+                exit_reason=_exc_error_kind or type(e).__name__,
                 summary=str(raw or reason)[:300],
             )
             error = {"error": type(e).__name__, "reason": reason}
