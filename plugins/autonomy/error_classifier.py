@@ -48,6 +48,7 @@ Return value of ``classify()``:
 from __future__ import annotations
 
 import re
+import json
 from typing import List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -182,11 +183,13 @@ def _is_refusal(text: str) -> bool:
 
 
 def _tool_call_signature(tc: dict) -> str:
-    """Compact signature for a single tool call: 'tool_name(arg1=v1,...)'."""
+    """Stable tool signature; strip timestamps/random request IDs (F5)."""
     name = str(tc.get("tool_name") or tc.get("name") or "?")
     args = tc.get("args") or tc.get("parameters") or {}
+    volatile = re.compile(r"(?:timestamp|request[_-]?id|trace[_-]?id|random[_-]?id|nonce)", re.I)
     if isinstance(args, dict):
-        parts = sorted("%s=%s" % (k, str(v)[:40]) for k, v in args.items())
+        clean = {k: v for k, v in args.items() if not volatile.search(str(k))}
+        parts = sorted("%s=%s" % (k, json.dumps(v, sort_keys=True, default=str)[:80]) for k, v in clean.items())
         return "%s(%s)" % (name, ",".join(parts))
     return "%s(%s)" % (name, str(args)[:80])
 
@@ -401,7 +404,7 @@ def record_t3_hits(audit_flags: List[str], db=None) -> int:
         List of T3 flag names returned by classify() or _t3_scan().
     db:
         autonomy.db connection (AutonomyDB instance with .append_event).
-        If None, the call is a no-op.
+        If None, the call is a no-op; production caller wiring remains pending (F10).
 
     Returns
     -------

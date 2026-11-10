@@ -47,6 +47,11 @@ def _quarantine_subject(
     expires_hours: float = 72.0,
 ) -> str:
     """Insert or ignore a quarantine row; return the new quarantine id."""
+    # F9 review metadata is additive and backward-compatible with old schemas.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(quarantines)")}
+    for col, typ in (("reviewer", "TEXT"), ("review_due_at", "REAL")):
+        if col not in cols:
+            conn.execute("ALTER TABLE quarantines ADD COLUMN %s %s" % (col, typ))
     qid = uuid.uuid4().hex
     now = time.time()
     expires_at = now + expires_hours * 3600
