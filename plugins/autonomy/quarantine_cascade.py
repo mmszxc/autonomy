@@ -20,6 +20,7 @@ to add the column before first use (idempotent ALTER TABLE).
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -59,17 +60,30 @@ def _quarantine_subject(
 
 
 def _derived_seed_session_ids(conn, run_id: str) -> List[str]:
-    """Find seed queue session IDs created from this run via seed_queue events."""
+    """F9: Find seed queue session IDs created from this run via seed_queue events.
+
+    Uses structured matching: looks for the canonical session key
+    ``session_autonomy_<run_id>`` in the event summary.  Unlike a bare
+    substring search, this checks an exact prefix so short run_ids cannot
+    accidentally match unrelated sessions (fail-open prevention).
+    """
     rows = conn.execute(
         "SELECT summary FROM events WHERE run_id=? AND kind='seed_queue'",
         (run_id,),
     ).fetchall()
     ids: List[str] = []
+    # Structured match: the session key must appear as a full token in the summary.
     session_key = "session_autonomy_" + run_id
+    # Structured match: session_key must appear as a full token (not embedded in a longer id).
+    # Anchors: preceded by ^, /, \s, or = ; followed by /, \s, ., or end of string.
+    _session_re = re.compile(
+        r"(?:^|[/\s=])(" + re.escape(session_key) + r")(?:[/\s.]|$)"
+    )
     for row in rows:
-        if session_key in (row[0] or ""):
-            ids.append(session_key)
-            break
+        summary = row[0] or ""
+        if _session_re.search(summary):
+            if session_key not in ids:
+                ids.append(session_key)
     return ids
 
 
@@ -141,9 +155,34 @@ def cascade_quarantine(
         "claim_ids": [],
         "seeds_soft_offlined": 0,
         "dry_run": dry_run,
+        "pending_review_count": 0,     # F9: existing quarantines awaiting review
+        "expired_quarantine_count": 0,  # F9: quarantines past expires_at
     }
 
     try:
+        # F9: Check existing quarantines for this run — read expires_at / review_count.
+        try:
+            existing = conn.execute(
+                "SELECT id, status, expires_at, review_count FROM quarantines"
+                " WHERE subject_id=? AND subject_type='run'",
+                (run_id,),
+            ).fetchall()
+            now_ts = time.time()
+            for eq in existing:
+                _qid, _qstatus, expires_at, review_count = eq
+                if expires_at and float(expires_at) < now_ts:
+                    result["expired_quarantine_count"] += 1
+                    audit_log.append({
+                        "action": "quarantine_expired",
+                        "quarantine_id": _qid,
+                        "run_id": run_id,
+                        "review_count": review_count,
+                    })
+                elif _qstatus == "pending_review":
+                    result["pending_review_count"] += 1
+        except Exception as exc:
+            audit_log.append({"action": "quarantine_review_check_error", "error": str(exc)[:200]})
+
         # 1. Quarantine the run itself.
         result["run_quarantined"] = True
         if not dry_run:

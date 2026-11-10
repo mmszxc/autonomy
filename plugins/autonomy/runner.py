@@ -52,6 +52,15 @@ from .thought_log import append_thought_log, resolve_thought_log_path
 from .journal import JournalManager, build_chassis_status
 from .transcript import extract_run_transcript
 from .memory_bridge import load_memory_provider_instance
+from .error_classifier import (
+    classify_error_text,
+    should_circuit_count,
+    E2_PROVIDER_EXHAUSTED,
+)
+try:
+    from .quarantine_cascade import cascade_quarantine as _cascade_quarantine
+except Exception:
+    _cascade_quarantine = None
 
 
 def _decode(raw):
@@ -795,7 +804,7 @@ class Runner:
                     active = bool(previous) and subprocess.run(["systemctl", "--user", "is-active", "--quiet", previous], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
                     if active:
                         return {"queued": True, "path": str(target), "worker": "submitted(" + previous + ")", "unit": previous, "elapsed_s": round(time.monotonic() - started, 3)}
-                    profile = re.sub(r"[^A-Za-z0-9_-]", "-", self.hermes_home.name) or "default"
+                    profile = re.sub(r"[^A-Za-z0-9_-]", "-", Path(self.hermes_home).name) or "default"
                     # A RuntimeMaxSec cleanup and a second tick can share one
                     # second; use a microsecond stamp plus random suffix instead.
                     unit = "hermes-seed-worker-%s-%d-%s" % (profile, time.time_ns() // 1000, uuid.uuid4().hex[:8])
@@ -1507,9 +1516,25 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                             elapsed = time.time() - started
                             tools = state.get("tool_calls") or []
                             self._record_partial(run, diagnostic, usage, elapsed, "failed", tools)
-                            error_class = state.get("error_class") or "RuntimeError"
+                            # F1: classify the failure to route to quarantine or retry
+                            _error_kind, _ = classify_error_text(diagnostic)
+                            error_class = _error_kind or state.get("error_class") or "RuntimeError"
                             self.db.append_event(run_id=run, kind="run_failed", exit_reason=error_class, summary=("returncode=%s reason=%s" % (state.get("returncode"), diagnostic))[:1200])
-                            raise RuntimeError(diagnostic)
+                            # F1: quarantine dirty runs; E2 provider-exhausted is retryable
+                            if _error_kind and _error_kind != E2_PROVIDER_EXHAUSTED and _cascade_quarantine is not None:
+                                try:
+                                    _cascade_quarantine(
+                                        self.db.c,
+                                        run_id=run,
+                                        error_kind=_error_kind,
+                                        reason=error_class,
+                                        dry_run=False,
+                                    )
+                                except Exception:
+                                    pass
+                            exc = RuntimeError(diagnostic)
+                            exc._autonomy_error_kind = _error_kind  # F8: carry kind for circuit routing
+                            raise exc
                         break
                     time.sleep(self.poll_s)
             elif self.gateway:
@@ -1689,7 +1714,16 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             }
         except Exception as e:
             http_status = getattr(e, "status_code", None)
-            self.circuit.failure(http_status)
+            # F8: only count code-attributable failures in the circuit breaker.
+            # E2 (provider exhausted), E3 (turn budget), E_UNCLASSIFIED, and
+            # E_AUTH_FAILED are not code bugs and must never trip the circuit.
+            _exc_error_kind = getattr(e, "_autonomy_error_kind", None)
+            if _exc_error_kind is None and http_status is not None:
+                # Derive from HTTP status when available
+                from .error_classifier import classify as _clf
+                _exc_error_kind, _, _ = _clf("", {"http_status": http_status})
+            if should_circuit_count(_exc_error_kind):
+                self.circuit.failure(http_status)
             reason = " ".join(str(e).split())[:240]
             self.db.append_event(
                 run_id=run,

@@ -14,10 +14,12 @@ Behaviour when active (post-observe):
       2. Write an alert event to autonomy.db events table with kind="gray_rollback".
       3. Call ``reset()`` so the counter restarts for the new code.
 
-Why git blob rollback instead of DB-level?
-  The DB schema is append-only / immutable-evidence. Rolling back the plugin
-  source is safe (the DB contract stays intact). Rolling back DB state is not
-  safe during the observe period.
+Why per-file blob SHA instead of git rev-parse HEAD?
+  F7: ``_record_last_good_ref`` now records a dict of {rel_path: blob_sha} for
+  every .py file in plugin_dir.  This is more precise than a commit SHA — it
+  lets rollback restore the exact file state even when multiple plugins share a
+  commit. When no good ref has been recorded yet, an alert is raised (not a
+  silent skip).
 
 Thresholds are intentionally conservative (2 failures) to avoid spurious
 rollback on transient provider overloads. The caller may adjust via the
@@ -25,11 +27,14 @@ rollback on transient provider overloads. The caller may adjust via the
 """
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
+
+logger = logging.getLogger("autonomy.gray_circuit")
 
 
 class GrayCircuit:
@@ -44,8 +49,8 @@ class GrayCircuit:
     failure_threshold:
         Number of consecutive failures before rollback is triggered (default 2).
     plugin_dir:
-        Path to the autonomy plugin directory. Used to find the last good
-        git blob via ``git log``.
+        Path to the autonomy plugin directory. Used to build the per-file
+        git-blob SHA manifest for rollback.
     active:
         Set to True to enable rollback. During P0 observe period keep False.
     """
@@ -61,7 +66,8 @@ class GrayCircuit:
         self.active = bool(active)
         self._consecutive_failures = 0
         self._last_failure_ts: Optional[float] = None
-        self._last_good_ref: Optional[str] = None
+        # F7: per-file blob SHA manifest, not a single commit ref
+        self._last_good_manifest: Optional[Dict[str, str]] = None
 
     # ------------------------------------------------------------------
     # Public interface
@@ -91,44 +97,65 @@ class GrayCircuit:
         return self._consecutive_failures >= self.failure_threshold
 
     def rollback_to_last_good(self, event_log=None) -> dict:
-        """Atomically restore last known-good git blob snapshot.
+        """Atomically restore last known-good per-file git blob snapshot.
 
-        This is a no-op (returns ``{"status": "noop", "reason": "observe_period"}``
-        ) when ``active=False``.
+        Returns ``{"status": "noop", "reason": "observe_period"}``
+        when ``active=False``.
 
-        When active, restores plugin files to the last good git ref recorded
-        by ``_record_last_good_ref`` and writes an alert event.
+        F7: Uses per-file blob SHA manifest (not git rev-parse HEAD).
+        When no good manifest has been recorded, alerts and returns
+        ``{"status": "skipped", "reason": "no_good_ref_recorded"}``
+        instead of silently skipping.
 
-        Returns a status dict with keys: status, ref, files_restored, error.
+        Returns a status dict with keys: status, files_restored, error.
         """
         if not self.active:
             return {"status": "noop", "reason": "observe_period"}
 
-        ref = self._last_good_ref
-        if not ref:
+        manifest = self._last_good_manifest
+        if not manifest:
+            # F7: alert instead of silent skip
+            msg = "gray_circuit: no good manifest recorded — cannot rollback"
+            logger.warning(msg)
+            if event_log is not None:
+                try:
+                    event_log.append_event(
+                        kind="gray_rollback_alert",
+                        exit_reason="no_good_ref",
+                        summary=msg[:800],
+                    )
+                except Exception:
+                    pass
             return {"status": "skipped", "reason": "no_good_ref_recorded"}
 
-        result: dict = {"status": "unknown", "ref": ref, "files_restored": 0}
-        try:
-            # Restore only plugin Python files from the last good ref.
-            proc = subprocess.run(
-                ["git", "checkout", ref, "--", str(self.plugin_dir)],
-                cwd=str(self.plugin_dir.parent.parent),
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if proc.returncode != 0:
-                result["status"] = "git_error"
-                result["error"] = proc.stderr.strip()[:400]
-            else:
-                result["status"] = "ok"
-                # Count restored .py files (approximate).
-                result["files_restored"] = len(list(self.plugin_dir.glob("*.py")))
-                self._consecutive_failures = 0
-        except Exception as exc:
-            result["status"] = "error"
-            result["error"] = str(exc)[:400]
+        result: dict = {"status": "unknown", "files_restored": 0}
+        repo_root = self.plugin_dir.parent.parent
+        restored = 0
+        errors = []
+        for rel_path, blob_sha in manifest.items():
+            abs_path = self.plugin_dir / rel_path
+            try:
+                proc = subprocess.run(
+                    ["git", "cat-file", "blob", blob_sha],
+                    cwd=str(repo_root),
+                    capture_output=True,
+                    timeout=10,
+                )
+                if proc.returncode == 0:
+                    abs_path.write_bytes(proc.stdout)
+                    restored += 1
+                else:
+                    errors.append("%s: git cat-file rc=%d" % (rel_path, proc.returncode))
+            except Exception as exc:
+                errors.append("%s: %s" % (rel_path, str(exc)[:100]))
+
+        result["files_restored"] = restored
+        if errors:
+            result["status"] = "partial"
+            result["error"] = "; ".join(errors)[:400]
+        else:
+            result["status"] = "ok"
+            self._consecutive_failures = 0
 
         # Write alert event (best-effort).
         if event_log is not None:
@@ -136,8 +163,8 @@ class GrayCircuit:
                 event_log.append_event(
                     kind="gray_rollback",
                     exit_reason=result["status"],
-                    summary="ref=%s failures=%d error=%s" % (
-                        ref, self._consecutive_failures, result.get("error", "")
+                    summary="files=%d failures=%d error=%s" % (
+                        restored, self._consecutive_failures, result.get("error", "")
                     )[:800],
                 )
             except Exception:
@@ -157,7 +184,8 @@ class GrayCircuit:
             "failure_threshold": self.failure_threshold,
             "should_rollback": self.should_rollback(),
             "last_failure_ts": self._last_failure_ts,
-            "last_good_ref": self._last_good_ref,
+            "has_good_manifest": self._last_good_manifest is not None,
+            "good_manifest_files": len(self._last_good_manifest or {}),
         }
 
     # ------------------------------------------------------------------
@@ -165,16 +193,41 @@ class GrayCircuit:
     # ------------------------------------------------------------------
 
     def _record_last_good_ref(self) -> None:
-        """Record the current HEAD git commit as last-good-ref. Best-effort."""
+        """F7: Record per-file git blob SHA manifest for all .py files in plugin_dir.
+
+        Each entry maps relative filename → blob SHA from 'git ls-files --format'.
+        This is more precise than git rev-parse HEAD and survives multi-plugin commits.
+        Best-effort: failure is logged but never raises.
+        """
         try:
             proc = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
+                ["git", "ls-files", "--format=%(objectname) %(path)", "--", str(self.plugin_dir)],
                 cwd=str(self.plugin_dir.parent.parent),
                 capture_output=True,
                 text=True,
                 timeout=10,
             )
-            if proc.returncode == 0:
-                self._last_good_ref = proc.stdout.strip()[:40]
-        except Exception:
-            pass
+            if proc.returncode != 0:
+                logger.debug("gray_circuit: git ls-files rc=%d", proc.returncode)
+                return
+            manifest: Dict[str, str] = {}
+            for line in proc.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(" ", 1)
+                if len(parts) == 2:
+                    blob_sha, path = parts
+                    # Store only the filename relative to plugin_dir
+                    rel = Path(path).name
+                    if rel.endswith(".py"):
+                        manifest[rel] = blob_sha.strip()
+            if manifest:
+                self._last_good_manifest = manifest
+                logger.debug(
+                    "gray_circuit: recorded manifest files=%d", len(manifest)
+                )
+            else:
+                logger.debug("gray_circuit: no .py files found in git index for plugin_dir")
+        except Exception as exc:
+            logger.debug("gray_circuit: _record_last_good_ref error: %s", exc)
