@@ -146,6 +146,12 @@ def should_dream(*, in_window: bool, new_seed_count: int, backlog: int,
     return True, "eligible"
 
 
+def quota_pair(failures: int, successes: int, max_each: int = 3) -> tuple[int, int]:
+    """Return a balanced 1:1 result quota, capped per side (Stage 0 policy)."""
+    n = min(max(0, failures), max(0, successes), max_each)
+    return n, n
+
+
 def store_candidates(conn: sqlite3.Connection, receipt: DreamReceipt, *, max_failures: int = 3, max_successes: int = 3) -> int:
     """Persist receipt candidates only; active seeds/semantic/edges are untouched."""
     ensure_candidate_table(conn)

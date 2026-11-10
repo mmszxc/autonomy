@@ -6,7 +6,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins" / "seed_memory" / "seed_src"))
 from hermes.memory.memory_dream import (
     causal_completion, ensure_candidate_table, organisation_diagnostics,
-    semantic_review, should_dream, store_candidates, validate_edge,
+    semantic_review, should_dream, store_candidates, validate_edge, quota_pair,
 )
 
 
@@ -44,6 +44,11 @@ def test_semantic_review_flags_duplicate_and_missing_source():
                                SimpleNamespace(id="2", statement=" same   claim ", source_seeds=["s"])])
     flags = [f.payload["flag"] for f in receipt.flags]
     assert "no_source" in flags and "duplicate" in flags
+
+
+def test_quota_is_balanced_and_capped():
+    assert quota_pair(9, 2) == (2, 2)
+    assert quota_pair(2, 9) == (2, 2)
 
 
 def test_diagnostics_are_counts_only():
