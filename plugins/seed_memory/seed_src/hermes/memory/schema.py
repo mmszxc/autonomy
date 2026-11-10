@@ -48,6 +48,7 @@ class SemanticMemory:
     last_reinforced: Optional[datetime] = None
     access_count: int = 0
     last_accessed: Optional[datetime] = None
+    shareable: int = 1             # 1=shareable, 0=private
     embedding: Optional[List[float]] = None
 
 

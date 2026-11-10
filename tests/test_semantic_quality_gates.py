@@ -21,8 +21,10 @@ def test_reader_gate_threshold_and_provenance(tmp_path):
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             ("seed-1", "2026-01-01T00:00:00+00:00", "source", "[]", "neutral", 0.0, 0.8),
         )
-    good = {"confidence": 0.67, "evidence_count": 1, "source_seeds": ["seed-1"]}
-    assert store.semantic_memory_readable(good)
+    single = {"confidence": 2 / 3, "evidence_count": 1, "source_seeds": ["seed-1"]}
+    assert not store.semantic_memory_readable(single)
+    good = {"confidence": 0.75, "evidence_count": 2, "source_seeds": ["seed-1", "seed-1b"]}
+    assert store.semantic_memory_readable(good, source_seed_ids={"seed-1", "seed-1b"})
     assert not store.semantic_memory_readable({**good, "confidence": 0.59})
     assert not store.semantic_memory_readable({**good, "source_seeds": ["missing"]})
 

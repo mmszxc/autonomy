@@ -244,7 +244,8 @@ def init_db(db_path: str | os.PathLike[str] | None = None) -> None:
                 access_count INTEGER NOT NULL DEFAULT 0,
                 last_accessed TEXT,
                 embedding BLOB,
-                normalised_statement TEXT
+                normalised_statement TEXT,
+                shareable INTEGER NOT NULL DEFAULT 1
             )"""
         )
         sem_columns = {
@@ -252,7 +253,8 @@ def init_db(db_path: str | os.PathLike[str] | None = None) -> None:
         }
         for column, declaration in {
             "normalised_statement": "TEXT",
-            "embedding": "TEXT",
+            "embedding": "BLOB",
+            "shareable": "INTEGER NOT NULL DEFAULT 1",
         }.items():
             if column not in sem_columns:
                 conn.execute(
@@ -602,7 +604,7 @@ def sanitize_causal_refs() -> dict:
 def semantic_memory_readable(
     memory: SemanticMemory | Dict[str, Any],
     *,
-    min_confidence: float = 0.6,
+    min_confidence: float = 0.668,
     min_evidence_count: int = 1,
     source_seed_ids: Optional[set[str]] = None,
 ) -> bool:
@@ -610,6 +612,10 @@ def semantic_memory_readable(
 
     A row is readable only when its confidence/evidence claims clear the
     thresholds and every provenance id can be replayed from the seed store.
+    The default confidence gate is 0.667 (2/3): one source is intentionally
+    below it; each additional corroborating source advances the evidence
+    count and Bayesian confidence. NULL embeddings are a deliberate lazy
+    backfill state, not a failed write; retrieval may fill the BLOB later.
     ``source_seed_ids`` is injectable for callers/tests that already loaded the
     canonical seed ids; otherwise this function performs a read-only lookup.
     """
@@ -757,6 +763,7 @@ def _row_to_semantic(row: sqlite3.Row) -> SemanticMemory:
         last_reinforced=datetime.fromisoformat(row["last_reinforced"]) if row["last_reinforced"] else None,
         access_count=row["access_count"],
         last_accessed=datetime.fromisoformat(row["last_accessed"]) if row["last_accessed"] else None,
+        shareable=row["shareable"] if "shareable" in row.keys() else 1,
         embedding=(
             np.frombuffer(row["embedding"], dtype=np.float32).copy()
             if row["embedding"] is not None else None
@@ -840,7 +847,7 @@ def save_semantic_memory(
     with _connect() as conn:
         if merge:
             row = conn.execute(
-                "SELECT id, evidence_count, confidence, source_seeds "
+                "SELECT id, evidence_count, confidence, source_seeds, shareable "
                 "FROM semantic_memories WHERE normalised_statement = ?",
                 (norm,),
             ).fetchone()
@@ -855,9 +862,10 @@ def save_semantic_memory(
                 merged_sources = existing_seeds + new_seeds
                 conn.execute(
                     "UPDATE semantic_memories SET evidence_count=?, confidence=?, "
-                    "source_seeds=?, last_reinforced=? WHERE id=?",
+                    "source_seeds=?, shareable=?, last_reinforced=? WHERE id=?",
                     (merged_evidence, merged_confidence,
                      json.dumps(merged_sources, ensure_ascii=False),
+                     int(bool(row["shareable"]) and bool(memory.shareable)),
                      now.isoformat(), row["id"]),
                 )
                 return row["id"]
@@ -867,12 +875,12 @@ def save_semantic_memory(
         memory.last_reinforced = now
         fields = ["id", "timestamp", "category", "statement", "confidence",
                   "evidence_count", "source_seeds", "last_reinforced",
-                  "access_count", "last_accessed"]
+                  "access_count", "last_accessed", "shareable"]
         values = [memory.id, now.isoformat(), memory.category, memory.statement,
                   memory.confidence, memory.evidence_count,
                   json.dumps(memory.source_seeds, ensure_ascii=False),
                   now.isoformat(), memory.access_count,
-                  None]
+                  None, int(bool(memory.shareable))]
         conn.execute(
             f"INSERT OR IGNORE INTO semantic_memories ({', '.join(fields)}) "
             f"VALUES ({', '.join(['?'] * len(fields))})",
