@@ -243,7 +243,7 @@ def init_db(db_path: str | os.PathLike[str] | None = None) -> None:
                 last_reinforced TEXT,
                 access_count INTEGER NOT NULL DEFAULT 0,
                 last_accessed TEXT,
-                embedding TEXT,
+                embedding BLOB,
                 normalised_statement TEXT
             )"""
         )
@@ -597,6 +597,50 @@ def sanitize_causal_refs() -> dict:
                 conn.execute("UPDATE seeds SET led_to=? WHERE id=?",
                              (json.dumps(valid, ensure_ascii=False), row["id"]))
     return cleaned
+
+
+def semantic_memory_readable(
+    memory: SemanticMemory | Dict[str, Any],
+    *,
+    min_confidence: float = 0.6,
+    min_evidence_count: int = 1,
+    source_seed_ids: Optional[set[str]] = None,
+) -> bool:
+    """Reader gate for semantic memory before retrieval consumes a row.
+
+    A row is readable only when its confidence/evidence claims clear the
+    thresholds and every provenance id can be replayed from the seed store.
+    ``source_seed_ids`` is injectable for callers/tests that already loaded the
+    canonical seed ids; otherwise this function performs a read-only lookup.
+    """
+    if isinstance(memory, dict):
+        confidence = memory.get("confidence", 0.0)
+        evidence_count = memory.get("evidence_count", 0)
+        refs = memory.get("source_seeds", [])
+    else:
+        confidence = memory.confidence
+        evidence_count = memory.evidence_count
+        refs = memory.source_seeds
+    try:
+        confidence = float(confidence)
+        evidence_count = int(evidence_count)
+    except (TypeError, ValueError):
+        return False
+    if confidence < min_confidence or evidence_count < min_evidence_count:
+        return False
+    if not isinstance(refs, list) or len(refs) < min_evidence_count:
+        return False
+    refs = {r for r in refs if isinstance(r, str) and r}
+    if len(refs) < min_evidence_count:
+        return False
+    if source_seed_ids is None:
+        init_db()
+        with _connect() as conn:
+            source_seed_ids = {
+                row[0] for row in conn.execute("SELECT id FROM seeds WHERE id IN (%s)" %
+                    ",".join("?" * len(refs)), tuple(refs))
+            } if refs else set()
+    return refs <= source_seed_ids
 
 
 def get_all_semantic_memories() -> List[SemanticMemory]:
