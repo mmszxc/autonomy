@@ -183,10 +183,10 @@ class TestT1StructuralSignals:
         assert kind == E4_PROCESS_CRASHED
         assert quarantine is True
 
-    def test_e4_timeout(self):
+    def test_timeout_without_process_signal_is_unclassified(self):
         state = _failed_state(timed_out=True)
         kind, quarantine, _ = classify("text", state, exit_reason="max_seconds")
-        assert kind == E4_PROCESS_CRASHED
+        assert kind == E_UNCLASSIFIED
         assert quarantine is True
 
     def test_e4_signal_kill(self):
@@ -290,14 +290,13 @@ class TestT3TextPatterns:
         assert flags == []
 
     def test_t3_does_not_fire_on_failed_run(self):
-        # A failed run with no signal is E_UNCLASSIFIED (F2), not E4.
-        # T3 is not reached for T1/unclassified matches; flags should be empty.
+        # Provider failures are retryable E2 even on a failed run; T3 is not reached.
         state = _failed_state(returncode=1)
         kind, quarantine, flags = classify(
             "Provider 503 error occurred", state
         )
-        assert kind == E_UNCLASSIFIED
-        assert quarantine is True
+        assert kind == E2_PROVIDER_EXHAUSTED
+        assert quarantine is False
         assert flags == []  # T3 not reached for T1-level matches
 
 
@@ -324,7 +323,12 @@ class TestClassifyErrorText:
 
     def test_transport_failed(self):
         kind, _ = classify_error_text("request_failed: connection refused")
-        assert kind == E4_PROCESS_CRASHED
+        assert kind == E2_PROVIDER_EXHAUSTED
+
+    def test_transport_failed_structured_and_text_match(self):
+        text_kind, _ = classify_error_text("request_failed: connection refused")
+        state_kind, _, _ = classify("request_failed: connection refused", _failed_state())
+        assert text_kind == state_kind == E2_PROVIDER_EXHAUSTED
 
     def test_unknown_returns_none(self):
         kind, flags = classify_error_text("All good, no errors here")
@@ -653,8 +657,8 @@ class TestF1TickLevelFixture:
         )
         assert result["run_quarantined"] is True
 
-        # F8: unclassified must NOT count toward circuit breaker
-        assert should_circuit_count(kind) is False
+        # F8: repeated unknown failures count toward circuit breaker
+        assert should_circuit_count(kind) is True
 
     def test_e3_tick_does_not_count_circuit(self):
         """E3 turn budget exhausted must NOT count toward circuit breaker."""
@@ -691,7 +695,7 @@ class TestF3DualEntryConsistency:
         ("rate limited 429", E2_PROVIDER_EXHAUSTED),
         ("max_turns reached iteration_limit", E3_TURN_BUDGET_EXCEEDED),
         ("out of memory killed-9", E4_PROCESS_CRASHED),
-        ("request_failed connection refused", E4_PROCESS_CRASHED),
+        ("request_failed connection refused", E2_PROVIDER_EXHAUSTED),
         ("401 unauthorized api key invalid", E_AUTH_FAILED),
     ]
 
@@ -862,13 +866,13 @@ class TestF8CircuitCount:
         assert should_circuit_count(E3_TURN_BUDGET_EXCEEDED) is False
 
     def test_unclassified_does_not_count(self):
-        assert should_circuit_count(E_UNCLASSIFIED) is False
+        assert should_circuit_count(E_UNCLASSIFIED) is True
 
     def test_auth_failed_does_not_count(self):
         assert should_circuit_count(E_AUTH_FAILED) is False
 
-    def test_none_does_not_count(self):
-        assert should_circuit_count(None) is False
+    def test_none_counts_as_unknown(self):
+        assert should_circuit_count(None) is True
 
 
 # ===========================================================================

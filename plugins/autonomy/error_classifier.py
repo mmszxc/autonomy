@@ -111,7 +111,8 @@ _CANONICAL_PATTERNS: List[Tuple[str, re.Pattern]] = [
      re.compile(r"turns?==max|iteration.?limit|turn.?budget|max[_\s]turns", re.IGNORECASE)),
     (E4_PROCESS_CRASHED,
      re.compile(r"out\s+of\s+memory|oom.?killer|killed.*-9|killed.*signal\s+9", re.IGNORECASE)),
-    (E4_PROCESS_CRASHED,
+    # Transport/provider failures are retryable, not process crashes (F3).
+    (E2_PROVIDER_EXHAUSTED,
      re.compile(r"request_failed|transport.?failed|connection.?(?:refused|reset|timeout)", re.IGNORECASE)),
     (E_AUTH_FAILED,
      re.compile(r"\b(?:401|403)\b.*(?:unauthorized|forbidden)|api[_\s-]?key\s+(?:invalid|required)", re.IGNORECASE)),
@@ -275,6 +276,8 @@ def classify(
     status = str((state.get("status") or "") if isinstance(state, dict) else "")
     returncode = _safe_int(evidence.get("exit_code"))
     timed_out = bool(evidence.get("timed_out"))
+    # A gateway timeout alone is not proof that our process was killed (F2).
+    process_killed = bool(evidence.get("process_killed") or evidence.get("killed_by_timer"))
     oom = bool(evidence.get("oom"))
     # signal field: normalized to positive signal number (handle both 128+N and -N conventions)
     signal_raw = evidence.get("signal")
@@ -321,14 +324,12 @@ def classify(
     # ------------------------------------------------------------------
     # T1e — E4: process crashed — CONFIRMED process death only
     # F2: OOM confirmed via evidence flag, or signal kill (SIGKILL/SIGTERM),
-    #     or non-zero exit with an explicit signal.
-    # Gateway-side timeout (timed_out in evidence) = process-side kill.
+    #     or non-zero exit with an explicit signal. Gateway timeout alone is unknown.
     # ------------------------------------------------------------------
     if oom:
         return (E4_PROCESS_CRASHED, True, [])
 
-    if timed_out or exit_reason in ("max_seconds", "timeout", "run_timeout"):
-        # Process-side timeout — the runner killed the process (SIGKILL).
+    if process_killed:
         return (E4_PROCESS_CRASHED, True, [])
 
     # Non-zero returncode WITH explicit signal → confirmed process crash.
@@ -342,6 +343,10 @@ def classify(
     #        unclassified — quarantine + alert, do NOT count as gray circuit failure.
     # ------------------------------------------------------------------
     if status == "failed" or (returncode is not None and returncode != 0):
+        # Keep textual and structured failure entry points aligned (F3).
+        for kind, pattern in _CANONICAL_PATTERNS:
+            if kind == E2_PROVIDER_EXHAUSTED and pattern.search(str(raw or "")):
+                return (kind, False, [])
         return (E_UNCLASSIFIED, True, [])
 
     # ------------------------------------------------------------------
@@ -423,11 +428,11 @@ def should_circuit_count(error_kind: Optional[str]) -> bool:
 
     E2 (provider exhausted) and E3 (turn budget) are environment failures,
     not code failures — they must never trip the circuit breaker.
-    E_UNCLASSIFIED is unknown-cause — do not count (avoid spurious circuit trips).
+    E_UNCLASSIFIED is unknown-cause — count it so repeated unknown failures trip safely.
     E_AUTH_FAILED is a config issue, not a code bug — do not count.
     """
     if error_kind in (E2_PROVIDER_EXHAUSTED, E3_TURN_BUDGET_EXCEEDED,
-                      E_UNCLASSIFIED, E_AUTH_FAILED, None):
+                      E_AUTH_FAILED):
         return False
     # E1_STATE_DB_CORRUPTED, E4_PROCESS_CRASHED, T2 labels → count
     return True
