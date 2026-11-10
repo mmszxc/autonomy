@@ -230,6 +230,34 @@ def init_db(db_path: str | os.PathLike[str] | None = None) -> None:
                     f"ALTER TABLE program_memories ADD COLUMN {column} {declaration}"
                 )
 
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS semantic_memories (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'value',
+                statement TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0.5,
+                evidence_count INTEGER NOT NULL DEFAULT 0,
+                source_seeds TEXT NOT NULL DEFAULT '[]',
+                last_reinforced TEXT,
+                access_count INTEGER NOT NULL DEFAULT 0,
+                last_accessed TEXT,
+                embedding TEXT,
+                normalised_statement TEXT
+            )"""
+        )
+        sem_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(semantic_memories)")
+        }
+        for column, declaration in {
+            "normalised_statement": "TEXT",
+            "embedding": "TEXT",
+        }.items():
+            if column not in sem_columns:
+                conn.execute(
+                    f"ALTER TABLE semantic_memories ADD COLUMN {column} {declaration}"
+                )
+
         fts_exists = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='seeds_fts'"
         ).fetchone()

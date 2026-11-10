@@ -84,7 +84,7 @@ def _compute_shareable(item: dict) -> int:
     return 1
 
 
-def extract_seeds(dialogue: List[Dict], llm_call, *, persist: bool = True, session_id: str = "unknown", recent_seeds: Optional[List[Dict]] = None, importance_override: Optional[float] = None) -> List[Seed]:
+def extract_seeds(dialogue: List[Dict], llm_call, *, persist: bool = True, session_id: str = "unknown", recent_seeds: Optional[List[Dict]] = None, importance_override: Optional[float] = None, semantic_distill: bool = True) -> List[Seed]:
     """
     dialogue: [{"role": "user"/"hermes", "content": "..."}]
     llm_call: 一个函数，接受 prompt 字符串，返回回复字符串
@@ -200,4 +200,41 @@ def extract_seeds(dialogue: List[Dict], llm_call, *, persist: bool = True, sessi
             save_seed(seed)
         seeds.append(seed)
 
+    if persist and semantic_distill and seeds:
+        _distill_to_semantic_memories(seeds, session_id=session_id)
+
     return seeds
+
+
+def _distill_to_semantic_memories(seeds: List["Seed"], *, session_id: str = "unknown") -> None:
+    """Write each seed's seeds_planted conclusions as SemanticMemory rows.
+
+    One semantic memory per non-empty planted conclusion. Idempotent via
+    normalised_statement merge in save_semantic_memory.  Failures are logged
+    and swallowed so a distillation error never breaks seed extraction.
+    """
+    try:
+        from ..memory.store import save_semantic_memory
+        from ..memory.schema import SemanticMemory
+    except Exception:
+        return
+    logger = logging.getLogger("seed_memory.tagger")
+    for seed in seeds:
+        for statement in (seed.seeds_planted or []):
+            statement = statement.strip()
+            if not statement:
+                continue
+            try:
+                mem = SemanticMemory(
+                    category="world_model",
+                    statement=statement,
+                    confidence=0.5,
+                    evidence_count=1,
+                    source_seeds=[seed.id],
+                )
+                save_semantic_memory(mem, merge=True)
+            except Exception as exc:
+                logger.warning(
+                    "semantic_distill failed seed_id=%s session_id=%s error=%s",
+                    seed.id, session_id, exc,
+                )
