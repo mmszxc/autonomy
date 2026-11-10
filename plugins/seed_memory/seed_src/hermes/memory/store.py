@@ -7,6 +7,7 @@ Hermes Agent plugin without writing into the source tree.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import uuid
 import json
@@ -940,3 +941,181 @@ def touch_semantic_memory(semantic_id: str) -> None:
             "last_accessed=? WHERE id=?",
             (datetime.now(timezone.utc).isoformat(), semantic_id),
         )
+
+
+# ---------------------------------------------------------------------------
+# Decay maintenance — Phase 1: dry-run only, never writes importance
+# ---------------------------------------------------------------------------
+
+# Half-life: a seed with decay_rate=0.05 reaches ~50% importance after ~14 days
+# (ln(2)/0.05 ≈ 13.9 days).  Default rate 0.05 chosen so typical seeds stay
+# retrievable for weeks and gradually yield to newer experience.
+_DECAY_FLOOR: float = 0.05          # effective importance is never driven below this
+_DECAY_DORMANT_THRESHOLD: float = 0.15  # candidate for dormant label if below this
+_DECAY_EXEMPT_IMPORTANCE: float = 0.85  # seeds born with importance >= this are exempt
+_DECAY_DORMANT_MIN_AGE_DAYS: float = 7.0  # must also be >=7d since last real access
+
+
+def _decay_effective_importance(
+    importance: float,
+    decay_rate: float,
+    age_days: float,
+) -> float:
+    """importance * exp(-decay_rate * age_days), clamped to [_DECAY_FLOOR, 1.0]."""
+    effective = importance * math.exp(-decay_rate * min(age_days, 365.0))
+    return max(_DECAY_FLOOR, min(1.0, effective))
+
+
+def decay_due_seeds(
+    now: "datetime | None" = None,
+    *,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """Compute time-decayed effective importance for every seed and return a report.
+
+    Phase-1 contract: ``dry_run=True`` (the default) is the ONLY supported mode.
+    ``dry_run=False`` is reserved for Phase 2 (post 14-day observe window) and
+    raises ``RuntimeError`` to prevent accidental writes during the observe period.
+
+    Parameters
+    ----------
+    now:
+        Reference time for age calculation. Defaults to ``datetime.now(UTC)``.
+    dry_run:
+        Must be True in Phase 1. Set to False only after the 14-day observe
+        window ends and Phase 2 is explicitly activated (see rollback design below).
+
+    Returns
+    -------
+    A report dict with keys:
+        total           — total seeds scanned
+        exempt          — seeds born with importance >= _DECAY_EXEMPT_IMPORTANCE
+        no_decay_needed — seeds whose effective importance >= _DECAY_DORMANT_THRESHOLD
+        dormant_candidates — seeds whose effective < _DECAY_DORMANT_THRESHOLD AND
+                             age_since_real_access >= _DECAY_DORMANT_MIN_AGE_DAYS
+        decay_candidates  — seeds whose effective dropped below current importance
+                            but are not yet dormant candidates
+        distribution    — {"<0.05": N, "0.05-0.15": N, "0.15-0.50": N, "0.50+": N}
+        dry_run         — echoed
+        entries         — list of per-seed dicts (id, importance, effective, age_days,
+                          age_real_days, is_exempt, is_dormant_candidate)
+
+    Phase-2 write activation design
+    --------------------------------
+    When the 14-day observe period ends (2026-11-28), enable writes by:
+      1. Set ``HERMES_DECAY_WRITE_ENABLED=1`` in the profile .env.
+      2. The caller (autonomy tick maintenance slot) passes ``dry_run=False``.
+      3. decay_due_seeds will UPDATE seeds SET importance=effective WHERE id=?
+         for all non-exempt seeds whose effective < importance.
+      4. Rollback: ``git revert HEAD~1`` or ``HERMES_DECAY_WRITE_ENABLED=`` (unset)
+         re-disables writes. No DB migration needed: importance values already
+         written can be left in place (they were computed deterministically).
+    """
+    if not dry_run:
+        raise RuntimeError(
+            "decay_due_seeds: dry_run=False is reserved for Phase 2 "
+            "(post 2026-11-28 observe window). "
+            "Set HERMES_DECAY_WRITE_ENABLED=1 and confirm with the team lead "
+            "before enabling writes."
+        )
+
+    if now is None:
+        now = datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+
+    init_db()
+    with _connect() as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(seeds)")}
+        has_real_access = "last_real_access" in columns
+        select_cols = "id, importance, decay_rate, timestamp, last_accessed"
+        if has_real_access:
+            select_cols += ", last_real_access"
+        rows = conn.execute(f"SELECT {select_cols} FROM seeds").fetchall()
+
+    total = len(rows)
+    exempt = 0
+    no_decay_needed = 0
+    dormant_candidates = 0
+    decay_candidates = 0
+    dist: Dict[str, int] = {"<0.05": 0, "0.05-0.15": 0, "0.15-0.50": 0, "0.50+": 0}
+    entries: List[Dict[str, Any]] = []
+
+    for row in rows:
+        importance = float(row["importance"] or 0.5)
+        decay_rate = float(row["decay_rate"] or 0.05)
+
+        # Age since creation/last_accessed (for effective importance)
+        baseline_ts = row["last_accessed"] or row["timestamp"]
+        try:
+            baseline = datetime.fromisoformat(baseline_ts)
+            if baseline.tzinfo is None:
+                baseline = baseline.replace(tzinfo=timezone.utc)
+            age_days = (now - baseline).total_seconds() / 86400.0
+        except Exception:
+            age_days = 0.0
+
+        # Age since last real (non-prefetch) access
+        real_access_ts = None
+        if has_real_access:
+            real_access_ts = row["last_real_access"]
+        age_real_days: float
+        if real_access_ts:
+            try:
+                rt = datetime.fromisoformat(real_access_ts)
+                if rt.tzinfo is None:
+                    rt = rt.replace(tzinfo=timezone.utc)
+                age_real_days = (now - rt).total_seconds() / 86400.0
+            except Exception:
+                age_real_days = age_days
+        else:
+            age_real_days = age_days
+
+        is_exempt = importance >= _DECAY_EXEMPT_IMPORTANCE
+        effective = _decay_effective_importance(importance, decay_rate, age_days)
+
+        is_dormant_candidate = (
+            not is_exempt
+            and effective < _DECAY_DORMANT_THRESHOLD
+            and age_real_days >= _DECAY_DORMANT_MIN_AGE_DAYS
+        )
+
+        # Bucketize for distribution
+        if effective < _DECAY_FLOOR:
+            dist["<0.05"] += 1
+        elif effective < _DECAY_DORMANT_THRESHOLD:
+            dist["0.05-0.15"] += 1
+        elif effective < 0.50:
+            dist["0.15-0.50"] += 1
+        else:
+            dist["0.50+"] += 1
+
+        if is_exempt:
+            exempt += 1
+        elif is_dormant_candidate:
+            dormant_candidates += 1
+        elif effective < importance:
+            decay_candidates += 1
+        else:
+            no_decay_needed += 1
+
+        entries.append({
+            "id": row["id"],
+            "importance": importance,
+            "effective": round(effective, 4),
+            "age_days": round(age_days, 2),
+            "age_real_days": round(age_real_days, 2),
+            "is_exempt": is_exempt,
+            "is_dormant_candidate": is_dormant_candidate,
+        })
+
+    return {
+        "total": total,
+        "exempt": exempt,
+        "no_decay_needed": no_decay_needed,
+        "dormant_candidates": dormant_candidates,
+        "decay_candidates": decay_candidates,
+        "distribution": dist,
+        "dry_run": dry_run,
+        "entries": entries,
+    }
