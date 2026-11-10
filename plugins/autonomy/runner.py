@@ -1719,12 +1719,12 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             # E2 (provider exhausted), E3 (turn budget), E_UNCLASSIFIED, and
             # E_AUTH_FAILED are not code bugs and must never trip the circuit.
             _exc_error_kind = getattr(e, "_autonomy_error_kind", None)
-            if _exc_error_kind is None:
-                _exc_error_kind, _, _ = classify_error_text(str(e))
             if _exc_error_kind is None and http_status is not None:
-                # Derive from HTTP status when available
+                # Structured HTTP signal takes precedence over text (F2/F3).
                 from .error_classifier import classify as _clf
                 _exc_error_kind, _, _ = _clf("", {"http_status": http_status})
+            if _exc_error_kind is None:
+                _exc_error_kind, _ = classify_error_text(str(e))
             if should_circuit_count(_exc_error_kind):
                 self.circuit.failure(http_status)
             reason = " ".join(str(e).split())[:240]
