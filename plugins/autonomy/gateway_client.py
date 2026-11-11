@@ -62,8 +62,10 @@ class GatewayClient:
         return self._req("POST", "/v1/runs/" + str(run_id) + "/stop", {})[1]
 
     def append_run_message(self, run_id, content):
-        """Best-effort soft-wrap prompt; older gateways may return 404."""
-        return self._req("POST", "/v1/runs/" + str(run_id) + "/messages", {"role": "user", "content": content})[1]
+        """Best-effort soft-wrap prompt via the official run steering API."""
+        return self._req(
+            "POST", "/v1/runs/" + str(run_id) + "/steer", {"input": content}
+        )[1]
 
     def end(self, sid):
         return self._req("PATCH", "/api/sessions/" + sid, {"end_reason": "autonomy_tick"}, {"X-Hermes-Session-Id": sid})

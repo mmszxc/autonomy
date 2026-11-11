@@ -154,3 +154,24 @@ def test_prefetch_child_resets_address_space_limit(monkeypatch):
     monkeypatch.setattr(runner_module, "resource", fake)
     runner_module._reset_address_space_limit()
     assert fake.calls == [(fake.RLIMIT_AS, (fake.RLIM_INFINITY, fake.RLIM_INFINITY))]
+
+
+def test_cli_soft_wrap_false_is_recorded_as_not_prompted():
+    instance = Runner.__new__(Runner)
+    instance.gateway = type(
+        "CliGateway", (), {"append_run_message": lambda self, run_id, content: False}
+    )()
+    events = []
+    instance.db = type(
+        "DB", (), {"append_event": lambda self, **event: events.append(event)}
+    )()
+    instance._soft_wrap_sent = False
+
+    assert instance._prompt_soft_wrap("tick-1", "cli-run", 12.5) is False
+    assert instance._soft_wrap_sent is True
+    assert events == [{
+        "run_id": "tick-1",
+        "kind": "soft_wrap",
+        "exit_reason": "not_prompted",
+        "summary": "elapsed=12.5",
+    }]

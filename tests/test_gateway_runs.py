@@ -8,3 +8,10 @@ def test_start_run_uses_input_and_session_id(monkeypatch):
 def test_get_and_stop_run_paths(monkeypatch):
  c=GatewayClient('http://x','k'); calls=[]
  monkeypatch.setattr(c,'_req',lambda *a,**k: calls.append((a,k)) or (200,{'status':'completed','output':'x'})); assert c.get_run('r') ['output']=='x'; c.stop_run('r'); assert calls[0][0][:2]==('GET','/v1/runs/r'); assert calls[1][0][:2]==('POST','/v1/runs/r/stop')
+
+
+def test_append_run_message_uses_official_steer_endpoint(monkeypatch):
+ c=GatewayClient('http://x','k'); calls=[]
+ monkeypatch.setattr(c,'_req',lambda *a,**k: calls.append((a,k)) or (200,{'status':'accepted'}))
+ assert c.append_run_message('run-1','换路') == {'status':'accepted'}
+ assert calls[0][0][:3] == ('POST','/v1/runs/run-1/steer',{'input':'换路'})

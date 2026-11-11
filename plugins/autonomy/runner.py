@@ -271,6 +271,26 @@ class Runner:
         tools = state.get("tool_calls") or state.get("events") or []
         return str(raw or ""), usage, tools
 
+    def _prompt_soft_wrap(self, run, run_id, elapsed):
+        try:
+            prompted = bool(self.gateway.append_run_message(
+                run_id, "请在接下来几步内收尾并写下你的想法。"
+            ))
+            exit_reason = "prompted" if prompted else "not_prompted"
+            summary = "elapsed=%.1f" % elapsed
+        except Exception as exc:
+            prompted = False
+            exit_reason = "unsupported"
+            summary = str(exc)[:240]
+        self._soft_wrap_sent = True
+        self.db.append_event(
+            run_id=run,
+            kind="soft_wrap",
+            exit_reason=exit_reason,
+            summary=summary,
+        )
+        return prompted
+
     def _record_partial(self, run, raw, usage, elapsed, reason, tools=None):
         tools = tools or []
         raw = _redact_diagnostic(raw)
@@ -1532,14 +1552,7 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                     elapsed_now = time.time() - started
                     if (not self._soft_wrap_sent and elapsed_now >= self.run_soft_wrap_seconds
                             and hasattr(self.gateway, "append_run_message")):
-                        try:
-                            self.gateway.append_run_message(rid, "请在接下来几步内收尾并写下你的想法。")
-                            self._soft_wrap_sent = True
-                            self.db.append_event(run_id=run, kind="soft_wrap", exit_reason="prompted", summary="elapsed=%.1f" % elapsed_now)
-                        except Exception as exc:
-                            # Gateway versions without append support simply skip this advisory.
-                            self._soft_wrap_sent = True
-                            self.db.append_event(run_id=run, kind="soft_wrap", exit_reason="unsupported", summary=str(exc)[:240])
+                        self._prompt_soft_wrap(run, rid, elapsed_now)
                     if elapsed_now >= self.max_seconds:
                         self.gateway.stop_run(rid)
                         final = state

@@ -1326,7 +1326,13 @@ def decay_due_seeds(
         has_real_access = "last_real_access" in columns
         select_cols = "id, importance, decay_rate, timestamp, last_accessed"
         if has_real_access:
-            select_cols += ", last_real_access"
+            select_cols += (
+                ", (SELECT MAX(a.timestamp) FROM seed_access_log AS a "
+                "WHERE a.seed_id = seeds.id "
+                "AND COALESCE(a.reason, '') != 'prefetch' "
+                "AND COALESCE(a.writer, '') != 'hermes:seed_memory:prefetch') "
+                "AS audited_last_real_access"
+            )
         rows = conn.execute(f"SELECT {select_cols} FROM seeds").fetchall()
 
     total = len(rows)
@@ -1356,7 +1362,7 @@ def decay_due_seeds(
         # Age since last real (non-prefetch) access
         real_access_ts = None
         if has_real_access:
-            real_access_ts = row["last_real_access"]
+            real_access_ts = row["audited_last_real_access"]
         age_real_days: float
         if real_access_ts:
             try:

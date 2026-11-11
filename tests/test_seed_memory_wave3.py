@@ -277,6 +277,27 @@ def test_touch_unsigned_fallback_persists_and_warns(seed_db, monkeypatch, caplog
     assert module == "hermes.memory.signed_write"
 
 
+def test_seed_memory_wave3_wal_visibility(seed_db):
+    keeper = sqlite3.connect(seed_db)
+    try:
+        keeper.execute("PRAGMA journal_mode=WAL")
+        store.save_seeds([make_seed("wal-visible")])
+        store.touch_seed(
+            "wal-visible", writer="test:wal", session_id="session:wal", reason="retrieve"
+        )
+
+        with retrieval._connect_ro() as reader:
+            row = reader.execute(
+                "SELECT access_count, last_real_access FROM seeds WHERE id=?",
+                ("wal-visible",),
+            ).fetchone()
+
+        assert row["access_count"] == 1
+        assert row["last_real_access"] is not None
+    finally:
+        keeper.close()
+
+
 def test_retrieval_fallback_preserves_access_context(seed_db):
     store.save_seeds([make_seed("fallback-context")])
 
@@ -348,6 +369,34 @@ def test_legacy_duplicate_hash_migration_keeps_all_rows(seed_db, caplog):
     with sqlite3.connect(seed_db) as conn:
         assert conn.execute("SELECT COUNT(*) FROM seeds").fetchone()[0] == 2
     assert "preserving rows without unique index" in caplog.text
+
+
+def test_phase1_report_ignores_historical_prefetch_pollution(seed_db):
+    seed = make_seed("polluted-prefetch")
+    store.save_seed(seed)
+    with sqlite3.connect(seed_db) as conn:
+        conn.execute(
+            "UPDATE seeds SET last_real_access=? WHERE id=?",
+            ("2026-11-28T00:00:00+00:00", seed.id),
+        )
+        conn.execute(
+            "INSERT INTO seed_access_log "
+            "(seed_id, timestamp, reason, writer, session_id) VALUES (?, ?, ?, ?, ?)",
+            (seed.id, "2026-11-05T00:00:00+00:00", "retrieve", "user:real", "s1"),
+        )
+        conn.execute(
+            "INSERT INTO seed_access_log "
+            "(seed_id, timestamp, reason, writer, session_id) VALUES (?, ?, ?, ?, ?)",
+            (seed.id, "2026-11-28T00:00:00+00:00", "prefetch",
+             "hermes:seed_memory:prefetch", "s2"),
+        )
+
+    report = store.decay_due_seeds(
+        now=datetime(2026, 11, 29, tzinfo=timezone.utc), dry_run=True
+    )
+
+    entry = next(item for item in report["entries"] if item["id"] == seed.id)
+    assert entry["age_real_days"] == pytest.approx(24.0)
 
 
 def test_decay_phase1_is_report_only_and_phase2_remains_disabled(seed_db):
