@@ -154,8 +154,8 @@ def init_db(db_path: str | os.PathLike[str] | None = None) -> None:
                     f"UPDATE seeds SET {new_column}={old_column} "
                     f"WHERE {new_column} IS NULL"
                 )
-        # A hash may recur with a different external provenance ref. Preserve
-        # existing rows during migration; never delete historical evidence.
+        # Preserve production's content-hash uniqueness: repeated content
+        # is ignored regardless of provenance, never updated or duplicated.
         # Production signed-access schema: keep existing records and indexes.
         conn.execute(
             """CREATE TABLE IF NOT EXISTS seed_access_log (
@@ -196,11 +196,16 @@ def init_db(db_path: str | os.PathLike[str] | None = None) -> None:
             proposed_at TEXT NOT NULL,
             UNIQUE(seed_id, offline_review_id)
         )""")
-        conn.execute("DROP INDEX IF EXISTS idx_seeds_content_hash")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_seeds_hash_ref "
-            "ON seeds(content_hash, provenance_ref)"
-        )
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_seeds_content_hash "
+                "ON seeds(content_hash) WHERE content_hash IS NOT NULL"
+            )
+        except sqlite3.IntegrityError:
+            # Do not delete historical rows just to establish an index.
+            logging.getLogger(__name__).warning(
+                "legacy duplicate content hashes; preserving rows without unique index"
+            )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_seeds_importance_timestamp "
             "ON seeds(importance DESC, timestamp DESC)"
@@ -359,27 +364,8 @@ def _sync_seed_indexes(conn: sqlite3.Connection, seed: Seed) -> None:
         )
 
 
-def _update_duplicate(conn: sqlite3.Connection, seed: Seed) -> bool:
-    """Update an existing (content hash, provenance ref) row without resetting access."""
-    content_hash = _seed_hash(seed)
-    row = conn.execute(
-        "SELECT id, status FROM seeds WHERE content_hash=? "
-        "AND provenance_ref IS ? ORDER BY rowid LIMIT 1",
-        (content_hash, seed.provenance_ref),
-    ).fetchone()
-    if row is None:
-        return False
-    # Never resurrect an archived row through an automatic retry.
-    conn.execute(
-        "UPDATE seeds SET importance=MAX(importance, ?), "
-        "embedding=COALESCE(embedding, ?), shareable=? WHERE id=?",
-        (seed.importance, _embedding_blob(seed.embedding), int(seed.shareable), row["id"]),
-    )
-    return True
-
-
 def save_seeds(seeds: List[Seed]) -> int:
-    """Insert a batch in one transaction; duplicates are updated in place."""
+    """Insert a batch in one transaction; duplicates are ignored."""
     if not seeds:
         return 0
     init_db()
@@ -387,8 +373,6 @@ def save_seeds(seeds: List[Seed]) -> int:
     with _connect() as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(seeds)")}
         for seed in seeds:
-            if _update_duplicate(conn, seed):
-                continue
             embedding_blob = (
                 _embedding_blob(seed.embedding)
             )
@@ -425,15 +409,13 @@ def save_seed(seed: Seed) -> bool:
     """Insert a seed once.
 
     Returns True when a row was inserted. Repeated extraction of semantically
-    identical content and provenance ref is updated in place.
+    identical content is ignored (production hash-based deduplication).
     """
     init_db()
     embedding_blob = (
         _embedding_blob(seed.embedding)
     )
     with _connect() as conn:
-        if _update_duplicate(conn, seed):
-            return False
         columns = {row[1] for row in conn.execute("PRAGMA table_info(seeds)")}
         fields = [
             "id", "timestamp", "summary", "participants",
@@ -486,7 +468,7 @@ def update_embedding(seed_id: str, embedding: np.ndarray) -> None:
         conn.execute("UPDATE seeds SET embedding=? WHERE id=?", (blob, seed_id))
 
 
-def get_all_seeds(*, include_archived: bool = False) -> List[Seed]:
+def get_all_seeds(*, include_archived: bool = True) -> List[Seed]:
     init_db()
     with _connect() as conn:
         where = "" if include_archived else "WHERE status != 'archived'"
@@ -590,18 +572,19 @@ def _compute_effective_importance(seed: Seed, now: Optional[datetime] = None) ->
     Formula: effective = importance * exp(-decay_rate * days_since_base)
     where base = last_accessed (if set) or timestamp (creation time).
 
-    Defaults: decay_rate=0.01 (~70-day half-life).  Floors at 0.01 to
-    prevent seeds from vanishing entirely.  Future timestamps are clamped
-    to 0 elapsed days.  Max elapsed is 365 days (avoid ancient-seed underflow).
+    Floors at 0.01; elapsed days are capped at 365, matching production.
+    Production does not clamp future timestamps to zero.
     """
     if now is None:
         now = datetime.now(timezone.utc)
-    base = seed.last_accessed or seed.timestamp
-    if base.tzinfo is None:
-        base = base.replace(tzinfo=timezone.utc)
-    elapsed = max(0.0, min((now - base).total_seconds() / 86400.0, 365.0))
-    rate = seed.decay_rate if seed.decay_rate is not None else 0.01
-    return max(0.01, seed.importance * math.exp(-rate * elapsed))
+    baseline = seed.last_accessed or seed.timestamp
+    if baseline.tzinfo is None:
+        baseline = baseline.replace(tzinfo=timezone.utc)
+    days = (now - baseline).total_seconds() / 86400.0
+    # Keep production's upper clamp and floor; future dates retain their behavior.
+    days = min(days, 365.0)
+    effective = seed.importance * math.exp(-seed.decay_rate * days)
+    return max(0.01, effective)
 
 
 def get_ranked_seeds(limit: int = 5) -> List[Seed]:
@@ -613,7 +596,7 @@ def get_ranked_seeds(limit: int = 5) -> List[Seed]:
     """
     init_db()
     with _connect() as conn:
-        rows = conn.execute("SELECT * FROM seeds WHERE status != 'archived'").fetchall()
+        rows = conn.execute("SELECT * FROM seeds").fetchall()
     seeds = [_row_to_seed(row) for row in rows]
     now = datetime.now(timezone.utc)
     seeds.sort(key=lambda s: (_compute_effective_importance(s, now), s.timestamp), reverse=True)
@@ -671,9 +654,19 @@ def touch_seed(
             logging.getLogger(__name__).warning(
                 "signed_write module unavailable; persisting unsigned seed access log"
             )
-            save_access_log(log)
+            try:
+                save_access_log(log)
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "unsigned seed access log failed; primary touch remains successful",
+                    exc_info=True,
+                )
         else:
-            signed_write.signed_write_access_log(log=log, writer=writer)
+            try:
+                signed_write.signed_write_access_log(log=log, writer=writer)
+            except Exception:
+                # Production treats signed access logging as best-effort.
+                pass
 
 
 def backlink_led_to(new_seed_ids: List[str], caused_by_map: Dict[str, List[str]]) -> int:
@@ -1277,23 +1270,18 @@ def decay_due_seeds(
     now: "datetime | None" = None,
     *,
     dry_run: bool = True,
-    phase2_confirmed: bool = False,
 ) -> Dict[str, Any]:
     """Compute time-decayed effective importance for every seed and return a report.
 
-    This function is report-only even after the Phase-2 date. The explicit
-    confirmation and completed calendar-day gates permit a post-observation
-    report request, but no invocation updates seed importance. Query-time
-    ranking uses a separate production decay formula; physical writes remain
-    disabled until the two strategies are reconciled.
+    Phase-1 report-only; never modifies seed importance. Query-time ranking
+    uses the separate production decay formula. Phase-2 activation is deferred.
 
     Parameters
     ----------
     now:
         Reference time for age calculation. Defaults to ``datetime.now(UTC)``.
     dry_run:
-        Must be True until the observation calendar day completes and the
-        caller explicitly confirms Phase 2; False still produces only a report.
+        Must be True; false is reserved for a separately approved Phase 2.
 
     Returns
     -------
@@ -1314,22 +1302,15 @@ def decay_due_seeds(
     separate explicit design review to avoid compounding the existing
     query-time decay and this Phase-1 report calculation.
     """
+    if not dry_run:
+        raise RuntimeError(
+            "decay_due_seeds: dry_run=False is reserved for Phase 2; "
+            "physical decay writes are not enabled"
+        )
     if now is None:
         now = datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
-    # Both a completed natural calendar day and explicit caller confirmation are
-    # required. A future timestamp by itself must never unlock writes.
-    phase2_ready = (
-        datetime.now(timezone.utc).date() > datetime(2026, 11, 28).date()
-        and now.date() > datetime(2026, 11, 28).date()
-        and phase2_confirmed
-    )
-    if not dry_run and not phase2_ready:
-        raise RuntimeError(
-            "decay_due_seeds: dry_run=False requires a completed Phase 1 "
-            "calendar day and explicit phase2_confirmed=True"
-        )
 
     init_db()
     with _connect() as conn:
@@ -1338,7 +1319,7 @@ def decay_due_seeds(
         select_cols = "id, importance, decay_rate, timestamp, last_accessed"
         if has_real_access:
             select_cols += ", last_real_access"
-        rows = conn.execute(f"SELECT {select_cols} FROM seeds WHERE status != 'archived'").fetchall()
+        rows = conn.execute(f"SELECT {select_cols} FROM seeds").fetchall()
 
     total = len(rows)
     exempt = 0

@@ -65,6 +65,7 @@ def test_gray_mode_audit_fallback_preserves_fields(seed_db, caplog, monkeypatch)
 def test_production_access_log_and_query_time_decay_coexist(seed_db):
     first = make_seed("older", ref="event:old", importance=0.9)
     second = make_seed("recent", ref="event:new", importance=0.6)
+    second.summary = "File recent.py failed E505 on 2026-11-10"
     second.timestamp = datetime.now(timezone.utc)
     first.decay_rate = second.decay_rate = 0.05
     assert store.save_seeds([first, second]) == 2
@@ -159,6 +160,25 @@ def test_touch_signed_access_log_uses_merkle_path(seed_db, monkeypatch):
     assert observed[0][1] == "tester"
 
 
+def test_signed_access_failure_never_breaks_primary_touch(seed_db, monkeypatch):
+    seed = make_seed("signed-failure", ref="event:signed-failure")
+    assert store.save_seed(seed)
+
+    def signing_failure(*, log, writer):
+        raise RuntimeError("signing unavailable")
+
+    monkeypatch.setattr(store, "import_module", lambda _: SimpleNamespace(
+        signed_write_access_log=signing_failure
+    ))
+    store.touch_seed(seed.id, writer="tester", session_id="session:failure", reason="recall")
+    with sqlite3.connect(seed_db) as conn:
+        access_count, last_real_access = conn.execute(
+            "SELECT access_count, last_real_access FROM seeds WHERE id=?", (seed.id,)
+        ).fetchone()
+    assert access_count == 1
+    assert last_real_access is not None
+
+
 def test_touch_unsigned_fallback_persists_and_warns(seed_db, monkeypatch, caplog):
     seed = make_seed("unsigned", ref="event:unsigned")
     store.save_seed(seed)
@@ -176,62 +196,68 @@ def test_touch_unsigned_fallback_persists_and_warns(seed_db, monkeypatch, caplog
     assert module == "hermes.memory.signed_write"
 
 
-def test_prefetch_read_only_and_actual_recall_touches(seed_db, monkeypatch):
+def test_prefetch_preserves_production_access_tracking(seed_db, monkeypatch):
+    from seed_memory import SeedMemoryProvider
+
     seed = make_seed("prefetch", ref="event:1")
     assert store.save_seed(seed)
     monkeypatch.setattr(retrieval, "_embed_query", lambda *_: None, raising=False)
-    retrieval.retrieve("example.py", top_k=1, record_access=False)
+    provider = SeedMemoryProvider()
+    provider._initialized = True
+    provider._store = store
+    provider._retrieval = retrieval
+    provider._config = {"prefetch_limit": 1}
+    provider._session_id = "session:prefetch"
+    assert provider.prefetch("example.py")
     with sqlite3.connect(seed_db) as conn:
-        before = conn.execute(
+        count, last_real_access = conn.execute(
             "SELECT access_count, last_real_access FROM seeds WHERE id=?", (seed.id,)
         ).fetchone()
-    assert before == (0, None)
-    assert retrieval.retrieve("example.py", top_k=1)
-    with sqlite3.connect(seed_db) as conn:
-        after = conn.execute(
-            "SELECT access_count, last_real_access FROM seeds WHERE id=?", (seed.id,)
+        writer, session = conn.execute(
+            "SELECT writer, session_id FROM seed_access_log"
         ).fetchone()
-    assert after[0] >= 1
-    assert after[1] is not None
+    assert count >= 1
+    assert last_real_access is not None
+    assert writer == "hermes:seed_memory:prefetch"
+    assert session == "session:prefetch"
 
 
-def test_hash_and_provenance_ref_idempotency(seed_db):
+def test_production_hash_dedup_ignores_ref_and_never_updates(seed_db):
     first = make_seed("first", ref="event:1", importance=0.4)
     duplicate = make_seed("different-id", ref="event:1", importance=0.9)
     distinct_ref = make_seed("distinct", ref="event:2")
     assert store.save_seed(first)
     assert not store.save_seed(duplicate)
-    assert store.save_seeds([duplicate, distinct_ref]) == 1
+    assert store.save_seeds([duplicate, distinct_ref]) == 0
     with sqlite3.connect(seed_db) as conn:
-        rows = conn.execute(
-            "SELECT id, provenance_ref, importance FROM seeds ORDER BY rowid"
-        ).fetchall()
-    assert len(rows) == 2
-    assert rows[0][0] == "first"
-    assert rows[0][1] == "event:1"
-    assert rows[0][2] == pytest.approx(0.9)
-    assert rows[1][1] == "event:2"
+        rows = conn.execute("SELECT id, provenance_ref, importance FROM seeds").fetchall()
+    assert rows == [("first", "event:1", 0.4)]
 
 
-def test_decay_phase2_needs_natural_day_and_explicit_confirmation(seed_db, monkeypatch):
+def test_legacy_duplicate_hash_migration_keeps_all_rows(seed_db, caplog):
+    seed = make_seed("legacy-original", ref="event:legacy")
+    assert store.save_seed(seed)
+    with sqlite3.connect(seed_db) as conn:
+        conn.execute("DROP INDEX idx_seeds_content_hash")
+        conn.execute(
+            "INSERT INTO seeds (id, timestamp, summary, participants, emotion_primary, "
+            "emotion_intensity, importance, content_hash) SELECT ?, timestamp, summary, "
+            "participants, emotion_primary, emotion_intensity, importance, content_hash "
+            "FROM seeds WHERE id=?",
+            ("legacy-duplicate", seed.id),
+        )
+    store.init_db(str(seed_db))
+    with sqlite3.connect(seed_db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM seeds").fetchone()[0] == 2
+    assert "preserving rows without unique index" in caplog.text
+
+
+def test_decay_phase1_is_report_only_and_phase2_remains_disabled(seed_db):
     store.save_seed(make_seed("phase2"))
     with pytest.raises(RuntimeError):
-        store.decay_due_seeds(now=datetime(2026, 11, 28, 23, 59, tzinfo=timezone.utc),
-                              dry_run=False, phase2_confirmed=True)
-    with pytest.raises(RuntimeError):
         store.decay_due_seeds(now=datetime(2026, 11, 29, tzinfo=timezone.utc), dry_run=False)
-    report = store.decay_due_seeds(now=datetime(2026, 11, 29, tzinfo=timezone.utc),
-                                   dry_run=True)
+    report = store.decay_due_seeds(now=datetime(2026, 11, 29, tzinfo=timezone.utc), dry_run=True)
     assert report["dry_run"] is True
-    class AfterObservation(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return datetime(2026, 11, 30, tzinfo=timezone.utc)
-
-    monkeypatch.setattr(store, "datetime", AfterObservation)
-    report = store.decay_due_seeds(now=datetime(2026, 11, 29, tzinfo=timezone.utc),
-                                   dry_run=False, phase2_confirmed=True)
-    assert report["dry_run"] is False
 
 
 def test_filtered_counter_is_separate_and_revival_requires_offline_proposal(seed_db):
@@ -239,18 +265,19 @@ def test_filtered_counter_is_separate_and_revival_requires_offline_proposal(seed
     assert store.count_filtered_by_contract() == 1
     archived = make_seed("archived", ref="event:1", status="archived")
     store.save_seed(archived)
-    assert store.get_all_seeds() == []
-    assert len(store.get_all_seeds(include_archived=True)) == 1
+    assert len(store.get_all_seeds()) == 1
+    assert store.get_all_seeds(include_archived=False) == []
+    # No automatic archival isolation is enabled in the production baseline.
     assert store.decay_due_seeds(now=datetime(2026, 11, 29, tzinfo=timezone.utc))[
-        "dormant_candidates"
-    ] == 0
+        "total"
+    ] == 1
     with pytest.raises(ValueError):
         store.propose_archived_revival(archived.id, offline_review_id=" ")
     assert store.propose_archived_revival(archived.id, offline_review_id="review:1")
-    assert store.get_all_seeds() == []
-    # A repeated write cannot implicitly reactivate an archived record.
+    assert len(store.get_all_seeds()) == 1
+    # Repeated production-style content hash dedup cannot reactivate the row.
     assert not store.save_seed(make_seed("retry", ref="event:1", status="active"))
-    assert store.get_all_seeds() == []
+    assert store.get_all_seeds(include_archived=False) == []
     with sqlite3.connect(seed_db) as conn:
         assert conn.execute("SELECT status FROM seeds WHERE id=?", (archived.id,)).fetchone()[0] == "archived"
         assert conn.execute("SELECT COUNT(*) FROM seed_revival_proposals").fetchone()[0] == 1

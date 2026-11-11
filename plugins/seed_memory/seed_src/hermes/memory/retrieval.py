@@ -10,7 +10,6 @@ import json
 import os
 import re
 import sqlite3
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,7 +17,7 @@ import numpy as np
 
 from . import store as memory_store
 from .schema import Seed
-from .store import get_all_seeds, get_ranked_seeds, touch_seed, update_embedding, save_access_log
+from .store import get_all_seeds, get_ranked_seeds, touch_seed, update_embedding
 
 _DEFAULT_MODEL_PATH = (
     Path(__file__).resolve().parent.parent
@@ -149,7 +148,7 @@ def _fts_retrieve(
     sql = """SELECT s.*
              FROM seeds AS s
              JOIN seeds_fts ON seeds_fts.rowid = s.rowid
-             WHERE seeds_fts MATCH ? AND s.status != 'archived'
+             WHERE seeds_fts MATCH ?
              ORDER BY seeds_fts.rank
              LIMIT ?"""
     try:
@@ -216,7 +215,7 @@ def retrieve_program_evidence(
         if evidence_ids:
             placeholders = ",".join("?" for _ in evidence_ids)
             seed_rows = conn.execute(
-                f"SELECT * FROM seeds WHERE id IN ({placeholders}) AND status != 'archived'",
+                f"SELECT * FROM seeds WHERE id IN ({placeholders})",
                 tuple(evidence_ids),
             ).fetchall()
             seed_by_id = {
@@ -326,7 +325,7 @@ def retrieve(
         for seed in all_seeds:
             if seed.embedding is None:
                 seed.embedding = embed(_seed_text(seed))
-                if record_access and seed.embedding is not None and _valid_embedding(
+                if seed.embedding is not None and _valid_embedding(
                     seed.embedding, query_embedding.size
                 ):
                     update_embedding(seed.id, seed.embedding)
@@ -352,7 +351,7 @@ def retrieve(
 
     used_fallback = not emb_ranked and not fts_ranked
     if used_fallback:
-        results = _fallback(top_k, record_access=False)
+        return _rerank_with_ext_hook(_fallback(top_k, record_access=record_access), query)
     else:
         scores: Dict[str, float] = {}
         candidates: Dict[str, Seed] = {}
@@ -363,148 +362,19 @@ def retrieve(
             candidates[seed.id] = seed
             scores[seed.id] = scores.get(seed.id, 0.0) + 0.45 / (k_rrf + rank)
 
-        # Lift long-dormant seeds into the candidate pool BEFORE RRF truncation.
-        # The ext_hook can only REORDER what retrieve() hands it; a seed that
-        # never enters the top_n window can never be woken by the hook, no
-        # matter how high it scores in ext_hooks._score().  This is the
-        # caller's own pool expansion -- the hook's no-injection contract is
-        # untouched; it still only reorders.
-        injected = _inject_dormant_candidates(candidates, scores, all_seeds, top_k)
-
         ranked_ids = sorted(scores, key=lambda seed_id: (-scores[seed_id], seed_id))
         results = [candidates[seed_id] for seed_id in ranked_ids[:top_k]]
-        # Injected dormant seeds carry a floor score and would be truncated
-        # away here.  Reserve their slots so the injection is not a no-op:
-        # they displace the lowest-scoring ordinary matches, not each other.
-        if injected:
-            injected_ids = {s.id for s in injected if s.id in candidates}
-            # Make room first: drop the lowest-scoring ordinary results until
-            # every injected seed fits.  If the pool is already smaller than
-            # top_k (rare -- top_n < top_k), nothing is dropped.
-            for sid in injected_ids:
-                if sid in results:
-                    continue
-                while len(results) >= top_k:
-                    ordinary = [
-                        i for i, s in enumerate(results)
-                        if s.id not in injected_ids
-                    ]
-                    if not ordinary:
-                        break  # pool is all injected seeds; nothing to drop
-                    results.pop(ordinary[-1])
-                if len(results) < top_k:
-                    results.append(candidates[sid])
-    results = _rerank_with_ext_hook(results, query)
     if record_access:
-        if used_fallback:
-            provenance = json.dumps({
-                "chain": [{"layer": "retrieve", "stage": "fallback",
-                           "writer": "hermes:retrieval:fallback"}],
-                "trigger": "fallback",
-            }, ensure_ascii=False)
-            for seed in results:
-                touch_seed(
-                    seed.id, writer="hermes:retrieval:fallback",
-                    session_id=session_id, reason="fallback",
-                    query_hash=query_hash, provenance=provenance,
-                )
-        else:
-            provenance = json.dumps({
-                "chain": [{"layer": "retrieve", "stage": "rrf",
-                           "writer": writer or "hermes:retrieval:rrf",
-                           "query_hash": query_hash, "session_id": session_id}],
-                "trigger": "query", "query": query[:200] if query else "",
-            }, ensure_ascii=False)
-            for seed in results:
-                touch_seed(
-                    seed.id, writer=writer or "hermes:retrieval:rrf",
-                    session_id=session_id, reason=reason,
-                    query_hash=query_hash, provenance=provenance,
-                )
-    return results
-
-
-_DORMANT_INJECT_DAYS = 7.0
-_DORMANT_INJECT_MAX = 5
-
-
-def _dormant_seeds_from_db(
-    all_seeds: List[Seed], top_k: int
-) -> List[Seed]:
-    """Return long-sleeping unretrieved seeds, capped and age-filtered.
-
-    The Seed dataclass carries no last_real_access column (that lives only in
-    the DB), so the age check is done here against the raw row rather than
-    against the in-memory object.  Seeds already in the candidate pool are
-    excluded by the caller.
-    """
-    if top_k <= 0:
-        return []
-    try:
-        from .store import DB_PATH
-        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row
-        cutoff = datetime.now(timezone.utc) - timedelta(days=_DORMANT_INJECT_DAYS)
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(seeds)")}
-        access_col = "last_real_access" if "last_real_access" in columns else (
-            "last_accessed" if "last_accessed" in columns else "timestamp"
-        )
-        rows = conn.execute(
-            f"SELECT id, access_count, {access_col}, timestamp, importance "
-            "FROM seeds WHERE access_count = 0 AND status != 'archived' "
-            "ORDER BY importance DESC, timestamp ASC"
-        ).fetchall()
-        conn.close()
-    except (OSError, sqlite3.Error):
-        return []
-
-    now = datetime.now(timezone.utc)
-    seed_by_id = {s.id: s for s in all_seeds}
-    picked: List[Seed] = []
-    for row in rows:
-        if len(picked) >= _DORMANT_INJECT_MAX:
-            break
-        seed = seed_by_id.get(row["id"])
-        if seed is None:
-            continue
-        ts = row[access_col] or row["timestamp"]
-        try:
-            t = datetime.fromisoformat(ts)
-            if t.tzinfo is None:
-                t = t.replace(tzinfo=timezone.utc)
-            age_days = (now - t).total_seconds() / 86400.0
-        except Exception:
-            age_days = _DORMANT_INJECT_DAYS  # unknown age: treat as eligible
-        if age_days < _DORMANT_INJECT_DAYS:
-            continue
-        picked.append(seed)
-    return picked
-
-
-def _inject_dormant_candidates(
-    candidates: Dict[str, Seed],
-    scores: Dict[str, float],
-    all_seeds: List[Seed],
-    top_k: int,
-) -> List[Seed]:
-    """Add long-sleeping seeds to the RRF candidate pool so the ext_hook can reach them.
-
-    Seeds already in the pool are left alone.  Only seeds that have never been
-    retrieved (access_count == 0) AND have been sleeping for at least
-    _DORMANT_INJECT_DAYS are added, with a floor score so they sit below genuine
-    matches but above noise.  The cap keeps the pool bounded.
-
-    Returns the seeds that were actually injected so the caller can reserve
-    their slots in the final top_k truncation.
-    """
-    if top_k <= 0:
-        return []
-    floor = -float(top_k) - 1.0
-    injected: List[Seed] = []
-    for seed in _dormant_seeds_from_db(all_seeds, top_k):
-        if seed.id in candidates:
-            continue
-        candidates[seed.id] = seed
-        scores[seed.id] = floor
-        injected.append(seed)
-    return injected
+        provenance = json.dumps({
+            "chain": [{"layer": "retrieve", "stage": "rrf",
+                       "writer": writer or "hermes:retrieval:rrf",
+                       "query_hash": query_hash, "session_id": session_id}],
+            "trigger": "query", "query": query[:200] if query else "",
+        }, ensure_ascii=False)
+        for seed in results:
+            touch_seed(
+                seed.id, writer=writer or "hermes:retrieval:rrf",
+                session_id=session_id, reason=reason,
+                query_hash=query_hash, provenance=provenance,
+            )
+    return _rerank_with_ext_hook(results, query)

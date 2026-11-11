@@ -420,8 +420,9 @@ class SeedMemoryProvider(MemoryProvider):
         self._require_initialized()
         limit = min(10, max(1, int(self._config.get("prefetch_limit", 5))))
         seeds = self._retrieval.retrieve(
-            query, top_k=limit, record_access=False,
-            writer=writer or "hermes:seed_memory:prefetch", session_id=session_id, reason=reason,
+            query, top_k=limit,
+            writer=writer or "hermes:seed_memory:prefetch",
+            session_id=session_id or self._session_id, reason=reason,
         )
         self._last_recalled = len(seeds)
         fallback = not bool(self._retrieval.embedding_status().get("available", False))
@@ -441,25 +442,6 @@ class SeedMemoryProvider(MemoryProvider):
             if seed.seeds_planted:
                 insights = [self._memory_text(item, 300) for item in seed.seeds_planted[:5]]
                 lines.append("  洞见：「" + "；".join(insights) + "」")
-        programs = self._retrieval.retrieve_program_evidence(query, seeds)
-        for program in programs:
-            lines.append(
-                f"- program_memory id={self._memory_text(program['id'], 96)}; "
-                f"domain={self._memory_text(program['domain_signature'], 200)}; "
-                f"pattern={self._memory_text(program['pattern'], 400)}; "
-                f"trigger={self._memory_text(program['trigger_context'], 400)}; "
-                f"behavior={self._memory_text(program['behavior'], 500)}; "
-                f"confidence={program['confidence']:.2f}"
-            )
-            for label, key in (("正例", "positive_seed"), ("反例", "counter_seed")):
-                evidence = program[key]
-                if evidence is not None:
-                    lines.append(
-                        f"  {label} seed_id={self._memory_text(evidence.id, 96)}; "
-                        f"summary={self._memory_text(evidence.summary, 600)}; "
-                        f"emotion={self._memory_text(evidence.emotion.primary, 64)}; "
-                        f"insights={self._memory_text('；'.join(evidence.seeds_planted), 600)}"
-                    )
         lines.append("</memory_context>")
         return "\n".join(lines)
 
