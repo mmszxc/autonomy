@@ -22,6 +22,11 @@ _plugins_dir = Path(__file__).resolve().parent.parent
 # authoritative on the supported Ubuntu target, but must not shadow a local
 # interpreter's packages on unsupported developer platforms (notably Windows).
 _vendor_runtime_enabled = sys.platform.startswith("linux") or os.environ.get("AUTONOMY_VENDOR_FORCE") == "1"
+if _vendor_runtime_enabled and sys.version_info[:2] != (3, 14):
+    raise RuntimeError(
+        f"autonomy plugin requires Python 3.14, got {sys.version_info[:2]}; "
+        ".vendor/py314-site-packages 不兼容"
+    )
 if _vendor_runtime_enabled:
     for _vendor_dir in (_plugins_dir / "_vendor_ml", Path(__file__).resolve().parent / "_vendor"):
         if _vendor_dir.is_dir() and str(_vendor_dir) not in sys.path:

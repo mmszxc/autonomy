@@ -145,7 +145,12 @@ for plugin in autonomy seed_memory; do
     log "installing plugin: $plugin"
     target="$HERMES_HOME/plugins/$plugin"
     ACTIVE_STAGE=$(mktemp -d "$HERMES_HOME/plugins/.${plugin}.install.XXXXXX")
-    cp -a -- "$ROOT_DIR/plugins/$plugin/." "$ACTIVE_STAGE/"
+    plugin_copy_bin="${PLUGIN_COPY_BIN:-cp}"
+    if ! "$plugin_copy_bin" -a -- "$ROOT_DIR/plugins/$plugin/." "$ACTIVE_STAGE/"; then
+        warn "cp -a failed for $plugin (cross-user/btrfs ownership); retrying without attribute preservation"
+        "$plugin_copy_bin" -r -- "$ROOT_DIR/plugins/$plugin/." "$ACTIVE_STAGE/" \
+            || die "failed to stage $plugin after cp -a fallback"
+    fi
     [[ -f "$ACTIVE_STAGE/plugin.yaml" ]] || die "staged $plugin is missing plugin.yaml"
     if [[ -e "$target" || -L "$target" ]]; then
         mv -- "$target" "$BACKUP_DIR/plugins/$plugin"

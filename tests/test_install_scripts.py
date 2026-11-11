@@ -167,6 +167,29 @@ def test_dry_run_temp_home_installs_without_touching_protected_data(tmp_path: Pa
     assert "enable --now" not in systemctl_log
 
 
+def test_plugin_copy_falls_back_when_archive_copy_fails(tmp_path: Path) -> None:
+    env, profile, _ = _fixture(tmp_path)
+    fake_cp = _executable(
+        tmp_path / "bin" / "cp",
+        r'''#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1:-} == -a ]]; then
+    exit 1
+fi
+exec /bin/cp "$@"
+''',
+    )
+    assert fake_cp.is_file()
+    env["PLUGIN_COPY_BIN"] = _bash_path(fake_cp)
+
+    result = _run(env, "--profile", "demo", "--skip-ml", "--no-timer", "--yes")
+
+    assert result.returncode == 0
+    assert "retrying without attribute preservation" in result.stderr
+    assert (profile / "plugins" / "autonomy" / "plugin.yaml").is_file()
+    assert (profile / "plugins" / "seed_memory" / "seed_src" / "hermes" / "memory" / "store.py").is_file()
+
+
 def test_missing_profile_is_rejected_without_creating_it(tmp_path: Path) -> None:
     env, profile, _ = _fixture(tmp_path)
     shutil.rmtree(profile)

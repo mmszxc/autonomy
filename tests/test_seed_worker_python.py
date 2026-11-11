@@ -23,7 +23,7 @@ def _module(monkeypatch):
     return module
 
 
-def test_seed_memory_worker_uses_embedded_python_without_pyyaml(monkeypatch, tmp_path):
+def test_seed_memory_worker_prefers_autonomy_python_without_pyyaml(monkeypatch, tmp_path):
     real_import = builtins.__import__
 
     def without_pyyaml(name, *args, **kwargs):
@@ -49,11 +49,12 @@ def test_seed_memory_worker_uses_embedded_python_without_pyyaml(monkeypatch, tmp
         return SimpleNamespace(returncode=0, stdout='', stderr='')
 
     monkeypatch.setattr(subprocess, 'run', fake_run)
+    monkeypatch.setenv('AUTONOMY_PYTHON', '/opt/hermes/python3.14')
 
     provider._launch_worker_if_needed()
 
     command = commands[0]
-    worker_index = command.index(sys.executable)
+    worker_index = command.index('/opt/hermes/python3.14')
     assert command[0] == 'systemd-run'
     assert command[worker_index + 1].endswith('seed_memory\\worker.py') or command[worker_index + 1].endswith('seed_memory/worker.py')
     assert command[worker_index + 2] == '--once'

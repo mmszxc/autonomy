@@ -110,6 +110,7 @@ def test_completed_autonomy_turn_enqueues_standard_ended_session(
 
     monkeypatch.setattr(runner_module, "os", PosixOS())
     monkeypatch.setattr(runner_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setenv("AUTONOMY_PYTHON", "/opt/hermes/python3.14")
     result = r._enqueue_completed_turn("run1", {"title": "visible"}, "assistant output")
     queued = home / "seed_data" / "seed_queue" / "session_autonomy_run1.json"
     assert result["queued"] is True and queued.is_file()
@@ -120,6 +121,8 @@ def test_completed_autonomy_turn_enqueues_standard_ended_session(
     assert payload["messages"][1] == {"role": "assistant", "content": "assistant output"}
     commands = [call[0][0] for call in calls]
     assert commands[0][0] == "systemd-run"
+    assert "/opt/hermes/python3.14" in commands[0]
+    assert commands[1][0] == "/opt/hermes/python3.14"
     assert commands[1][-1] == "--once"
 
 

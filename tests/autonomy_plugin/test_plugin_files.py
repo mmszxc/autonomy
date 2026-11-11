@@ -6,7 +6,10 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -143,6 +146,25 @@ def test_config_example_has_no_real_keys():
         assert marker not in lowered
     assert "HERMES_<HOST>_API_KEY_MAIN" in text
     assert "HERMES_<HOST>_API_KEY_AUTONOMY" in text
+
+
+@pytest.mark.skipif(sys.version_info[:2] == (3, 14), reason="requires ABI mismatch")
+def test_vendor_runtime_rejects_non_py314_interpreter():
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(ROOT / "plugins")
+    env["AUTONOMY_VENDOR_FORCE"] = "1"
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import autonomy"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "autonomy plugin requires Python 3.14" in result.stderr
+    assert ".vendor/py314-site-packages 不兼容" in result.stderr
 
 
 # ------------------------------------------------- 插件目录 .py 守卫标记
