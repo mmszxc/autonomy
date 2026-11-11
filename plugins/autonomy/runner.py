@@ -55,10 +55,13 @@ from .journal import JournalManager, build_chassis_status
 from .transcript import extract_run_transcript
 from .memory_bridge import load_memory_provider_instance
 from .error_classifier import (
+    record_t3_hits,
     classify_error_text,
     should_circuit_count,
     E2_PROVIDER_EXHAUSTED,
     E_AUTH_FAILED,
+    T2_LOOP_DETECTED,
+    classify as classify_run,
 )
 try:
     from .quarantine_cascade import cascade_quarantine as _cascade_quarantine
@@ -306,6 +309,25 @@ class Runner:
     # ------------------------------------------------------------------
     _SEED_REF_RE = re.compile(r"\[#([A-Za-z0-9_.:-]+)\]")
     _EXPAND_REF_RE = re.compile(r"\[#expand:([A-Za-z0-9_.:-]+)\]")
+
+    def _check_overdue_quarantine_reviews(self, run):
+        """F9: mark overdue reviews and emit an operator-visible event, never delete."""
+        if not self.db:
+            return
+        try:
+            from .quarantine_cascade import overdue_quarantine_reviews
+            for overdue in overdue_quarantine_reviews(self.db.c):
+                self.db.append_event(
+                    run_id=run, kind="quarantine_review_overdue",
+                    summary="Review required for quarantine %s" % overdue['id'],
+                )
+        except (sqlite3.Error, OSError) as exc:
+            logger.warning("quarantine review check failed: %s", exc)
+            try:
+                self.db.append_event(run_id=run, kind="quarantine_review_check_failed",
+                                     summary=str(exc)[:300])
+            except (sqlite3.Error, OSError):
+                logger.exception("quarantine review failure receipt unavailable")
 
     def _seed_db_path(self):
         """Resolve this profile's seed database path (if present)."""
@@ -1344,8 +1366,20 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             acquired = self._acquire_lock(f)
             if not acquired:
                 return {"status": "busy", "run_id": run}
+            self._check_overdue_quarantine_reviews(run)
             if os.path.exists(self.stop_file):
                 return {"status": "stopped", "run_id": run}
+            if os.path.exists(self.lock_path + '.auth_failed'):
+                if self.db:
+                    self.db.append_event(run_id=run, kind="auth_dispatch_blocked",
+                                         exit_reason=E_AUTH_FAILED,
+                                         summary="Explicit credential reset required; no request dispatched")
+                    self.db.c.execute(
+                        "update last_tick set status=?,finished_at=?,summary=? where id=1",
+                        ("auth_failed", time.time(), "Credentials require operator reset"),
+                    )
+                    self.db.c.commit()
+                return {"status": "auth_failed", "run_id": run}
             if not self.budget.allow() or not self.circuit.allow():
                 return {"status": "blocked", "run_id": run}
 
@@ -1519,8 +1553,32 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                             elapsed = time.time() - started
                             tools = state.get("tool_calls") or []
                             self._record_partial(run, diagnostic, usage, elapsed, "failed", tools)
-                            # F1: classify the failure to route to quarantine or retry
-                            _error_kind, _ = classify_error_text(diagnostic)
+                            # F1: structured HTTP status precedes text diagnostics.
+                            _http_status = state.get('http_status') or state.get('status_code')
+                            if _http_status is not None:
+                                _error_kind, _, _flags = classify_run(
+                                    diagnostic, {'http_status': _http_status},
+                                )
+                            else:
+                                _error_kind, _flags = classify_error_text(diagnostic)
+                            record_t3_hits(_flags, self.db)
+                            # F5: prefer paired turns supplied by the gateway; the
+                            # transcript fallback includes actual tool result previews.
+                            _tool_calls = state.get('tool_calls') or []
+                            _prior_calls = state.get('previous_tool_calls') or []
+                            if not (_tool_calls and _prior_calls):
+                                _transcript = self._extract_transcript(started, time.time())
+                                _history = _transcript.get('tool_calls') or []
+                                if len(_history) >= 2:
+                                    _prior_calls, _tool_calls = [_history[-2]], [_history[-1]]
+                            if _tool_calls and _prior_calls and _error_kind not in (E_AUTH_FAILED, E2_PROVIDER_EXHAUSTED):
+                                _loop_kind, _, _ = classify_run(
+                                    diagnostic, {'status': 'completed'},
+                                    tool_calls=_tool_calls,
+                                    previous_tool_calls=_prior_calls,
+                                )
+                                if _loop_kind == T2_LOOP_DETECTED:
+                                    _error_kind = _loop_kind
                             error_class = _error_kind or state.get("error_class") or "RuntimeError"
                             self.db.append_event(run_id=run, kind="run_failed", exit_reason=error_class, summary=("returncode=%s reason=%s" % (state.get("returncode"), diagnostic))[:1200])
                             # F1: quarantine dirty runs; E2 provider-exhausted is retryable
@@ -1717,16 +1775,21 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             }
         except Exception as e:
             http_status = getattr(e, "status_code", None)
-            # F8: only count code-attributable failures in the circuit breaker.
-            # E2 (provider exhausted), E3 (turn budget), E_UNCLASSIFIED, and
-            # E_AUTH_FAILED are not code bugs and must never trip the circuit.
+            # F8: Circuit (threshold 3) counts unknown/code failures; provider,
+            # budget and auth failures do not. GrayCircuit separately handles
+            # consecutive gray-release failures (threshold 2).
             _exc_error_kind = getattr(e, "_autonomy_error_kind", None)
             if _exc_error_kind is None and http_status is not None:
                 # Structured HTTP signal takes precedence over text (F2/F3).
                 from .error_classifier import classify as _clf
                 _exc_error_kind, _, _ = _clf("", {"http_status": http_status})
             if _exc_error_kind is None:
-                _exc_error_kind, _ = classify_error_text(str(e))
+                _exc_error_kind, _flags = classify_error_text(str(e))
+                record_t3_hits(_flags, self.db)
+            if _exc_error_kind == E_AUTH_FAILED:
+                # Explicit operator reset after credentials change: remove this flag.
+                with open(self.lock_path + '.auth_failed', 'w', encoding='utf-8') as auth_flag:
+                    auth_flag.write(str(http_status or 'auth_failed'))
             if should_circuit_count(_exc_error_kind):
                 self.circuit.failure(http_status)
             reason = " ".join(str(e).split())[:240]

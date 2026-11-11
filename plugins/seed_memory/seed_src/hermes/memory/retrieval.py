@@ -148,7 +148,7 @@ def _fts_retrieve(
     sql = """SELECT s.*
              FROM seeds AS s
              JOIN seeds_fts ON seeds_fts.rowid = s.rowid
-             WHERE seeds_fts MATCH ?
+             WHERE seeds_fts MATCH ? AND s.status != 'archived'
              ORDER BY seeds_fts.rank
              LIMIT ?"""
     try:
@@ -215,7 +215,7 @@ def retrieve_program_evidence(
         if evidence_ids:
             placeholders = ",".join("?" for _ in evidence_ids)
             seed_rows = conn.execute(
-                f"SELECT * FROM seeds WHERE id IN ({placeholders})",
+                f"SELECT * FROM seeds WHERE id IN ({placeholders}) AND status != 'archived'",
                 tuple(evidence_ids),
             ).fetchall()
             seed_by_id = {
@@ -297,7 +297,7 @@ def _rerank_with_ext_hook(seeds: List[Seed], query: str) -> List[Seed]:
         executor.shutdown(wait=False, cancel_futures=True)
 
 
-def retrieve(query: str, top_k: int = 5) -> List[Seed]:
+def retrieve(query: str, top_k: int = 5, *, record_access: bool = True) -> List[Seed]:
     """Retrieve seeds by fusing cosine and FTS ranks with weighted RRF."""
     top_k = max(1, int(top_k))
     top_n = max(top_k * 3, 20)
@@ -312,7 +312,7 @@ def retrieve(query: str, top_k: int = 5) -> List[Seed]:
         for seed in all_seeds:
             if seed.embedding is None:
                 seed.embedding = embed(_seed_text(seed))
-                if seed.embedding is not None and _valid_embedding(
+                if record_access and seed.embedding is not None and _valid_embedding(
                     seed.embedding, query_embedding.size
                 ):
                     update_embedding(seed.id, seed.embedding)
@@ -379,10 +379,11 @@ def retrieve(query: str, top_k: int = 5) -> List[Seed]:
                     results.pop(ordinary[-1])
                 if len(results) < top_k:
                     results.append(candidates[sid])
+    results = _rerank_with_ext_hook(results, query)
+    if record_access:
         for seed in results:
             touch_seed(seed.id)
-
-    return _rerank_with_ext_hook(results, query)
+    return results
 
 
 _DORMANT_INJECT_DAYS = 7.0
@@ -408,7 +409,7 @@ def _dormant_seeds_from_db(
         cutoff = datetime.now(timezone.utc) - timedelta(days=_DORMANT_INJECT_DAYS)
         rows = conn.execute(
             "SELECT id, access_count, last_real_access, timestamp, importance "
-            "FROM seeds WHERE access_count = 0 "
+            "FROM seeds WHERE access_count = 0 AND status != 'archived' "
             "ORDER BY importance DESC, timestamp ASC"
         ).fetchall()
         conn.close()

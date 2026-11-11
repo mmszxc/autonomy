@@ -7,10 +7,12 @@ Hermes Agent plugin without writing into the source tree.
 from __future__ import annotations
 
 import hashlib
+from importlib import import_module
 import math
 import re
 import uuid
 import json
+import logging
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -19,7 +21,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from .schema import Emotion, Seed, SemanticMemory, ProgramMemory
+from .schema import Emotion, Seed, SemanticMemory, ProgramMemory, SeedAccessLog
 
 _SOURCE_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "seeds.db"
 # In an installed profile this module lives under
@@ -106,7 +108,9 @@ def init_db(db_path: str | os.PathLike[str] | None = None) -> None:
                 led_to TEXT,
                 decay_rate REAL DEFAULT 0.05,
                 recall_count INTEGER DEFAULT 0,
-                shareable INTEGER DEFAULT 1
+                shareable INTEGER DEFAULT 1,
+                provenance_ref TEXT,
+                status TEXT NOT NULL DEFAULT 'active'
             )"""
         )
         columns = {row[1] for row in conn.execute("PRAGMA table_info(seeds)")}
@@ -126,6 +130,8 @@ def init_db(db_path: str | os.PathLike[str] | None = None) -> None:
             "shareable": "INTEGER DEFAULT 1",
             "last_real_access": "TEXT",
             "last_reinforced": "TEXT",
+            "provenance_ref": "TEXT",
+            "status": "TEXT NOT NULL DEFAULT 'active'",
         }
         for column, sql_type in migrations.items():
             if column not in columns:
@@ -148,23 +154,45 @@ def init_db(db_path: str | os.PathLike[str] | None = None) -> None:
                     f"UPDATE seeds SET {new_column}={old_column} "
                     f"WHERE {new_column} IS NULL"
                 )
-        try:
-            conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_seeds_content_hash "
-                "ON seeds(content_hash) WHERE content_hash IS NOT NULL"
-            )
-        except sqlite3.IntegrityError:
-            # A legacy DB may contain duplicate hashes. Retain the oldest row
-            # for each hash, then make future writes idempotent.
-            conn.execute(
-                "DELETE FROM seeds WHERE rowid NOT IN "
-                "(SELECT MIN(rowid) FROM seeds WHERE content_hash IS NOT NULL GROUP BY content_hash) "
-                "AND content_hash IS NOT NULL"
-            )
-            conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_seeds_content_hash "
-                "ON seeds(content_hash) WHERE content_hash IS NOT NULL"
-            )
+        # A hash may recur with a different external provenance ref. Preserve
+        # existing rows during migration; never delete historical evidence.
+        # Production signed-access schema: keep existing records and indexes.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS seed_access_log (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                seed_id TEXT NOT NULL,
+                writer TEXT NOT NULL,
+                session_id TEXT,
+                reason TEXT,
+                query_hash TEXT,
+                provenance TEXT
+            )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_seed_access_log_seed_id "
+            "ON seed_access_log(seed_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_seed_access_log_timestamp "
+            "ON seed_access_log(timestamp DESC)"
+        )
+        conn.execute("""CREATE TABLE IF NOT EXISTS seed_ingest_dispositions (
+            disposition TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            recorded_at TEXT NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS seed_revival_proposals (
+            seed_id TEXT NOT NULL,
+            offline_review_id TEXT NOT NULL,
+            proposed_at TEXT NOT NULL,
+            UNIQUE(seed_id, offline_review_id)
+        )""")
+        conn.execute("DROP INDEX IF EXISTS idx_seeds_content_hash")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_seeds_hash_ref "
+            "ON seeds(content_hash, provenance_ref)"
+        )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_seeds_importance_timestamp "
             "ON seeds(importance DESC, timestamp DESC)"
@@ -323,8 +351,27 @@ def _sync_seed_indexes(conn: sqlite3.Connection, seed: Seed) -> None:
         )
 
 
+def _update_duplicate(conn: sqlite3.Connection, seed: Seed) -> bool:
+    """Update an existing (content hash, provenance ref) row without resetting access."""
+    content_hash = _seed_hash(seed)
+    row = conn.execute(
+        "SELECT id, status FROM seeds WHERE content_hash=? "
+        "AND provenance_ref IS ? ORDER BY rowid LIMIT 1",
+        (content_hash, seed.provenance_ref),
+    ).fetchone()
+    if row is None:
+        return False
+    # Never resurrect an archived row through an automatic retry.
+    conn.execute(
+        "UPDATE seeds SET importance=MAX(importance, ?), "
+        "embedding=COALESCE(embedding, ?), shareable=? WHERE id=?",
+        (seed.importance, _embedding_blob(seed.embedding), int(seed.shareable), row["id"]),
+    )
+    return True
+
+
 def save_seeds(seeds: List[Seed]) -> int:
-    """Insert a batch in one transaction; duplicates are ignored."""
+    """Insert a batch in one transaction; duplicates are updated in place."""
     if not seeds:
         return 0
     init_db()
@@ -332,6 +379,8 @@ def save_seeds(seeds: List[Seed]) -> int:
     with _connect() as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(seeds)")}
         for seed in seeds:
+            if _update_duplicate(conn, seed):
+                continue
             embedding_blob = (
                 _embedding_blob(seed.embedding)
             )
@@ -349,6 +398,8 @@ def save_seeds(seeds: List[Seed]) -> int:
                       embedding_blob, seed.access_count, None, _seed_hash(seed),
                       json.dumps(seed.caused_by, ensure_ascii=False), json.dumps(seed.led_to, ensure_ascii=False),
                       seed.decay_rate, int(seed.shareable)]
+            fields.extend(("provenance_ref", "status"))
+            values.extend((seed.provenance_ref, seed.status))
             if "created_at" in columns:
                 fields.append("created_at"); values.append(seed.timestamp.isoformat())
             cursor = conn.execute(
@@ -366,13 +417,15 @@ def save_seed(seed: Seed) -> bool:
     """Insert a seed once.
 
     Returns True when a row was inserted. Repeated extraction of semantically
-    identical content is ignored via ``content_hash``.
+    identical content and provenance ref is updated in place.
     """
     init_db()
     embedding_blob = (
         _embedding_blob(seed.embedding)
     )
     with _connect() as conn:
+        if _update_duplicate(conn, seed):
+            return False
         columns = {row[1] for row in conn.execute("PRAGMA table_info(seeds)")}
         fields = [
             "id", "timestamp", "summary", "participants",
@@ -403,6 +456,8 @@ def save_seed(seed: Seed) -> bool:
             seed.decay_rate,
             int(seed.shareable),
         ]
+        fields.extend(("provenance_ref", "status"))
+        values.extend((seed.provenance_ref, seed.status))
         if "created_at" in columns:
             fields.append("created_at")
             values.append(seed.timestamp.isoformat())
@@ -423,37 +478,183 @@ def update_embedding(seed_id: str, embedding: np.ndarray) -> None:
         conn.execute("UPDATE seeds SET embedding=? WHERE id=?", (blob, seed_id))
 
 
-def get_all_seeds() -> List[Seed]:
+def get_all_seeds(*, include_archived: bool = False) -> List[Seed]:
     init_db()
     with _connect() as conn:
-        rows = conn.execute("SELECT * FROM seeds ORDER BY timestamp DESC").fetchall()
+        where = "" if include_archived else "WHERE status != 'archived'"
+        rows = conn.execute(f"SELECT * FROM seeds {where} ORDER BY timestamp DESC").fetchall()
     return [_row_to_seed(row) for row in rows]
+
+
+def record_filtered_by_contract(reason: str) -> None:
+    """Track compliant filtering separately from persisted seeds and invalid failures."""
+    if not reason.strip():
+        raise ValueError("contract filter reason is required")
+    init_db()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO seed_ingest_dispositions(disposition, reason, recorded_at) "
+            "VALUES ('filtered_by_contract', ?, ?)",
+            (reason, datetime.now(timezone.utc).isoformat()),
+        )
+
+
+def count_filtered_by_contract() -> int:
+    init_db()
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM seed_ingest_dispositions "
+            "WHERE disposition='filtered_by_contract'"
+        ).fetchone()[0]
+
+
+def propose_archived_revival(seed_id: str, *, offline_review_id: str) -> bool:
+    """Record an offline-reviewed proposal; never automatically reactivate a seed."""
+    if not offline_review_id.strip():
+        raise ValueError("offline_review_id is required for archived revival proposals")
+    init_db()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM seeds WHERE id=? AND status='archived'", (seed_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        conn.execute(
+            "INSERT INTO seed_revival_proposals(seed_id, offline_review_id, proposed_at) "
+            "VALUES (?, ?, ?)",
+            (seed_id, offline_review_id, datetime.now(timezone.utc).isoformat()),
+        )
+    return True
+
+
+def save_access_log(log: SeedAccessLog) -> bool:
+    """Insert a signed access record. Idempotent on (seed_id, writer, session_id, reason, timestamp minute)."""
+    init_db()
+    with _connect() as conn:
+        # Idempotency key: same seed+writer+session+reason within the same minute
+        minute_key = log.timestamp.replace(second=0, microsecond=0).isoformat()
+        idempotency_key = f"{log.seed_id}|{log.writer}|{log.session_id}|{log.reason}|{minute_key}"
+        import hashlib
+        dedup_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:16]
+        # Check if already exists
+        existing = conn.execute(
+            "SELECT id FROM seed_access_log WHERE id LIKE ?",
+            (f"acc_{dedup_hash}%",),
+        ).fetchone()
+        if existing:
+            return False
+        conn.execute(
+            """INSERT INTO seed_access_log (id, timestamp, seed_id, writer, session_id, reason, query_hash, provenance)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                log.id,
+                log.timestamp.isoformat(),
+                log.seed_id,
+                log.writer,
+                log.session_id,
+                log.reason,
+                log.query_hash,
+                log.provenance,
+            ),
+        )
+    return True
+
+
+def _compute_effective_importance(
+    importance: float,
+    timestamp_str: str,
+    decay_rate: float,
+    now: datetime,
+) -> float:
+    """Time-decay importance: I_eff = I * exp(-decay_rate * days_since_creation)."""
+    try:
+        ts = datetime.fromisoformat(timestamp_str)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        days = max(0.0, (now - ts).total_seconds() / 86400.0)
+        return importance * math.exp(-decay_rate * days)
+    except (ValueError, TypeError, OverflowError):
+        return importance
 
 
 def get_ranked_seeds(limit: int = 5) -> List[Seed]:
-    """Embedding-free fallback: importance first, then recency."""
+    """Return top seeds by decayed importance, computed at query time.
+
+    Ranking: effective_importance = importance * exp(-decay_rate * age_days).
+    Seeds are sorted in Python because SQLite lacks a built-in exp() on some
+    builds.  The full active set is scanned; a modest seed table makes this cheap.
+    """
     init_db()
     with _connect() as conn:
-        rows = conn.execute(
-            """SELECT * FROM seeds
-               ORDER BY importance DESC, timestamp DESC
-               LIMIT ?""",
-            (max(1, int(limit)),),
-        ).fetchall()
-    return [_row_to_seed(row) for row in rows]
-
-
-def touch_seed(seed_id: str) -> None:
-    with _connect() as conn:
-        conn.execute(
-            "UPDATE seeds SET access_count=access_count+1, "
-            "last_accessed=?, last_real_access=? WHERE id=?",
-            (
-                datetime.now(timezone.utc).isoformat(),
-                datetime.now(timezone.utc).isoformat(),
-                seed_id,
+        rows = conn.execute("SELECT * FROM seeds WHERE status != 'archived'").fetchall()
+    now = datetime.now(timezone.utc)
+    ranked = sorted(
+        rows,
+        key=lambda r: (
+            _compute_effective_importance(
+                r["importance"], r["timestamp"], r["decay_rate"], now,
             ),
+            r["timestamp"],
+        ),
+        reverse=True,
+    )
+    return [_row_to_seed(row) for row in ranked[:max(1, int(limit))]]
+
+
+def touch_seed(
+    seed_id: str,
+    *,
+    writer: str = "",
+    session_id: str = "",
+    reason: str = "",
+    query_hash: str = "",
+    provenance: str = "",
+) -> None:
+    """Increment access count, update last_accessed, and write a signed access log.
+
+    The access log write is best-effort: it never blocks the primary update.
+    """
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    with _connect() as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(seeds)")}
+        sets = ["access_count=access_count+1"]
+        params = []
+        if "last_accessed" in columns:
+            sets.append("last_accessed=?")
+            params.append(now_iso)
+        if "last_real_access" in columns:
+            sets.append("last_real_access=?")
+            params.append(now_iso)
+        params.append(seed_id)
+        conn.execute(
+            f"UPDATE seeds SET {', '.join(sets)} WHERE id=?",
+            tuple(params),
         )
+
+    # Production profiles retain their Merkle-signed writer. Source checkouts
+    # without that optional module still persist an unsigned audit record.
+    if writer or session_id or reason:
+        log = SeedAccessLog(
+            seed_id=seed_id,
+            writer=writer or "unknown",
+            session_id=session_id,
+            reason=reason,
+            query_hash=query_hash,
+            provenance=provenance,
+            timestamp=now,
+        )
+        try:
+            signed_write = import_module(f"{__package__}.signed_write")
+        except ModuleNotFoundError as exc:
+            if exc.name != f"{__package__}.signed_write":
+                raise
+            logging.getLogger(__name__).warning(
+                "signed_write module unavailable; persisting unsigned seed access log"
+            )
+            save_access_log(log)
+        else:
+            signed_write.signed_write_access_log(log=log, writer=writer)
 
 
 def backlink_led_to(new_seed_ids: List[str], caused_by_map: Dict[str, List[str]]) -> int:
@@ -1022,20 +1223,23 @@ def decay_due_seeds(
     now: "datetime | None" = None,
     *,
     dry_run: bool = True,
+    phase2_confirmed: bool = False,
 ) -> Dict[str, Any]:
     """Compute time-decayed effective importance for every seed and return a report.
 
-    Phase-1 contract: ``dry_run=True`` (the default) is the ONLY supported mode.
-    ``dry_run=False`` is reserved for Phase 2 (post 14-day observe window) and
-    raises ``RuntimeError`` to prevent accidental writes during the observe period.
+    This function is report-only even after the Phase-2 date. The explicit
+    confirmation and completed calendar-day gates permit a post-observation
+    report request, but no invocation updates seed importance. Query-time
+    ranking uses a separate production decay formula; physical writes remain
+    disabled until the two strategies are reconciled.
 
     Parameters
     ----------
     now:
         Reference time for age calculation. Defaults to ``datetime.now(UTC)``.
     dry_run:
-        Must be True in Phase 1. Set to False only after the 14-day observe
-        window ends and Phase 2 is explicitly activated (see rollback design below).
+        Must be True until the observation calendar day completes and the
+        caller explicitly confirms Phase 2; False still produces only a report.
 
     Returns
     -------
@@ -1052,29 +1256,26 @@ def decay_due_seeds(
         entries         — list of per-seed dicts (id, importance, effective, age_days,
                           age_real_days, is_exempt, is_dormant_candidate)
 
-    Phase-2 write activation design
-    --------------------------------
-    When the 14-day observe period ends (2026-11-28), enable writes by:
-      1. Set ``HERMES_DECAY_WRITE_ENABLED=1`` in the profile .env.
-      2. The caller (autonomy tick maintenance slot) passes ``dry_run=False``.
-      3. decay_due_seeds will UPDATE seeds SET importance=effective WHERE id=?
-         for all non-exempt seeds whose effective < importance.
-      4. Rollback: ``git revert HEAD~1`` or ``HERMES_DECAY_WRITE_ENABLED=`` (unset)
-         re-disables writes. No DB migration needed: importance values already
-         written can be left in place (they were computed deterministically).
+    Phase-2 write activation is not implemented. Future writes require a
+    separate explicit design review to avoid compounding the existing
+    query-time decay and this Phase-1 report calculation.
     """
-    if not dry_run:
-        raise RuntimeError(
-            "decay_due_seeds: dry_run=False is reserved for Phase 2 "
-            "(post 2026-11-28 observe window). "
-            "Set HERMES_DECAY_WRITE_ENABLED=1 and confirm with the team lead "
-            "before enabling writes."
-        )
-
     if now is None:
         now = datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
+    # Both a completed natural calendar day and explicit caller confirmation are
+    # required. A future timestamp by itself must never unlock writes.
+    phase2_ready = (
+        datetime.now(timezone.utc).date() > datetime(2026, 11, 28).date()
+        and now.date() > datetime(2026, 11, 28).date()
+        and phase2_confirmed
+    )
+    if not dry_run and not phase2_ready:
+        raise RuntimeError(
+            "decay_due_seeds: dry_run=False requires a completed Phase 1 "
+            "calendar day and explicit phase2_confirmed=True"
+        )
 
     init_db()
     with _connect() as conn:
@@ -1083,7 +1284,7 @@ def decay_due_seeds(
         select_cols = "id, importance, decay_rate, timestamp, last_accessed"
         if has_real_access:
             select_cols += ", last_real_access"
-        rows = conn.execute(f"SELECT {select_cols} FROM seeds").fetchall()
+        rows = conn.execute(f"SELECT {select_cols} FROM seeds WHERE status != 'archived'").fetchall()
 
     total = len(rows)
     exempt = 0

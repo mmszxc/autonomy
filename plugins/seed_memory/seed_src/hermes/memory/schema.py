@@ -33,6 +33,21 @@ class Seed:
     shareable: int = 1            # 1=可供其他 AI 分享，0=私人/临时内容
     decay_rate: float = 0.05      # 每次访问后重要性衰减的速率
     embedding: Optional[List[float]] = None  # 向量，检索用
+    provenance_ref: Optional[str] = None  # Full provenance validation is a separate phase.
+    status: str = "active"
+
+
+@dataclass
+class SeedAccessLog:
+    """Signed access record: who touched which seed, when, why, in which session."""
+    id: str = field(default_factory=lambda: f"acc_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}")
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    seed_id: str = ""
+    writer: str = ""
+    session_id: str = ""
+    reason: str = ""
+    query_hash: str = ""
+    provenance: str = ""
 
 
 @dataclass

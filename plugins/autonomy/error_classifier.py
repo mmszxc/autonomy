@@ -148,7 +148,7 @@ _REFUSAL_RE = re.compile(
     r"As\s+an\s+AI\b|"
     r"I\s+(?:cannot|can't|won't)\s+(?:help|assist|provide|do|create|generate)|"
     r"I\s+don't\s+have\s+(?:the\s+ability|access|permission)|"
-    r"(?:对不起|抱歉)，?我(?:无法|不能|不可以)|"
+    r"(?:对不起|抱歉)[，,]?我(?:无法|不能|不可以)|"
     r"作为(?:一个)?AI|"
     r"我(?:无法|不能|不可以)(?:帮助|提供|执行|完成|生成)|"
     r"这超出了我的能力范围"
@@ -165,7 +165,7 @@ def _has_substantial_content(text: str) -> bool:
     """Return True if the text contains meaningful recoverable content."""
     cleaned = re.sub(
         r"(?:I(?:'m|\sam)\s+(?:sorry|unable)|As\s+an\s+AI|I\s+(?:cannot|can't|won't)|"
-        r"对不起，我(?:无法|不能)|作为(?:一个)?AI|我(?:无法|不能))[^.。\n]*[.。\n]?",
+        r"(?:对不起|抱歉)[，,]?我(?:无法|不能|不可以)|作为(?:一个)?AI|我(?:无法|不能|不可以))",
         "", text, flags=re.IGNORECASE
     )
     return len(cleaned.strip()) >= _SUBSTANTIAL_CONTENT_MIN_CHARS
@@ -186,7 +186,12 @@ def _is_refusal(text: str) -> bool:
 def _tool_call_signature(tc: dict) -> str:
     """Stable tool signature; strip timestamps/random request IDs (F5)."""
     name = str(tc.get("tool_name") or tc.get("name") or "?")
-    args = tc.get("args") or tc.get("parameters") or {}
+    args = tc.get("args") or tc.get("parameters") or tc.get("args_preview") or {}
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (TypeError, ValueError):
+            pass
     volatile = re.compile(r"(?:timestamp|request[_-]?id|trace[_-]?id|random[_-]?id|nonce)", re.I)
     if isinstance(args, dict):
         clean = {k: v for k, v in args.items() if not volatile.search(str(k))}
@@ -214,14 +219,18 @@ def _is_loop(
     tool call lists, most-recent first (or last).  Callers should source this
     from ``transcript["tool_calls_by_turn"]`` or equivalent.
     """
-    # F5: tool-call signature based loop detection
+    # F5: matching calls are a loop only when the prior result supplied no
+    # new evidence; missing result data must not be mistaken for evidence.
     if tool_calls and previous_tool_calls:
         current_sigs = tuple(_tool_call_signature(tc) for tc in tool_calls)
         if current_sigs:
             for prev_turn in previous_tool_calls:
                 prev_sigs = tuple(_tool_call_signature(tc) for tc in (prev_turn or []))
                 if current_sigs == prev_sigs and len(current_sigs) > 0:
-                    return True
+                    current_results = tuple(str(tc.get('result_preview') or tc.get('result') or '') for tc in tool_calls)
+                    previous_results = tuple(str(tc.get('result_preview') or tc.get('result') or '') for tc in prev_turn)
+                    if all(current_results) and all(previous_results) and current_results == previous_results:
+                        return True
 
     # Text-identity fallback
     if not previous_outputs or not text:

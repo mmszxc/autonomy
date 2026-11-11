@@ -778,9 +778,9 @@ class TestF4RefusalChineseAndDual:
 
 class TestF5ToolCallLoopDetection:
     def test_identical_tool_calls_detected_as_loop(self):
-        tool_calls = [{"tool_name": "search", "args": {"query": "hermes memory"}}]
+        tool_calls = [{"tool_name": "search", "args": {"query": "hermes memory"}, "result": "same evidence"}]
         previous_tool_calls = [
-            [{"tool_name": "search", "args": {"query": "hermes memory"}}],
+            [{"tool_name": "search", "args": {"query": "hermes memory"}, "result": "same evidence"}],
             [{"tool_name": "read_file", "args": {"path": "/foo"}}],
         ]
         kind, q, _ = classify(

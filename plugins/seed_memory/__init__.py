@@ -358,7 +358,7 @@ class SeedMemoryProvider(MemoryProvider):
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         self._require_initialized()
         limit = min(10, max(1, int(self._config.get("prefetch_limit", 5))))
-        seeds = self._retrieval.retrieve(query, top_k=limit)
+        seeds = self._retrieval.retrieve(query, top_k=limit, record_access=False)
         self._last_recalled = len(seeds)
         fallback = not bool(self._retrieval.embedding_status().get("available", False))
         logger.info("prefetch recall_count=%d seed_ids=%s similarities=%s fallback=%s", len(seeds), [s.id for s in seeds], [getattr(s, "similarity", None) for s in seeds], fallback)

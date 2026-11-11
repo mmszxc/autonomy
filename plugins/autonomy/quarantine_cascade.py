@@ -39,6 +39,26 @@ def ensure_quarantine_column(seeds_conn) -> bool:
     return True
 
 
+def overdue_quarantine_reviews(conn, now: float | None = None) -> list[dict]:
+    """Mark overdue items for operator review; never delete or release them."""
+    now = time.time() if now is None else now
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(quarantines)")}
+    for col, typ in (("reviewer", "TEXT"), ("review_due_at", "REAL")):
+        if col not in cols:
+            conn.execute("ALTER TABLE quarantines ADD COLUMN %s %s" % (col, typ))
+    rows = conn.execute(
+        "SELECT id, subject_type, subject_id, review_due_at FROM quarantines "
+        "WHERE status='pending_review' AND reviewer IS NULL "
+        "AND review_due_at IS NOT NULL AND review_due_at <= ?", (now,)
+    ).fetchall()
+    result = [dict(zip(('id', 'subject_type', 'subject_id', 'review_due_at'), row)) for row in rows]
+    if result:
+        conn.executemany("UPDATE quarantines SET status='review_overdue' WHERE id=?",
+                         [(item['id'],) for item in result])
+        conn.commit()
+    return result
+
+
 def _quarantine_subject(
     conn,
     subject_type: str,
@@ -57,9 +77,9 @@ def _quarantine_subject(
     expires_at = now + expires_hours * 3600
     conn.execute(
         "INSERT OR IGNORE INTO quarantines"
-        "(id, subject_type, subject_id, reason, status, expires_at, review_count, created_at)"
-        " VALUES (?, ?, ?, ?, 'pending_review', ?, 0, ?)",
-        (qid, subject_type, subject_id, reason, expires_at, now),
+        "(id, subject_type, subject_id, reason, status, expires_at, review_count, created_at, reviewer, review_due_at)"
+        " VALUES (?, ?, ?, ?, 'pending_review', ?, 0, ?, NULL, ?)",
+        (qid, subject_type, subject_id, reason, expires_at, now, expires_at),
     )
     return qid
 
@@ -183,7 +203,7 @@ def cascade_quarantine(
                         "run_id": run_id,
                         "review_count": review_count,
                     })
-                elif _qstatus == "pending_review":
+                elif _qstatus in ("pending_review", "review_overdue"):
                     result["pending_review_count"] += 1
         except Exception as exc:
             audit_log.append({"action": "quarantine_review_check_error", "error": str(exc)[:200]})
