@@ -612,7 +612,7 @@ def semantic_memory_readable(
 
     A row is readable only when its confidence/evidence claims clear the
     thresholds and every provenance id can be replayed from the seed store.
-    The default confidence gate is 0.667 (2/3): one source is intentionally
+    The default confidence gate is 0.668 (2/3): one source is intentionally
     below it; each additional corroborating source advances the evidence
     count and Bayesian confidence. NULL embeddings are a deliberate lazy
     backfill state, not a failed write; retrieval may fill the BLOB later.
@@ -1094,8 +1094,10 @@ def decay_due_seeds(
     entries: List[Dict[str, Any]] = []
 
     for row in rows:
-        importance = float(row["importance"] or 0.5)
-        decay_rate = float(row["decay_rate"] or 0.05)
+        importance_raw = row["importance"]
+        decay_raw = row["decay_rate"]
+        importance = float(importance_raw if importance_raw is not None else 0.5)
+        decay_rate = float(decay_raw if decay_raw is not None else 0.05)
 
         # Age since creation/last_accessed (for effective importance)
         baseline_ts = row["last_accessed"] or row["timestamp"]
