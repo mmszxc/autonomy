@@ -2,6 +2,15 @@ import os, uuid, json, hashlib, threading, time, signal, re, subprocess, sys, st
 from datetime import datetime, timezone
 import logging
 logger = logging.getLogger(__name__)
+
+
+def _redact_diagnostic(value):
+    """Remove common credential forms before persisting diagnostic material."""
+    text = str(value or "")
+    text = re.sub(r"(?i)\b(authorization\s*[:=]\s*bearer\s+)\S+", r"\1<redacted>", text)
+    text = re.sub(r"(?i)\b(bearer\s+)\S+", r"\1<redacted>", text)
+    text = re.sub(r"(?i)\b(api[_-]?key|access[_-]?token|token|secret|password)\b(\s*[=:]\s*|\s+)[\"']?[^\s,;\"']+", r"\1=<redacted>", text)
+    return text
 try:
     import fcntl
 except ImportError:
@@ -267,6 +276,8 @@ class Runner:
 
     def _record_partial(self, run, raw, usage, elapsed, reason, tools=None):
         tools = tools or []
+        raw = _redact_diagnostic(raw)
+        reason = _redact_diagnostic(reason)
         partial = bool(raw or usage.get("total_tokens") or tools)
         summary = "partial=%s chars=%d tools=%d elapsed=%.1f usage=%s prefetch=%s" % (
             partial, len(raw), len(tools), elapsed, json.dumps(usage, ensure_ascii=False), json.dumps(self._prefetch_meta, ensure_ascii=False)
@@ -1068,7 +1079,7 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                     # Keep a bounded, redacted child diagnostic; the old code
                     # discarded stderr and made intermittent provider failures opaque.
                     diagnostic = (stderr or stdout or "")[-2000:]
-                    diagnostic = re.sub(r"(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*[^\\s]+", r"\\1=<redacted>", diagnostic)
+                    diagnostic = _redact_diagnostic(diagnostic)
                     raise RuntimeError("prefetch_exit_%s stderr=%s" % (proc.returncode, diagnostic))
                 child_result = json.loads(stdout.strip().splitlines()[-1])
                 text = str(child_result.get("text") or "").strip()
@@ -1330,6 +1341,15 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             encoding="utf-8",
         )
 
+    def _finish_tick(self, status, summary=None):
+        """Record this lock-owning tick's terminal state before returning."""
+        if self.db:
+            self.db.c.execute(
+                "update last_tick set status=?,finished_at=?,summary=? where id=1",
+                (status, time.time(), summary or status),
+            )
+            self.db.c.commit()
+
     def tick(self, goal_id=None):
         run = uuid.uuid4().hex
         started = time.time()
@@ -1350,13 +1370,6 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
         except (ValueError, AttributeError):
             pass
 
-        if self.db:
-            self.db.c.execute(
-                "insert or replace into last_tick values(1,?,?,?,?)",
-                ("running", started, None, None),
-            )
-            self.db.c.commit()
-
         os.makedirs(os.path.dirname(self.lock_path) or ".", exist_ok=True)
         f = open(self.lock_path, "a+")
         acquired = False
@@ -1366,27 +1379,38 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             acquired = self._acquire_lock(f)
             if not acquired:
                 return {"status": "busy", "run_id": run}
+            if self.db:
+                self.db.c.execute(
+                    "insert or replace into last_tick values(1,?,?,?,?)",
+                    ("running", started, None, None),
+                )
+                self.db.c.commit()
             self._check_overdue_quarantine_reviews(run)
             if os.path.exists(self.stop_file):
+                self._finish_tick("stopped")
                 return {"status": "stopped", "run_id": run}
             if os.path.exists(self.lock_path + '.auth_failed'):
                 if self.db:
                     self.db.append_event(run_id=run, kind="auth_dispatch_blocked",
                                          exit_reason=E_AUTH_FAILED,
                                          summary="Explicit credential reset required; no request dispatched")
-                    self.db.c.execute(
-                        "update last_tick set status=?,finished_at=?,summary=? where id=1",
-                        ("auth_failed", time.time(), "Credentials require operator reset"),
-                    )
-                    self.db.c.commit()
+                self._finish_tick("auth_failed", "Credentials require operator reset")
                 return {"status": "auth_failed", "run_id": run}
-            if not self.budget.allow() or not self.circuit.allow():
+            budget_allowed = self.budget.allow()
+            circuit_allowed = self.circuit.allow() if budget_allowed else False
+            if not budget_allowed or not circuit_allowed:
+                reason = "budget" if not budget_allowed else "circuit"
+                if self.db:
+                    self.db.append_event(run_id=run, kind="run_blocked",
+                                         exit_reason=reason, summary="Dispatch blocked by " + reason)
+                self._finish_tick("blocked", reason)
                 return {"status": "blocked", "run_id": run}
 
             # T5 policy reflection: 03:00-03:39 local, once per day. When it runs it
             # replaces this tick; it never touches L0 counter, surprise baseline or prompt.
             _reflect = self._policy_reflect_slot(run)
             if _reflect is not None:
+                self._finish_tick(_reflect.get("status", "reflection"))
                 return _reflect
 
             goals = [g for g in self.db.list_goals() if g.get("status") in ("approved", "active")]
@@ -1534,11 +1558,13 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                                 budget_accounted = True
                                 raw, _, tools = self._run_snapshot(final)
                                 partial, _ = self._record_partial(run, raw, usage, time.time() - started, "preempted", tools)
+                                self._finish_tick("preempted")
                                 return {"status": "preempted", "run_id": run, "remote_run_id": rid, "partial": partial, "raw_text": raw, "usage": usage}
                             time.sleep(1)
                         self.db.append_event(
                             run_id=run, kind="stuck_run", exit_reason="stop_timeout", summary=rid
                         )
+                        self._finish_tick("stuck_run")
                         return {"status": "stuck_run", "run_id": run, "remote_run_id": rid}
 
                     state = self.gateway.get_run(rid)
@@ -1549,12 +1575,14 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                         if state.get("status") == "failed":
                             # Preserve CLI stderr/stdout before propagating the failure.
                             diagnostic = (raw or state.get("stderr") or state.get("error") or "run failed")[-2000:]
-                            diagnostic = re.sub(r"(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*[^\\s]+", r"\\1=<redacted>", diagnostic)
+                            diagnostic = _redact_diagnostic(diagnostic)
                             elapsed = time.time() - started
                             tools = state.get("tool_calls") or []
                             self._record_partial(run, diagnostic, usage, elapsed, "failed", tools)
                             # F1: structured HTTP status precedes text diagnostics.
-                            _http_status = state.get('http_status') or state.get('status_code')
+                            _http_status = state.get('http_status')
+                            if _http_status is None:
+                                _http_status = state.get('status_code')
                             if _http_status is not None:
                                 _error_kind, _, _flags = classify_run(
                                     diagnostic, {'http_status': _http_status},
@@ -1582,7 +1610,7 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                             error_class = _error_kind or state.get("error_class") or "RuntimeError"
                             self.db.append_event(run_id=run, kind="run_failed", exit_reason=error_class, summary=("returncode=%s reason=%s" % (state.get("returncode"), diagnostic))[:1200])
                             # F1: quarantine dirty runs; E2 provider-exhausted is retryable
-                            if _error_kind and _error_kind != E2_PROVIDER_EXHAUSTED and _cascade_quarantine is not None:
+                            if _error_kind and _error_kind not in (E2_PROVIDER_EXHAUSTED, E_AUTH_FAILED) and _cascade_quarantine is not None:
                                 try:
                                     _cascade_quarantine(
                                         self.db.c,
@@ -1595,6 +1623,7 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                                     pass
                             exc = RuntimeError(diagnostic)
                             exc._autonomy_error_kind = _error_kind  # F8: carry kind for circuit routing
+                            exc._autonomy_http_status = _http_status
                             raise exc
                         break
                     time.sleep(self.poll_s)
@@ -1765,6 +1794,7 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 self.db.append_event(run_id=run, goal_id=goal_id, kind="thought_log_error", exit_reason=type(log_error).__name__, summary=str(log_error)[:300])
 
             self._policy_evaluate()
+            self._finish_tick("ok", summary_str)
             return {
                 "status": "ok",
                 "run_id": run,
@@ -1787,25 +1817,34 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 _exc_error_kind, _flags = classify_error_text(str(e))
                 record_t3_hits(_flags, self.db)
             if _exc_error_kind == E_AUTH_FAILED:
-                # Explicit operator reset after credentials change: remove this flag.
-                with open(self.lock_path + '.auth_failed', 'w', encoding='utf-8') as auth_flag:
-                    auth_flag.write(str(http_status or 'auth_failed'))
+                verified_status = getattr(e, "_autonomy_http_status", http_status)
+                if verified_status in (401, 403):
+                    # Operator changes credentials then explicitly removes this flag.
+                    with open(self.lock_path + '.auth_failed', 'w', encoding='utf-8') as auth_flag:
+                        auth_flag.write(str(verified_status))
+                else:
+                    self.db.append_event(
+                        run_id=run, kind="auth_text_unverified",
+                        exit_reason=E_AUTH_FAILED,
+                        summary="Auth error mentioned without verified HTTP 401/403; dispatch enabled",
+                    )
             if should_circuit_count(_exc_error_kind):
                 self.circuit.failure(http_status)
-            reason = " ".join(str(e).split())[:240]
+            reason = _redact_diagnostic(" ".join(str(e).split()))[:240]
             self.db.append_event(
                 run_id=run,
                 goal_id=goal_id,
                 kind="tick",
                 exit_reason=_exc_error_kind or type(e).__name__,
-                summary=str(raw or reason)[:300],
+                summary=_redact_diagnostic(raw or reason)[:300],
             )
             error = {"error": type(e).__name__, "reason": reason}
             if http_status is not None:
                 error["http_status"] = int(http_status)
+            self._finish_tick("failed", reason)
             return {"status": "failed", "run_id": run, "summary": error}
         finally:
-            if self.db:
+            if acquired and self.db:
                 row = self.db.c.execute("select status from last_tick where id=1").fetchone()
                 if row and row[0] == "running":
                     self.db.c.execute(
