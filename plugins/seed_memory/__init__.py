@@ -10,6 +10,7 @@ from importlib import import_module
 import os
 import re
 import random
+import shutil
 import sqlite3
 import unicodedata
 from contextlib import contextmanager
@@ -30,6 +31,14 @@ from agent.memory_provider import MemoryProvider, RecallStatus
 
 
 logger = logging.getLogger("seed_memory")
+
+
+def _worker_python_executable() -> str:
+    """Use the OS Python for workers, not Hermes' embedded runtime."""
+    system_python = Path('/usr/bin/python3')
+    if system_python.is_file():
+        return str(system_python)
+    return shutil.which('python3') or sys.executable
 
 
 def _is_blocking_auth_error(exc: BaseException) -> bool:
@@ -585,7 +594,7 @@ class SeedMemoryProvider(MemoryProvider):
     def _launch_worker_if_needed(self) -> None:
         if not self._queue_transcripts():
             return
-        import subprocess, sys
+        import subprocess
         unit_state = self._queue_dir / ".worker.unit"
         launch_lock = self._queue_dir / ".worker.launch.lock"
         with open(launch_lock, "a+") as probe:
@@ -602,7 +611,7 @@ class SeedMemoryProvider(MemoryProvider):
             unit = "hermes-seed-worker-%s-%d" % (profile, int(time.time()))
             worker_script = Path(__file__).with_name("worker.py").resolve()
             log_path = self._queue_dir / "worker.log"
-            command = ["systemd-run", "--user", "--collect", "--quiet", "--unit", unit, "--property=RuntimeMaxSec=900s", "--property=StandardOutput=append:%s" % log_path, "--property=StandardError=append:%s" % log_path, "--setenv=HERMES_HOME=%s" % self._hermes_home, "--working-directory=%s" % worker_script.parent.parent, sys.executable, str(worker_script), "--once"]
+            command = ["systemd-run", "--user", "--collect", "--quiet", "--unit", unit, "--property=RuntimeMaxSec=900s", "--property=StandardOutput=append:%s" % log_path, "--property=StandardError=append:%s" % log_path, "--setenv=HERMES_HOME=%s" % self._hermes_home, "--working-directory=%s" % worker_script.parent.parent, _worker_python_executable(), str(worker_script), "--once"]
             try:
                 result = subprocess.run(command, capture_output=True, text=True, timeout=10)
             except FileNotFoundError:
@@ -616,7 +625,7 @@ class SeedMemoryProvider(MemoryProvider):
                     return
                 logger.warning("systemd-run submit failed rc=%s; falling back to foreground seed worker", result.returncode)
             try:
-                self._worker_proc = subprocess.Popen([sys.executable, str(worker_script), "--once"], cwd=str(worker_script.parent.parent), env={**os.environ, "HERMES_HOME": str(self._hermes_home)}, stdin=subprocess.DEVNULL, stdout=open(log_path, "ab", buffering=0), stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
+                self._worker_proc = subprocess.Popen([_worker_python_executable(), str(worker_script), "--once"], cwd=str(worker_script.parent.parent), env={**os.environ, "HERMES_HOME": str(self._hermes_home)}, stdin=subprocess.DEVNULL, stdout=open(log_path, "ab", buffering=0), stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
                 logger.warning("queue worker launched foreground fallback pid=%s", self._worker_proc.pid)
             except Exception:
                 logger.exception("queue worker launch failed")
