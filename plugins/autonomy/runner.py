@@ -1,5 +1,7 @@
 import os, uuid, json, hashlib, threading, time, signal, re, subprocess, sys, statistics
 from datetime import datetime, timezone
+import logging
+logger = logging.getLogger(__name__)
 try:
     import fcntl
 except ImportError:

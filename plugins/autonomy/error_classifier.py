@@ -61,6 +61,7 @@ E3_TURN_BUDGET_EXCEEDED = "turn_budget_exceeded"
 E4_PROCESS_CRASHED = "process_crashed"
 E_UNCLASSIFIED = "unclassified"       # failed with no recognized signal
 E_AUTH_FAILED = "auth_failed"         # 401/403 — stop dispatch, never retry
+E_ENDPOINT_MISCONFIGURED = "endpoint_misconfigured"  # 404; manual endpoint/model check
 
 # T2 content-contract labels (not E1-E4 but still quarantine-worthy)
 T2_EMPTY_RESPONSE = "empty_response"
@@ -147,7 +148,7 @@ _REFUSAL_RE = re.compile(
     r"As\s+an\s+AI\b|"
     r"I\s+(?:cannot|can't|won't)\s+(?:help|assist|provide|do|create|generate)|"
     r"I\s+don't\s+have\s+(?:the\s+ability|access|permission)|"
-    r"对不起，我(?:无法|不能|不可以)|"
+    r"(?:对不起|抱歉)，?我(?:无法|不能|不可以)|"
     r"作为(?:一个)?AI|"
     r"我(?:无法|不能|不可以)(?:帮助|提供|执行|完成|生成)|"
     r"这超出了我的能力范围"
@@ -314,6 +315,8 @@ def classify(
 
     if isinstance(http_status, int) and http_status in _PROVIDER_EXHAUSTED_HTTP:
         return (E2_PROVIDER_EXHAUSTED, False, [])
+    if isinstance(http_status, int) and http_status == 404:
+        return (E_ENDPOINT_MISCONFIGURED, False, [])
 
     # ------------------------------------------------------------------
     # T1d — E3: turn budget exhausted
@@ -435,7 +438,7 @@ def should_circuit_count(error_kind: Optional[str]) -> bool:
     E_AUTH_FAILED is a config issue, not a code bug — do not count.
     """
     if error_kind in (E2_PROVIDER_EXHAUSTED, E3_TURN_BUDGET_EXCEEDED,
-                      E_AUTH_FAILED):
+                      E_AUTH_FAILED, E_ENDPOINT_MISCONFIGURED):
         return False
     # E1_STATE_DB_CORRUPTED, E4_PROCESS_CRASHED, T2 labels → count
     return True
