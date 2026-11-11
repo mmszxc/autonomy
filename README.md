@@ -1,232 +1,288 @@
-# autonomy —— 让 Hermes 在没人说话时，也会自己醒来想一想
+# Hermes Autonomy + Seed Memory：从零安装教程
 
-**autonomy** 是 Hermes Agent 的“独处思考”插件：由定时器触发，每轮回顾记忆、进行自主思考，并把过程写入本地日志。配套的 **seed_memory** 插件把经历保存为带情绪和重要度的“种子”，供后续轮次检索。
+面向第一次接触 Hermes Agent 的用户，以 **Ubuntu Linux + 一个名为 `mybot` 的 profile** 为例。复制命令前先看注释；下文的 `mybot`、模型名称、服务地址都是示例，请按你的实际环境替换。**不要把 API key 提交到 Git。**
 
-> **状态**：持续迭代中，最近更新 2026-11-09。已在 Hermes v0.22.5 + Ubuntu 24 上验证，面向 Hermes v0.22.x。
+- `autonomy` 是自主思考的“大脑”：按定时任务唤醒 Hermes，读取环境和记忆，执行一轮思考（称为 **tick**）。
+- `seed_memory` 是记忆的“灵魂”：把会话归纳成 **seed（记忆种子）**，写入 SQLite 数据库，并供以后检索。队列中的文件由后台 **worker（处理进程）** 消费。
+- **profile** 是一个机器人的独立配置和数据目录；不同 profile 可以用不同模型，不共用记忆。
 
-## 快速开始
+> 本项目仅保证 Ubuntu 24.04 等 Linux 环境；不保证 Windows 原生运行。插件是 Hermes Agent 的扩展，**不能代替 Hermes Agent 本体**。
 
-安装器只接受已经存在的 Hermes profile；不会创建 profile，也不会修改数据库、`SOUL.md`、认证文件或环境文件。
+[screenshot: 安装完成后的终端、timer 和 viewer 总览]
 
-```bash
-# 1. 获取代码
-git clone https://github.com/mmszxc/autonomy.git && cd autonomy
+## 前置准备：先装 Hermes Agent
 
-# 2. 安装插件、CPU 依赖/模型和用户级定时器
-./install.sh --profile xiaozhi
+1. 准备 Ubuntu 24.04、可用的模型 API 或本地 Ollama、`git`、`python3`、`systemd --user`；安装系统工具：
 
-# 3. 验证安装
-hermes -p xiaozhi autonomy status && systemctl --user status xiaozhi-autonomy.timer
-```
+   ```bash
+   sudo apt update
+   sudo apt install -y git python3 python3-venv sqlite3
+   ```
 
-安装后的下一步：
+2. **先按 [Hermes Agent 官方仓库](https://github.com/NousResearch/hermes-agent) 的当前安装说明安装并完成首次配置**。官方安装命令和依赖可能随版本改变，请以该仓库 README 为准，不建议复制过期的第三方安装脚本。本教程从 `hermes` 已能运行开始：
 
-```bash
-hermes -p xiaozhi autonomy tick
-systemctl --user status xiaozhi-autonomy.timer
-```
+   ```bash
+   command -v hermes
+   hermes --help
+   systemctl --user --version
+   ```
 
-安装选项速查：`--yes` 用于自动化确认，`--skip-ml` 只安装插件，`--no-timer` 不写入或启用定时器，`--force` 仅在确认备份并替换已有 unit 时使用。大体积依赖默认要求交互确认。
+   **成功标志：**第一条输出 `hermes` 可执行文件路径，第二条打印帮助而不是 `command not found`；最后一条显示 systemd 版本。若失败，先完成官方安装、重新登录以刷新 PATH，再继续。后面的 systemd 服务同样需要能在该用户的 PATH 下找到 `hermes`。
 
-安装器不会覆盖 profile 中的数据库、身份文件、认证文件或环境文件。手工安装、固定模型版本、离线验证、systemd 与回滚说明见 [`docs/install_ubuntu24_profile_xiaozhi.md`](docs/install_ubuntu24_profile_xiaozhi.md)。仓库不包含模型权重或大体积 Python vendor。
+> 下文只在**当前普通用户**的 `~/.hermes` 中操作，不要用 `sudo` 运行 Hermes 或把配置文件放到 `/root` 下。
 
-## Profile 安装部署（交互式向导）
-
-多 profile 生产部署建议使用 [`scripts/install_profile.sh`](scripts/install_profile.sh)。它自行逐项询问 profile、模型、provider、endpoint、密钥环境变量名、viewer 端口以及 tick/challenge 错峰分钟，不调用 Hermes 自带的交互式 `autonomy init`（无人值守时该命令会卡在模型选择）。执行前必须确认：目标主机已授权、Hermes Agent 正在运行，且本仓库已 checkout 到准备部署的提交。非 login shell 可能找不到 `hermes`，向导默认使用 `/home/hermes/.local/bin/hermes`，也可在询问时指定绝对路径。
-
-```bash
-# 示例值均为占位符；密钥通过隐藏输入写入 profile-local .env
-./scripts/install_profile.sh
-```
-
-向导按以下门禁顺序执行，任一步失败立即停止并逐项回滚：
-
-1. 收集 profile、`model.default`、provider/custom provider、`base_url`、`key_env`、viewer 端口和两个错峰分钟。
-2. 把现有 config、`.env`、两个插件和相关 user unit 备份到带 UTC 时间戳的目录。备份只用于逐文件回滚，**不用于整 profile 恢复**。
-3. 直接从目标 Git commit 读取 blob 原始 bytes，用 Git blob SHA-1 逐文件复核后，原子安装 `autonomy` 与 `seed_memory`。绝不触碰 `state.db`、`state.db-*`、`gateway.lock`、`logs/` 或 `runtime/`。
-4. 逐项更新 `config.yaml`：`plugins.enabled` 同时包含 `autonomy` 与 `seed_memory`；model/provider/endpoint/`${ENV_VAR}` 自洽；custom provider 的 `key_env` 与 `.env` 变量名相同；memory provider 指向 profile-local seed DB/queue/source，并显式设置 `write_enabled: true` 与 tagger model/provider；autonomy 使用 profile-local data/paths，首次部署默认为 `observe_only`。
-5. 以隐藏输入写 credential 到 `.env` 并设置 `0600`，不回显密钥；随后执行配置与环境变量静态门。
-6. 执行 `hermes -p <profile> gateway restart` 刷新该 profile 句柄；必须收到 ACK、共享 gateway PID 不变，且操作后没有新增 `StateDbReplacedError`。
-7. 预检 `plugins list`、`autonomy --help`，并确认 `autonomy`、`seed_memory` 均为 enabled/user 且 seed_memory 已 registered/activated。
-8. 用 `nohup` 非交互执行一次首 tick；必须 `exit_reason=ok`，并确认实际 model/provider 与配置相同。
-9. 验收 `autonomy.db`：`sqlite_master` 至少含 `schema_meta`、`events`、`receipts`、`evidence`、`evidence_challenges`、`budget_ledger`；同时要求 tick 成功、`seeds.db` 存在且 viewer HTTP 200。
-10. 只有所有门禁全绿，才按错峰分钟 enable/start autonomy、challenge 和 viewer units，避免多个 profile 同分钟争抢内存。
-
-### 部署踩坑与安全边界
-
-- **没有 `autonomy migrate` 命令。** DB 在首次打开时自动 migration；验收查 `sqlite_master`，版本表名是 `schema_meta`，不是 `schema_version`。
-- **`seed_memory` 必须写进 `plugins.enabled`。** 它虽是 memory provider，但未进插件目录会报 `not in plugin catalog`，provider 也无法加载。
-- **`memory.seed_memory.write_enabled` 必须为 `true`。** 缺少该项或设为 false 会进入 read-only gray mode，只能读已有记忆，不能写入新种子。`source_root` 应指向当前 profile 的 `plugins/seed_memory/seed_src`；tagger model/provider 可单独指定，留空时向导默认跟随主 model/provider。
-- **严禁整目录替换 profile 或替换 `state.db`。** 常驻共享 gateway 会继续持有旧 inode，触发 `StateDbReplacedError`，还可能被 autonomy 表面化为 `model connection request_failed`。刷新只能用官方 `hermes -p <profile> gateway restart`；它刷新单 profile，不应重启共享进程或影响其他 profile。
-- **传输必须保留原始 bytes。** 使用 Git object/blob SHA 校验；不要用 PowerShell 文本管道或 `Out-File` 传文件，否则 systemd unit 可能被压成单行并报 `Invalid section header`。
-- 模型返回 HTTP 503/`overloaded` 时，先停止部署并换用可用 provider/model；可先只读请求 `<gateway>/v1/models` 核对清单。
-- 密钥只进入权限 `0600` 的 `.env`，不得写入文档、日志或消息；所有示例必须使用占位符。
-- 回滚仅逐项恢复 config、`.env`、插件、units 和本轮创建的 autonomy data；随后做 per-profile restart。绝不整 profile 恢复，绝不改变 `state.db` inode。审计记录只保留时间、命令、返回码和输出路径，不得包含密钥。
-
-## 它是怎么工作的
-
-一轮 tick 的生命周期可以概括为：
-
-```text
-定时器唤醒
-    → 读取近期记忆与目标
-    → 自主思考并按策略执行动作
-    → 写入 transcript / thought / receipt / evidence
-    → 更新预算账本；异常时进入熔断
-```
-
-每轮是一次可审计的短任务，完成后退出，不依赖常驻推理进程。行动、失败、超时、资源异常和无行动都有对应的收据；观察模式下仍记录证据，但不会把学习候选直接晋升为生产策略。
-
-## P0 证据与安全护栏
-
-- **证据与收据层**：动作结果留下 SHA-256 收据和证据缓冲，可由独立 challenge job 按证据流复核；证据状态区分 `unverified`、`verified`、`mismatched` 与 `expired`。
-- **预算账本**：预算按 80/10/10 分层，分别约束正常行动、记忆/观察开销与学习/演化开销；每次消耗写入 ledger，避免只看进程日志。
-- **分层熔断**：正常行动与学习/晋升使用不同护栏。`closed`、`open`、`half-open` 状态控制故障恢复，学习候选不能绕过审核直接进入 active 策略。
-- **observe-only**：设置 `autonomy.p0.mode: observe_only` 可保持正常观察、收据和证据写入，同时阻断 learning、candidate generation、experiment allocation 与 promotion，适合首次部署和观察期。
-
-## 功能特性
-
-- **独处思考**：`autonomy tick` 执行单轮任务，完成后退出，不留下常驻推理进程。
-- **记忆优先**：模型调用前预取 seed_memory；失败时安全降级。激活目标的标题与描述会注入检索上下文，事件摘要会剥离遥测噪声。
-- **查询轮换**：预取查询在 12 种主题间轮换，其中包含 2 条休眠种子诊断查询，避免每轮只触达相同种子。
-- **模型模式**：自主模型留空时继承主模型；指定独立模型时可并行运行。
-- **预算与熔断**：每日调用、上下文和提示额度，以及 closed/open/half-open 熔断状态。
-- **停止与恢复**：支持 `stop`、`resume`、`reset-circuit` 和抢占标记。
-- **完整过程日志**：记录 assistant 文本、工具调用摘要和预取种子 ID，并对敏感字段打码；连续相同工具调用自动折叠。
-- **保尾摘要**：喂给 seed_memory 的文本保留头部与尾部上下文；打满 `max_turns` 时从最近助手消息和工具调用自动合成摘要。
-- **每日日记**：在本地时间 21:00–24:00 窗口内触发当日反思与次日计划，注入次日首轮提示词。
-- **结构化记忆**：SQLite 种子库、后台队列、语义检索、重要度/时效排序。
-- **因果记忆与队列治理**：可选 `recent_seeds` 与 `caused_by` / `led_to`；毒丸文件在重试超限后隔离到 `_failed/`；去重与处理结果写入数据目录统计文件。
-- **受控自我进化**：成员可在自己的插件目录修改代码；符合标准的改动经审核后合并主版本，候选策略与 active 策略隔离。
-
-## 适用环境
-
-| 项目 | 说明 |
-| --- | --- |
-| Hermes Agent | v0.22.x（已在 0.22.5 验证） |
-| 操作系统 | Ubuntu 24，Linux x86_64 |
-| Python | 以 Hermes 自带 Python 为准；已验证 CPython 3.14 |
-| 权限 | 普通用户；systemd 使用用户级单元 |
-| Windows | 不作为生产运行环境；`fcntl`、systemd 和 Linux 二进制依赖不适用 |
-
-## 仓库结构
-
-```text
-identity/                         示例身份文件
-plugins/autonomy/                 自主思考、P0 证据与收据层
-plugins/seed_memory/              后台队列与 Seed 核心代码
-  worker.py
-  seed_src/hermes/
-tests/                            可独立运行的插件测试
-tools/                            打包、日志查看、归档和验证工具
-docs/                             面向使用者的说明
-deploy/systemd/                   通用用户级 systemd 模板
-```
-
-## 运行数据目录
-
-推荐布局：
-
-```text
-<HERMES_HOME>/seed_data/
-  seeds/seeds.db
-  seed_queue/
-<HERMES_HOME>/autonomy_data/
-  autonomy.db
-  thoughts.log
-  STOP_AUTONOMY
-  LAST_USER_ACTIVITY
-  PREEMPT_NOW
-```
-
-插件兼容检测旧的 `seeds/`、`seed_queue/` 和 `autonomy/` 位置；新部署应使用统一布局。数据库、日志和队列均不应提交到 Git。
-
-## 常用命令
-
-| 命令 | 用途 |
-| --- | --- |
-| `hermes autonomy init` | 初始化配置并自检 |
-| `hermes autonomy status` | 查看模式、预算、熔断和数据路径 |
-| `hermes autonomy log -n 3` | 查看最近思考；支持 `--full`、`--seeds`、`--tools`、`--json` |
-| `hermes autonomy tick` | 手工执行一轮 |
-| `hermes autonomy stop` | 创建停止标记，暂停新轮次 |
-| `hermes autonomy resume` | 删除停止标记并恢复 |
-| `hermes autonomy reset-circuit` | 清理熔断状态 |
-
-带 profile 时使用：
+## 第一步：新建机器人 profile
 
 ```bash
-hermes -p <PROFILE> autonomy <子命令>
+# 将 mybot 换成你自己的英文短名称，后文保持一致
+export PROFILE=mybot
+export PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE"
+hermes init --profile "$PROFILE"
+ls -ld "$PROFILE_HOME"
 ```
 
-## 每小时运行
-
-`deploy/systemd/` 提供通用模板。复制到用户级 systemd 配置目录后，替换 `<PROFILE>`、`<HERMES_HOME>` 和 `<HERMES_BIN_DIR>`，再执行：
+如果你安装的 Hermes 版本没有 `init --profile`，先执行 `hermes --help` 查看其 profile 初始化命令；也可以手工创建**目录骨架**，然后按第三步建立 `config.yaml`：
 
 ```bash
+mkdir -p "$PROFILE_HOME/plugins" "$PROFILE_HOME/autonomy_data" "$PROFILE_HOME/seed_data/seeds"
+```
+
+**成功标志：**`ls -ld "$PROFILE_HOME"` 能看到目录。该目录下的 `config.yaml` 是此机器人的配置；`plugins/` 放插件；`autonomy_data/` 和 `seed_data/` 存数据。手工建目录不等于已经完成 Hermes 自身的 API/模型初始化。
+
+[screenshot: ~/.hermes/profiles/mybot 目录结构]
+
+## 第二步：下载仓库并安装两个插件
+
+在**运行 Hermes 的同一台机器、同一个 Linux 用户**下：
+
+```bash
+cd "$HOME"
+git clone https://github.com/mmszxc/autonomy.git
+mkdir -p "$PROFILE_HOME/plugins"
+cp -a "$HOME/autonomy/plugins/autonomy" "$PROFILE_HOME/plugins/"
+cp -a "$HOME/autonomy/plugins/seed_memory" "$PROFILE_HOME/plugins/"
+ls -ld "$PROFILE_HOME/plugins/autonomy" "$PROFILE_HOME/plugins/seed_memory"
+```
+
+**成功标志：**两个目录都存在，并能找到 `plugins/autonomy/tick.py`、`plugins/seed_memory/worker.py`。更新时**先备份再替换**；备份放在 `~/.hermes/deploy_backups/`，**不要**把旧插件目录留在 `plugins/` 内，以免被重复加载。
+
+如果仓库在笔记本、Hermes 在另一台 Linux 机器，先在**目标机器**创建 profile 的 `plugins/`，再从笔记本运行下面的示例（把占位符换成真实 SSH 用户、主机和 home；示例不含真实服务器地址）：
+
+```bash
+scp -r ./autonomy/plugins/autonomy ./autonomy/plugins/seed_memory \
+  '<ssh-user>@<your-server>:~/.hermes/profiles/mybot/plugins/'
+```
+
+> `scp` 中 `~` 的展开依 SSH 服务端而异；传输后请登录目标机器运行上述 `ls -ld` 核实目录。跨机器的 `PROFILE_HOME` 必须指向**目标机器**的 home。
+
+[screenshot: 两个插件均安装在 profile/plugins 下]
+
+## 第三步：配置自主思考模型和记忆
+
+模型是 Hermes 思考时调用的 AI 服务。先确认你已经通过 Hermes 官方说明配置好模型及访问凭据，再用编辑器打开 profile 配置：
+
+```bash
+nano "$PROFILE_HOME/config.yaml"
+```
+
+**完整示例 A：本机 Ollama（OpenAI 兼容接口）**。先安装并启动 [Ollama](https://ollama.com/download)，拉取你实际可运行的模型，验证 `curl http://127.0.0.1:11434/api/tags` 能连接；以下模型名 `qwen2.5:7b` 仅为示例。不同 Hermes 版本对 custom provider 命名可能有差异，请以 Hermes 自身的模型配置文档和 `hermes --help` 核对。
+
+```yaml
+# ~/.hermes/profiles/mybot/config.yaml
+model:
+  default: qwen2.5:7b
+  provider: custom:local-ollama
+providers:
+  local-ollama:
+    api: http://127.0.0.1:11434/v1
+    key_env: OLLAMA_API_KEY
+
+autonomy:
+  enabled: true
+  p0:
+    mode: normal
+  max_turns: 8
+  max_seconds: 300
+  interval_minutes: 20
+  memory:
+    provider: seed_memory
+  memory_provider: seed_memory # 兼容较早读取平铺键的版本
+  peer_share:
+    enabled: false
+
+memory:
+  provider: seed_memory
+  seed_memory:
+    write_enabled: true
+```
+
+如 Hermes/Ollama 客户端要求非空 key，可在 profile 专属的 `.env` 中设置 `OLLAMA_API_KEY=ollama`；**不要在公开配置文件或截图中暴露真实密钥**。
+
+**完整示例 B：远程 OpenAI 兼容 API**。将 `<your-api-host>`、`<your-model-id>` 换成服务商提供的地址与模型标识；这是占位符，不是可用的公共服务。使用 HTTPS，避免把密钥写入 YAML：
+
+```yaml
+# ~/.hermes/profiles/mybot/config.yaml
+model:
+  default: <your-model-id>
+  provider: custom:my-openai
+providers:
+  my-openai:
+    api: https://<your-api-host>/v1
+    key_env: MY_MODEL_API_KEY
+
+autonomy:
+  enabled: true
+  p0:
+    mode: normal
+  max_turns: 8
+  max_seconds: 300
+  interval_minutes: 20
+  memory:
+    provider: seed_memory
+  memory_provider: seed_memory
+  peer_share:
+    enabled: false
+
+memory:
+  provider: seed_memory
+  seed_memory:
+    write_enabled: true
+```
+
+将 `MY_MODEL_API_KEY=...` 放进 Hermes 支持的 profile `.env` 或 systemd 的受限 `EnvironmentFile=`，并执行 `chmod 600 "$PROFILE_HOME/.env"`；具体加载机制请按所装 Hermes 版本确认。**不要覆盖原 `config.yaml` 中已经存在的其他设置：把示例字段合并进去。**
+
+**最容易填错的路径：**
+
+- 必须是嵌套的 `autonomy.p0.mode: normal`，不是 `autonomy.p0_mode: normal`；`normal` 才启用正常运行模式。
+- 顶层 `memory.provider: seed_memory` 给 Hermes 记忆桥使用，`autonomy.memory.provider: seed_memory` 给 autonomy Runner 使用；`autonomy.memory_provider` 是兼容键。它们**不是**同一处配置。
+- 必须是 `memory.seed_memory.write_enabled: true`，旧键 `seed_memory.enabled` 不能替代它。
+- `model.default` 和 `model.provider` 是两层不同字段；模型标识、provider 名称以及 `/v1` API 地址须与实际服务和 Hermes 版本一致。
+- `autonomy.max_turns` 控制每轮允许的对话步数，`autonomy.max_seconds` 限制单轮耗时；timer 的间隔最终以第五步 `.timer` 文件为准，改 `interval_minutes` 后也要同步修改 timer。
+
+**成功标志：**`config.yaml` 可被 YAML 解析，`hermes` 可访问你所选的模型，且 `autonomy.p0.mode` 确实是 `normal`。如需本地验证 YAML，可用安装了 PyYAML 的 Python 执行 `python3 -c 'import yaml; yaml.safe_load(open("config.yaml"))'`（先 `cd "$PROFILE_HOME"`）；没有 PyYAML 不代表 Hermes 插件不可运行。
+
+[screenshot: config.yaml 层级示意，敏感字段打码]
+
+## 第四步：准备数据目录与数据库
+
+```bash
+mkdir -p "$PROFILE_HOME/autonomy_data" "$PROFILE_HOME/seed_data/seeds"
+ls -ld "$PROFILE_HOME/autonomy_data" "$PROFILE_HOME/seed_data/seeds"
+```
+
+**成功标志：**两个目录存在。**不必手工创建空 `.db` 文件**：首次正常 tick 会初始化 `autonomy_data/autonomy.db`，`seed_memory` 首次实际写入时初始化 `seed_data/seeds/seeds.db`。实际的 seed 库在 `seed_data/seeds/`，不要把 `autonomy_data/seeds.db` 当成同一个库。模型处理和后台 worker 可能有延迟，第一次 tick 后 seed 计数仍为 0 时先看队列和日志。
+
+## 第五步：用 systemd user timer 定时思考（Ubuntu）
+
+`service` 是执行一次 tick 的命令，`timer` 是定时唤醒它的闹钟。下面的示例每 20 分钟运行一次；`%h` 代表当前 Linux 用户的 home。**先检查你机器上可用的 Python 解释器**：`python3 -m autonomy.tick` 所在环境必须能导入 Hermes、autonomy 及其依赖；Hermes 官方安装的 Python 环境若不同，请把 `ExecStart` 中的 `/usr/bin/python3` 改为该环境的 Python 绝对路径（不是让你改 worker 的解释器）。
+
+```bash
+mkdir -p "$HOME/.config/systemd/user"
+cat > "$HOME/.config/systemd/user/mybot-autonomy.service" <<'UNIT'
+[Unit]
+Description=Hermes autonomy tick for mybot
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.hermes/profiles/mybot
+Environment=HERMES_HOME=%h/.hermes/profiles/mybot
+Environment=PYTHONPATH=%h/.hermes/profiles/mybot/plugins:%h/.hermes/hermes-agent
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 -m autonomy.tick --hermes-home %h/.hermes/profiles/mybot
+TimeoutStartSec=1800
+UNIT
+
+cat > "$HOME/.config/systemd/user/mybot-autonomy.timer" <<'UNIT'
+[Unit]
+Description=Run mybot autonomy every 20 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=20min
+Unit=mybot-autonomy.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
 systemctl --user daemon-reload
-systemctl --user enable --now <profile>-autonomy.timer
-systemctl --user list-timers --all
-journalctl --user -u <profile>-autonomy.service -n 50 --no-pager
+systemctl --user enable --now mybot-autonomy.timer
+systemctl --user list-timers --all | grep mybot-autonomy
 ```
 
-模板名称只是示例，可以按 profile 重命名。需要注销后继续运行时，请按发行版策略启用用户服务驻留。
+若 Hermes 不安装在 `%h/.hermes/hermes-agent`，请将 `PYTHONPATH` 的第二段改为 Hermes Agent 源码/安装位置；如它已安装为系统 Python 包，则不需要那一段。若需要读取 `.env` 中的模型 key，在 service 的 `[Service]` 段加入 `EnvironmentFile=%h/.hermes/profiles/mybot/.env`（先确保文件存在并 `chmod 600`）；修改后重新 `daemon-reload`。不要把 key 直接写到 unit 文件或 README。
 
-## 只读网页查看器
-
-`tools/viewer/viewer.py` 是独立的 Python 标准库小程序，不导入插件、不连接模型，也不写 profile 数据。它只读展示最近自主思考、工具调用、种子、预算、熔断、timer 和队列状态。
+**成功标志：**`systemctl --user list-timers --all` 显示 `mybot-autonomy.timer`，并有非空的 `NEXT` 时间。也可手动试跑一轮：
 
 ```bash
-python3 tools/viewer/viewer.py --profile xiaozhi
+systemctl --user start mybot-autonomy.service
+journalctl --user -u mybot-autonomy.service -n 50 --no-pager
 ```
 
-默认监听 `0.0.0.0:8765`。可用 `--host`、`--port` 或环境变量 `HERMES_VIEWER_HOST`、`HERMES_VIEWER_PORT` 修改。默认无鉴权，**只应在可信网络中开放**；如需简单口令保护，可使用 `--token '长随机口令'`，客户端通过 Bearer header 或 URL 参数提交；URL 参数可能进入浏览器历史，生产环境更建议使用 Bearer header、反向代理或其他安全认证层。部署前确认端口未被占用，并结合主机防火墙限制来源。
+`systemctl start` 成功只说明 service 运行结束，**不等于** tick 的业务结果是 `exit_reason=ok`；还需按下文查数据库。服务器上用户退出登录后若 timer 不再触发，请向管理员咨询 `loginctl enable-linger "$USER"` 是否合适。
 
-## 示例身份文件
+[screenshot: systemctl --user list-timers 显示下一次触发时间]
 
-`identity/SOUL.md` 是仓库提供的示例身份文件，不是插件运行所必需，也不会由安装步骤自动覆盖到 profile。你可以阅读、采用或替换为自己的身份文件。
+## 第六步：打开 viewer 查看页面
 
-## 测试
+viewer 是这个仓库另带的**可视化工具**，不会因为安装两个插件就自动出现在 `~/.local/lib/xiaozhi-viewer/`。先从**刚下载的本仓库**拷贝 `tools/viewer/`（其中包括 `viewer.py` 和 `viewer_app/`）：
 
 ```bash
-python3 -m pytest tests -q
+mkdir -p "$HOME/.local/lib/xiaozhi-viewer"
+cp -a "$HOME/autonomy/tools/viewer/." "$HOME/.local/lib/xiaozhi-viewer/"
+/usr/bin/python3 "$HOME/.local/lib/xiaozhi-viewer/viewer.py" --help
 ```
 
-测试不会要求真实 API 凭据，不应连接生产模型。Linux 专有锁和 systemd 行为应在临时 profile 或测试机器验证。
+此 viewer 基于 Python 标准库，不需要为它单独执行 `pip install`。`--help` 应打印 `--profile`、`--profile-home`、`--host` 等选项；若缺模块，先核实 `viewer_app/` 与脚本一起复制。
 
-## 安全建议
+本机访问时优先绑定 `127.0.0.1`，需要其他电脑访问且已经配置防火墙/认证时才绑定 `0.0.0.0`：
 
-- 不提交环境文件、密钥、数据库、种子归档、思考日志、模型或二进制依赖。
-- 首次部署使用临时 profile。
-- systemd 模板包含占位符，替换后再启用。
-- 部署现场的额外安全边界可逐行写入 `<autonomy_data>/extra_rules.txt`，不应硬编码进公开源码。
+```bash
+/usr/bin/python3 "$HOME/.local/lib/xiaozhi-viewer/viewer.py" \
+  --profile mybot --profile-home "$PROFILE_HOME" --host 127.0.0.1 --port 8766
+# 仅确认已做好访问控制、确需局域网远程访问时：--host 0.0.0.0
+```
 
-## 贡献
+同机浏览器打开 `http://127.0.0.1:8766`；如你**有意**开放到内网，可从另一台机器打开 `http://<server-ip>:8766`。公网不要裸露开放 viewer；可用 SSH 端口转发：`ssh -L 8766:127.0.0.1:8766 <ssh-user>@<your-server>` 后在本地访问 `http://127.0.0.1:8766`。
 
-欢迎 issue 和 pull request。贡献说明见 `CONTRIBUTING.md`。
+**成功标志：**终端显示 viewer 启动/监听端口，浏览器能打开页面，看见该 profile 的思考日志和种子（刚安装时为空是正常的）。具体页面功能随仓库版本变化。
 
-涉及底层契约、成员改装或主版本吸收时，请同时参考 [`docs/DESIGN_PRINCIPLES.md`](docs/DESIGN_PRINCIPLES.md)。
+[screenshot: viewer 首页和种子列表]
 
-## 近期变更
+## 验证是否真正跑通
 
-### 2026-11-06～09（P0 证据层上线）
+至少等一次 timer 触发，或者手动 `systemctl --user start mybot-autonomy.service`。随后逐项核实：
 
-- 增加结构化 evidence、receipt、budget ledger 与事件审计，六类动作终态均可追踪。
-- 增加 80/10/10 预算护栏、分层熔断和 `observe_only` 安全姿态。
-- 增加独立 evidence challenge 调度：按证据流进行严格 framed 解析、SHA-256 校验，并区分 `verified`、`mismatched`、`expired` 与不可用证据。
-- 隔离 candidate 与 active 策略；观察模式下不会执行 learning、experiment allocation 或 promotion。
-- 修复 evidence challenge 的 stream 哈希口径与 framing 解析，避免将合并缓冲误判为单流证据不一致；对应发布提交为 `e731889`。
+```bash
+systemctl --user list-timers --all | grep mybot-autonomy
+journalctl --user -u mybot-autonomy.service -n 80 --no-pager
+sqlite3 "$PROFILE_HOME/autonomy_data/autonomy.db" \
+  'SELECT kind, exit_reason, substr(summary,1,120) FROM events ORDER BY id DESC LIMIT 15;'
+sqlite3 "$PROFILE_HOME/autonomy_data/autonomy.db" \
+  'SELECT status, started_at, finished_at FROM last_tick;'
+sqlite3 "$PROFILE_HOME/seed_data/seeds/seeds.db" 'SELECT count(*) FROM seeds;'
+ls -lah "$PROFILE_HOME/seed_data/seed_queue" 2>/dev/null
+```
 
-### 2026-11-04（P0 止血修复）
+**成功标志：**timer 有下一次触发时间；本轮 tick 的 `events` / `last_tick` 显示正常结束（目标 `exit_reason=ok`，不是 `run_timeout`、`RuntimeError` 或 `degraded`）；`memory_prefetch` 不报 degraded；经过有内容的会话和 worker 处理后，`seeds` 数量增加，viewer 能展示数据。没有可提取的内容时，`memory_prefetch=empty` 或 seed 数量暂时为 0 **不一定是故障**。数据库结构随插件版本可能变化，先运行 `sqlite3 "$PROFILE_HOME/autonomy_data/autonomy.db" '.schema events'` 核对列名。
 
-- 修复转录提取顺序、空摘要、摘要截头丢尾、事件噪声和 goals 未传入预取等问题。
-- 增强转录折叠与异常处理，减少日志冗余并提高长轮次稳定性。
+[screenshot: events 正常记录、seeds count 大于零]
 
-### 2026-11-03（Phase 1B）
+## 常见问题 FAQ
 
-- 新增每日日记、查询轮换、休眠种子诊断、结构化因果记忆和队列治理。
-- 修复备份插件目录覆盖问题：备份目录中的 manifest 应停用，避免静默覆盖 canonical 插件。
+**Q：timer 停了、过了 20 分钟也没运行？** 先执行 `systemctl --user status mybot-autonomy.timer`、`systemctl --user list-timers --all`；必要时 `systemctl --user start mybot-autonomy.timer`，再查 `journalctl --user -u mybot-autonomy.service -n 100 --no-pager`。如果已部署更新，务必确认 timer 在结束维护后重新启动并且 `NEXT` 非空。
 
-## 许可证
+**Q：tick 总是 `run_timeout`？** 检查模型 API 可达性及调用耗时；减小 `autonomy.max_turns`、在明确了解资源限制后调大 `autonomy.max_seconds`，或换更快的模型。**不要把 systemd service 启动成功当成 tick 成功**；在数据库查最终 `exit_reason`。改配置、unit 后重新执行 `systemctl --user daemon-reload`，按需要重启 timer。
 
-本仓库所有内容（包括 `identity/SOUL.md`）均以 **MIT License** 发布，见根目录 `LICENSE`。
+**Q：worker 不消费队列、seeds 一直 0？** 检查 `"$PROFILE_HOME/seed_data/seed_queue"` 中的 `session_*.json` 或时间戳开头的 JSON，再看目录下的 `worker.log`；worker 是后台任务，可能仍在做慢速模型提取。若日志报失败，先看具体异常、模型凭据和数据库权限，不要直接删除队列文件。seed 库在 `seed_data/seeds/seeds.db`，不是 `autonomy_data/seeds.db`。
+
+**Q：worker 提示 `No module named yaml` / `numpy`？** 自动 worker 使用 Hermes 随附/嵌入式 Python 及插件提供的按需 YAML 加载；不要擅自把它改成 `/usr/bin/python3`，系统 Python 可能缺 numpy。确认安装的是本仓库最新 `seed_memory`、检查 worker.log 和对应解释器环境。不要仅凭 `worker` 进程退出码 0 判定已有 seed，实际执行 SQL 查计数。
+
+**Q：`memory_prefetch=degraded`？** 核实 `memory.provider` 与 `autonomy.memory.provider` 均为 `seed_memory`；`autonomy.p0.mode` 为 `normal`，然后查 `events.summary` 中的真实异常。只配置顶层 provider 不会自动使 autonomy Runner 使用 seed_memory。
+
+**Q：viewer 在另一台机器打不开？** 确认进程确实监听 8766；`127.0.0.1` 只能在本机或 SSH 隧道访问，`0.0.0.0` 需要配合网络防火墙与认证。不要把未经保护的 viewer 直接暴露到公网。
+
+---
+
+更多设计背景见 [`docs/`](docs/)；插件代码见 [`plugins/autonomy/`](plugins/autonomy/) 和 [`plugins/seed_memory/`](plugins/seed_memory/)。
