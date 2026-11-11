@@ -279,7 +279,8 @@ class Runner:
         summary = "partial=%s chars=%d tools=%d elapsed=%.1f usage=%s prefetch=%s" % (
             partial, len(raw), len(tools), elapsed, json.dumps(usage, ensure_ascii=False), json.dumps(self._prefetch_meta, ensure_ascii=False)
         )
-        self.db.append_event(run_id=run, kind="run_timeout", exit_reason=reason, summary=summary[:1200])
+        kind = 'run_timeout' if reason == 'timeout' else 'run_partial'
+        self.db.append_event(run_id=run, kind=kind, exit_reason=reason, summary=summary[:1200])
         try:
             append_thought_log(
                 self.thought_log_path, run_id=run,
@@ -1632,7 +1633,9 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                             if not (_tool_calls and _prior_calls):
                                 _history = _transcript.get('tool_calls') or []
                                 if len(_history) >= 2:
-                                    _prior_calls, _tool_calls = [_history[-2]], [_history[-1]]
+                                    _prior_calls, _tool_calls = [[c] for c in _history[:-1]], [_history[-1]]
+                                elif len(_history) == 1:
+                                    _prior_calls, _tool_calls = [], [_history[-1]]
                             progress = bool(
                                 tools or _tool_calls or _prior_calls or
                                 _transcript.get('assistant_texts') or
@@ -1896,7 +1899,7 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 goal_id=goal_id,
                 kind="tick",
                 exit_reason=_exc_error_kind or type(e).__name__,
-                summary=_redact_diagnostic(raw or reason)[:300],
+                summary=_redact_diagnostic(f'{reason} | {raw}' if raw else reason)[:300],
             )
             error = {"error": type(e).__name__, "reason": reason}
             if http_status is not None:

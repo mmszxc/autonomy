@@ -48,12 +48,19 @@ def test_cli_command_inherit_keeps_original_shape(monkeypatch):
     assert "--provider" not in seen["proc"].cmd
 
 
-def _run_tick(monkeypatch, tmp_path, configured_model):
+def _run_tick(monkeypatch, tmp_path, configured_model, configured_max_turns=None):
     profile = tmp_path / "example"
     profile.mkdir()
+    autonomy_cfg = {
+        "transport": "cli",
+        "model": configured_model,
+        "data_dir": str(profile / "data"),
+    }
+    if configured_max_turns is not None:
+        autonomy_cfg["max_turns"] = configured_max_turns
     (profile / "config.yaml").write_text(yaml.safe_dump({
         "model": {"default": "main-model", "provider": "main-provider"},
-        "autonomy": {"transport": "cli", "model": configured_model, "data_dir": str(profile / "data")},
+        "autonomy": autonomy_cfg,
     }), encoding="utf-8")
     seen = {}
 
@@ -86,6 +93,11 @@ def test_tick_passes_only_explicit_model_routing(monkeypatch, tmp_path, configur
     seen = _run_tick(monkeypatch, tmp_path, configured)
     assert seen["model"] == model
     assert seen["provider"] == provider
+
+
+def test_tick_passes_flat_autonomy_max_turns(monkeypatch, tmp_path):
+    seen = _run_tick(monkeypatch, tmp_path, None, configured_max_turns=8)
+    assert seen["max_turns"] == 8
 
 
 def test_custom_providers_list_resolves_own_key_env():

@@ -185,6 +185,8 @@ def _is_refusal(text: str) -> bool:
 
 def _tool_call_signature(tc: dict) -> str:
     """Stable tool signature; strip timestamps/random request IDs (F5)."""
+    if not isinstance(tc, dict):
+        return (str(tc), '')
     name = str(tc.get("tool_name") or tc.get("name") or "?")
     args = tc.get("args") or tc.get("parameters") or tc.get("args_preview") or {}
     if isinstance(args, str):
@@ -225,10 +227,11 @@ def _is_loop(
         current_sigs = tuple(_tool_call_signature(tc) for tc in tool_calls)
         if current_sigs:
             for prev_turn in previous_tool_calls:
-                prev_sigs = tuple(_tool_call_signature(tc) for tc in (prev_turn or []))
+                prev_calls = [prev_turn] if isinstance(prev_turn, dict) else (prev_turn or [])
+                prev_sigs = tuple(_tool_call_signature(tc) for tc in prev_calls)
                 if current_sigs == prev_sigs and len(current_sigs) > 0:
                     current_results = tuple(str(tc.get('result_preview') or tc.get('result') or '') for tc in tool_calls)
-                    previous_results = tuple(str(tc.get('result_preview') or tc.get('result') or '') for tc in prev_turn)
+                    previous_results = tuple(str(tc.get('result_preview') or tc.get('result') or '') for tc in prev_calls)
                     if all(current_results) and all(previous_results) and current_results == previous_results:
                         return True
 

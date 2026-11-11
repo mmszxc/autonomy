@@ -37,6 +37,7 @@ from autonomy.error_classifier import (
     T2_REFUSAL,
     classify,
     classify_error_text,
+    _is_loop,
     should_circuit_count,
     record_t3_hits,
 )
@@ -777,6 +778,18 @@ class TestF4RefusalChineseAndDual:
 # ===========================================================================
 
 class TestF5ToolCallLoopDetection:
+    def test_one_dimensional_previous_tool_calls_do_not_raise(self):
+        tool_call = {
+            "tool_name": "search",
+            "args": {"query": "hermes memory"},
+            "result": "same evidence",
+        }
+        assert _is_loop(
+            "some different text",
+            tool_calls=[tool_call],
+            previous_tool_calls=[tool_call],
+        ) is True
+
     def test_identical_tool_calls_detected_as_loop(self):
         tool_calls = [{"tool_name": "search", "args": {"query": "hermes memory"}, "result": "same evidence"}]
         previous_tool_calls = [

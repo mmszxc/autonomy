@@ -75,7 +75,15 @@ def main(argv=None, *, hermes_home=None):
     # New limits schema wins; retain old resources keys for read-only compatibility.
     prefetch_max_chars = int(os.environ.get("AUTONOMY_PREFETCH_MAX_CHARS") or limits_cfg.get("prefetch_max_chars") or 3000)
     prefetch_timeout_s = float(os.environ.get("AUTONOMY_PREFETCH_TIMEOUT_S") or limits_cfg.get("prefetch_timeout_s") or 20)
-    run_max_seconds = float(os.environ.get("AUTONOMY_RUN_MAX_SECONDS") or limits_cfg.get("run_max_seconds") or 2400)
+    run_max_seconds = float(
+        os.environ.get('AUTONOMY_RUN_MAX_SECONDS')
+        or limits_cfg.get('run_max_seconds')
+        or limits_cfg.get('max_seconds')
+        or auto_cfg.get('run_max_seconds')
+        or auto_cfg.get('max_seconds')
+        or 2400
+    )
+    effective_max_turns = int(limits_cfg.get('max_turns') or auto_cfg.get('max_turns') or 30)
     run_soft_wrap_seconds = float(os.environ.get("AUTONOMY_RUN_SOFT_WRAP_SECONDS") or limits_cfg.get("run_soft_wrap_seconds") or 1080)
     min_quiet = float(
         os.environ.get(
@@ -133,7 +141,7 @@ def main(argv=None, *, hermes_home=None):
     if transport == "cli":
         from .cli_transport import CliGateway
         gw = CliGateway(
-            max_turns=int(limits_cfg.get("max_turns") or 30), run_budget=int(run_max_seconds),
+            max_turns=effective_max_turns, run_budget=int(run_max_seconds),
             profile=Path(hermes_home).name, model=gw_model, provider=gw_provider,
             raw_buffer_dir=str(Path(paths["data_dir"]) / "evidence_raw"),
             raw_buffer_min_free_bytes=p0_cfg.t2_free_bytes,
@@ -144,7 +152,7 @@ def main(argv=None, *, hermes_home=None):
         except Exception:
             from .cli_transport import CliGateway
             gw = CliGateway(
-            max_turns=int(limits_cfg.get("max_turns") or 30), run_budget=int(run_max_seconds),
+            max_turns=effective_max_turns, run_budget=int(run_max_seconds),
             profile=Path(hermes_home).name, model=gw_model, provider=gw_provider,
             raw_buffer_dir=str(Path(paths["data_dir"]) / "evidence_raw"),
             raw_buffer_min_free_bytes=p0_cfg.t2_free_bytes,
