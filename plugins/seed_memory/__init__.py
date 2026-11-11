@@ -573,8 +573,17 @@ class SeedMemoryProvider(MemoryProvider):
         except Exception:
             logger.exception("atexit queue finalize failed")
 
+    def _queue_transcripts(self) -> List[Path]:
+        """Include session files and the legacy timestamp/UUID transcript format."""
+        if not self._queue_dir:
+            return []
+        return [
+            path for path in self._queue_dir.glob("*.json")
+            if re.fullmatch(r"(?:session_.+|\d+_[0-9a-f]{32})\.json", path.name)
+        ]
+
     def _launch_worker_if_needed(self) -> None:
-        if not self._queue_dir or not any(self._queue_dir.glob("session_*.json")):
+        if not self._queue_transcripts():
             return
         import subprocess, sys
         unit_state = self._queue_dir / ".worker.unit"
@@ -700,7 +709,7 @@ class SeedMemoryProvider(MemoryProvider):
     def _drain_queue(self) -> None:
         # Only transcript sessions belong to the drain queue.  stats.json and
         # other operational sidecars must never inflate worker counters.
-        queue_files = list(self._queue_dir.glob("session_*.json")) if self._queue_dir else []
+        queue_files = self._queue_transcripts()
         logger.info("drain start queue_dir=%s write_enabled=%s queue_file_count=%d", self._queue_dir, self._writes_enabled(), len(queue_files))
         if self._user_active():
             logger.info("drain skip reason=user_active")
@@ -711,7 +720,7 @@ class SeedMemoryProvider(MemoryProvider):
         import time
         now = time.time(); started = time.monotonic(); processed_files = 0; inspected_files = 0; skipped_files = 0; backlog_files = 0
         max_files = int(self._config.get("max_files", 6)); max_duration = float(self._config.get("max_duration_s", 540))
-        for path in sorted(self._queue_dir.glob("session_*.json"), key=lambda p: p.stat().st_mtime):
+        for path in sorted(queue_files, key=lambda p: p.stat().st_mtime):
             inspected_files += 1
             if self._user_active():
                 logger.info("drain skip reason=user_active"); break
@@ -899,7 +908,7 @@ class SeedMemoryProvider(MemoryProvider):
 
         backlog = 0
         if self._queue_dir:
-            for p in self._queue_dir.glob('session_*.json'):
+            for p in self._queue_transcripts():
                 try:
                     q=json.loads(p.read_text(encoding='utf-8')); backlog += int(q.get('processed_turns',0)) < (len(self._normalise_messages(q.get('messages'))) // 2)
                 except Exception: backlog += 1

@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 import importlib
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -33,6 +34,41 @@ def make_seed(identifier, *, ref=None, status="active", importance=0.6):
         provenance_ref=ref,
         status=status,
     )
+
+
+def test_drain_accepts_both_session_and_timestamp_transcripts(tmp_path, monkeypatch):
+    from types import ModuleType
+
+    agent_module = ModuleType("agent")
+    provider_module = ModuleType("agent.memory_provider")
+    provider_module.MemoryProvider = object
+    provider_module.RecallStatus = SimpleNamespace
+    monkeypatch.setitem(sys.modules, "agent", agent_module)
+    monkeypatch.setitem(sys.modules, "agent.memory_provider", provider_module)
+    import seed_memory
+
+    provider = seed_memory.SeedMemoryProvider()
+    provider._queue_dir = tmp_path
+    provider._config = {"write_enabled": True}
+    provider._user_active = lambda: False
+    inspected = []
+
+    def fake_lock(path):
+        from contextlib import nullcontext
+        inspected.append(path.name)
+        return nullcontext()
+
+    monkeypatch.setattr(seed_memory, "_session_lock", fake_lock)
+    for name in ("session_test.json", "1794384000_" + "a" * 32 + ".json",
+                 "stats.json", "random.json", "unfinished.json.tmp"):
+        path = tmp_path / name
+        path.write_text('{"created_at": 1794384000, "messages": []}', encoding="utf-8")
+        os.utime(path, (1794384000, 1794384000))
+    assert {p.name for p in provider._queue_transcripts()} == {
+        "session_test.json", "1794384000_" + "a" * 32 + ".json"
+    }
+    provider._drain_queue()
+    assert set(inspected) == {"session_test.json", "1794384000_" + "a" * 32 + ".json"}
 
 
 def test_gray_mode_audit_fallback_preserves_fields(seed_db, caplog, monkeypatch):
