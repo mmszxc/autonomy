@@ -1,6 +1,7 @@
 """Regression coverage for seed-memory wave 3 safety gates."""
 
 from datetime import datetime, timezone
+import importlib
 from pathlib import Path
 import sqlite3
 import sys
@@ -34,6 +35,33 @@ def make_seed(identifier, *, ref=None, status="active", importance=0.6):
     )
 
 
+def test_gray_mode_audit_fallback_preserves_fields(seed_db, caplog, monkeypatch):
+    from types import ModuleType
+
+    agent_module = ModuleType("agent")
+    provider_module = ModuleType("agent.memory_provider")
+    provider_module.MemoryProvider = object
+    provider_module.RecallStatus = SimpleNamespace
+    monkeypatch.setitem(sys.modules, "agent", agent_module)
+    monkeypatch.setitem(sys.modules, "agent.memory_provider", provider_module)
+    import seed_memory
+
+    provider = seed_memory.SeedMemoryProvider()
+    provider._store = store
+    provider._initialized = True
+    provider._session_id = "sess:gray"
+    provider._profile = "xiaomei"
+    provider._config = {"write_enabled": False}
+    result = provider.handle_tool_call("seed_add", {"summary": "refused", "emotion_primary": "neutral"})
+    assert '"rejection_recorded": true' in result
+    with sqlite3.connect(seed_db) as conn:
+        row = conn.execute(
+            "SELECT operation, writer, session_id, reason FROM seed_gray_mode_rejections"
+        ).fetchone()
+    assert row == ("seed_add", "hermes:seed_memory:tool:sess:gray", "sess:gray", "write_disabled")
+    assert "without signature" in caplog.text
+
+
 def test_production_access_log_and_query_time_decay_coexist(seed_db):
     first = make_seed("older", ref="event:old", importance=0.9)
     second = make_seed("recent", ref="event:new", importance=0.6)
@@ -48,10 +76,67 @@ def test_production_access_log_and_query_time_decay_coexist(seed_db):
             second.id, "tester", "event:new")
         names = {row[1] for row in conn.execute("PRAGMA index_list(seed_access_log)")}
     assert {"idx_seed_access_log_seed_id", "idx_seed_access_log_timestamp"} <= names
-    assert store._compute_effective_importance(0.9, first.timestamp.isoformat(), 0.05,
-                                                datetime.now(timezone.utc)) < 0.6
+    assert store._compute_effective_importance(first, datetime.now(timezone.utc)) < 0.6
+    first.last_accessed = datetime.now(timezone.utc)
+    assert store._compute_effective_importance(first, datetime.now(timezone.utc)) > 0.8
     assert store.get_ranked_seeds(limit=1)[0].id == second.id
     assert store.decay_due_seeds(dry_run=True)["dry_run"] is True
+
+
+def test_retrieval_provenance_and_readonly_prefetch(seed_db, monkeypatch):
+    seed = make_seed("retrieved", ref="event:search")
+    assert store.save_seed(seed)
+    monkeypatch.setattr(retrieval, "_embed_query", lambda *_: None, raising=False)
+    assert retrieval.retrieve("example.py", top_k=1, record_access=False,
+                              writer="tester", session_id="sess:1", reason="prefetch")
+    with sqlite3.connect(seed_db) as conn:
+        assert conn.execute("SELECT access_count FROM seeds WHERE id=?", (seed.id,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM seed_access_log").fetchone()[0] == 0
+    assert retrieval.retrieve("example.py", top_k=1, writer="tester", session_id="sess:1")
+    with sqlite3.connect(seed_db) as conn:
+        assert conn.execute("SELECT access_count FROM seeds WHERE id=?", (seed.id,)).fetchone()[0] == 1
+        writer, session, provenance = conn.execute(
+            "SELECT writer, session_id, provenance FROM seed_access_log"
+        ).fetchone()
+    assert writer in {"hermes:retrieval:fallback", "tester"}
+    assert session == "sess:1"
+    assert '"trigger":' in provenance
+
+
+def test_optional_heelo_and_signed_exports_when_private_modules_present(monkeypatch):
+    # These modules are production-only; the public checkout must still import.
+    from hermes import memory
+
+    assert hasattr(memory, "SeedAccessLog")
+    assert "signed_write_seed" not in memory.__all__
+    assert "Experience" not in memory.__all__
+    fake_signed = SimpleNamespace(**{
+        key: object() for key in (
+            "init_signed_write_path", "signed_write_seed", "signed_write_access_log",
+            "signed_write_semantic_memory", "signed_write_program_memory",
+            "record_gray_mode_rejection", "get_gray_mode_rejections",
+            "verify_merkle_chain", "verify_write_integrity", "export_merkle_proof",
+            "get_merkle_tail", "get_public_key_pem", "SignedWriteResult", "GrayModeRejection",
+        )
+    })
+    fake_heelo = SimpleNamespace(**{
+        key: object() for key in (
+            "Experience", "Observation", "Reflection", "Action", "Outcome",
+            "ExecutionPrimitive", "HandoffPrimitive", "ObservabilityPrimitive",
+            "serialize_heelo", "deserialize_heelo", "seed_to_experience",
+            "experience_to_seed", "skill_to_execution_primitive",
+        )
+    })
+    monkeypatch.setitem(sys.modules, "hermes.memory.signed_write", fake_signed)
+    monkeypatch.setitem(sys.modules, "hermes.memory.heelo", fake_heelo)
+    try:
+        importlib.reload(memory)
+        assert "signed_write_seed" in memory.__all__
+        assert "Experience" in memory.__all__
+    finally:
+        monkeypatch.delitem(sys.modules, "hermes.memory.signed_write")
+        monkeypatch.delitem(sys.modules, "hermes.memory.heelo")
+        importlib.reload(memory)
 
 
 def test_touch_signed_access_log_uses_merkle_path(seed_db, monkeypatch):

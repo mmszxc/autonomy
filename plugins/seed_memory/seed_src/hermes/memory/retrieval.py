@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import importlib.util
 import json
 import os
@@ -17,7 +18,7 @@ import numpy as np
 
 from . import store as memory_store
 from .schema import Seed
-from .store import get_all_seeds, get_ranked_seeds, touch_seed, update_embedding
+from .store import get_all_seeds, get_ranked_seeds, touch_seed, update_embedding, save_access_log
 
 _DEFAULT_MODEL_PATH = (
     Path(__file__).resolve().parent.parent
@@ -174,8 +175,8 @@ def retrieve_program_evidence(
         columns = {
             row[1] for row in conn.execute("PRAGMA table_info(program_memories)")
         }
-        # Legacy program memories predate provenance fields. They are quarantined
-        # read-only: absence of a trusted writer/L0 provenance means no injection.
+        # Production update guard: readers must observe online breaker writes
+        # before injecting program evidence. Legacy rows remain quarantined.
         required = {"source_seeds", "counter_seeds", "consecutive_failures", "writer", "owner", "provenance"}
         if not required.issubset(columns):
             return []
@@ -245,10 +246,19 @@ def retrieve_program_evidence(
             conn.close()
 
 
-def _fallback(limit: int) -> List[Seed]:
+def _fallback(limit: int, *, record_access: bool = True) -> List[Seed]:
     seeds = get_ranked_seeds(limit)
-    for seed in seeds:
-        touch_seed(seed.id)
+    if record_access:
+        provenance = json.dumps({
+            "chain": [{"layer": "retrieve", "stage": "fallback",
+                       "writer": "hermes:retrieval:fallback"}],
+            "trigger": "fallback",
+        }, ensure_ascii=False)
+        for seed in seeds:
+            touch_seed(
+                seed.id, writer="hermes:retrieval:fallback",
+                reason="fallback", provenance=provenance,
+            )
     return seeds
 
 
@@ -297,11 +307,15 @@ def _rerank_with_ext_hook(seeds: List[Seed], query: str) -> List[Seed]:
         executor.shutdown(wait=False, cancel_futures=True)
 
 
-def retrieve(query: str, top_k: int = 5, *, record_access: bool = True) -> List[Seed]:
+def retrieve(
+    query: str, top_k: int = 5, *, record_access: bool = True,
+    writer: str = "", session_id: str = "", reason: str = "retrieve",
+) -> List[Seed]:
     """Retrieve seeds by fusing cosine and FTS ranks with weighted RRF."""
     top_k = max(1, int(top_k))
     top_n = max(top_k * 3, 20)
     k_rrf = 10
+    query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16] if query else ""
     all_seeds = get_all_seeds()
 
     emb_ranked: List[Tuple[int, Seed]] = []
@@ -336,8 +350,9 @@ def retrieve(query: str, top_k: int = 5, *, record_access: bool = True) -> List[
     except (OSError, sqlite3.Error):
         fts_ranked = []
 
-    if not emb_ranked and not fts_ranked:
-        results = _fallback(top_k)
+    used_fallback = not emb_ranked and not fts_ranked
+    if used_fallback:
+        results = _fallback(top_k, record_access=False)
     else:
         scores: Dict[str, float] = {}
         candidates: Dict[str, Seed] = {}
@@ -381,8 +396,31 @@ def retrieve(query: str, top_k: int = 5, *, record_access: bool = True) -> List[
                     results.append(candidates[sid])
     results = _rerank_with_ext_hook(results, query)
     if record_access:
-        for seed in results:
-            touch_seed(seed.id)
+        if used_fallback:
+            provenance = json.dumps({
+                "chain": [{"layer": "retrieve", "stage": "fallback",
+                           "writer": "hermes:retrieval:fallback"}],
+                "trigger": "fallback",
+            }, ensure_ascii=False)
+            for seed in results:
+                touch_seed(
+                    seed.id, writer="hermes:retrieval:fallback",
+                    session_id=session_id, reason="fallback",
+                    query_hash=query_hash, provenance=provenance,
+                )
+        else:
+            provenance = json.dumps({
+                "chain": [{"layer": "retrieve", "stage": "rrf",
+                           "writer": writer or "hermes:retrieval:rrf",
+                           "query_hash": query_hash, "session_id": session_id}],
+                "trigger": "query", "query": query[:200] if query else "",
+            }, ensure_ascii=False)
+            for seed in results:
+                touch_seed(
+                    seed.id, writer=writer or "hermes:retrieval:rrf",
+                    session_id=session_id, reason=reason,
+                    query_hash=query_hash, provenance=provenance,
+                )
     return results
 
 
@@ -407,8 +445,12 @@ def _dormant_seeds_from_db(
         conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         cutoff = datetime.now(timezone.utc) - timedelta(days=_DORMANT_INJECT_DAYS)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(seeds)")}
+        access_col = "last_real_access" if "last_real_access" in columns else (
+            "last_accessed" if "last_accessed" in columns else "timestamp"
+        )
         rows = conn.execute(
-            "SELECT id, access_count, last_real_access, timestamp, importance "
+            f"SELECT id, access_count, {access_col}, timestamp, importance "
             "FROM seeds WHERE access_count = 0 AND status != 'archived' "
             "ORDER BY importance DESC, timestamp ASC"
         ).fetchall()
@@ -425,7 +467,7 @@ def _dormant_seeds_from_db(
         seed = seed_by_id.get(row["id"])
         if seed is None:
             continue
-        ts = row["last_real_access"] or row["timestamp"]
+        ts = row[access_col] or row["timestamp"]
         try:
             t = datetime.fromisoformat(ts)
             if t.tzinfo is None:

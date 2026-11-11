@@ -182,6 +182,14 @@ def init_db(db_path: str | os.PathLike[str] | None = None) -> None:
             reason TEXT NOT NULL,
             recorded_at TEXT NOT NULL
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS seed_gray_mode_rejections (
+            operation TEXT NOT NULL,
+            writer TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            recorded_at TEXT NOT NULL
+        )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS seed_revival_proposals (
             seed_id TEXT NOT NULL,
             offline_review_id TEXT NOT NULL,
@@ -486,6 +494,22 @@ def get_all_seeds(*, include_archived: bool = False) -> List[Seed]:
     return [_row_to_seed(row) for row in rows]
 
 
+def record_gray_mode_rejection_unsigned(
+    *, operation: str, writer: str, session_id: str,
+    payload_hash: str, reason: str,
+) -> None:
+    """Retain gray-mode audit fields when production's signer is absent."""
+    init_db()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO seed_gray_mode_rejections "
+            "(operation, writer, session_id, payload_hash, reason, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (operation, writer, session_id, payload_hash, reason,
+             datetime.now(timezone.utc).isoformat()),
+        )
+
+
 def record_filtered_by_contract(reason: str) -> None:
     """Track compliant filtering separately from persisted seeds and invalid failures."""
     if not reason.strip():
@@ -560,21 +584,24 @@ def save_access_log(log: SeedAccessLog) -> bool:
     return True
 
 
-def _compute_effective_importance(
-    importance: float,
-    timestamp_str: str,
-    decay_rate: float,
-    now: datetime,
-) -> float:
-    """Time-decay importance: I_eff = I * exp(-decay_rate * days_since_creation)."""
-    try:
-        ts = datetime.fromisoformat(timestamp_str)
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        days = max(0.0, (now - ts).total_seconds() / 86400.0)
-        return importance * math.exp(-decay_rate * days)
-    except (ValueError, TypeError, OverflowError):
-        return importance
+def _compute_effective_importance(seed: Seed, now: Optional[datetime] = None) -> float:
+    """Compute time-decayed importance using last_accessed as the base.
+
+    Formula: effective = importance * exp(-decay_rate * days_since_base)
+    where base = last_accessed (if set) or timestamp (creation time).
+
+    Defaults: decay_rate=0.01 (~70-day half-life).  Floors at 0.01 to
+    prevent seeds from vanishing entirely.  Future timestamps are clamped
+    to 0 elapsed days.  Max elapsed is 365 days (avoid ancient-seed underflow).
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    base = seed.last_accessed or seed.timestamp
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    elapsed = max(0.0, min((now - base).total_seconds() / 86400.0, 365.0))
+    rate = seed.decay_rate if seed.decay_rate is not None else 0.01
+    return max(0.01, seed.importance * math.exp(-rate * elapsed))
 
 
 def get_ranked_seeds(limit: int = 5) -> List[Seed]:
@@ -587,18 +614,10 @@ def get_ranked_seeds(limit: int = 5) -> List[Seed]:
     init_db()
     with _connect() as conn:
         rows = conn.execute("SELECT * FROM seeds WHERE status != 'archived'").fetchall()
+    seeds = [_row_to_seed(row) for row in rows]
     now = datetime.now(timezone.utc)
-    ranked = sorted(
-        rows,
-        key=lambda r: (
-            _compute_effective_importance(
-                r["importance"], r["timestamp"], r["decay_rate"], now,
-            ),
-            r["timestamp"],
-        ),
-        reverse=True,
-    )
-    return [_row_to_seed(row) for row in ranked[:max(1, int(limit))]]
+    seeds.sort(key=lambda s: (_compute_effective_importance(s, now), s.timestamp), reverse=True)
+    return seeds[:max(1, int(limit))]
 
 
 def touch_seed(
@@ -761,8 +780,11 @@ def _row_to_seed(row: sqlite3.Row) -> Seed:
         importance=row["importance"],
         embedding=embedding,
         access_count=row["access_count"],
+        last_accessed=datetime.fromisoformat(row["last_accessed"]) if row["last_accessed"] else None,
         shareable=int(row["shareable"] if row["shareable"] is not None else 1),
         decay_rate=row["decay_rate"] if row["decay_rate"] is not None else 0.05,
+        provenance_ref=row["provenance_ref"] if "provenance_ref" in row.keys() else None,
+        status=row["status"] if "status" in row.keys() and row["status"] else "active",
     )
 
 
@@ -1097,6 +1119,23 @@ def save_semantic_memory(
             "UPDATE semantic_memories SET normalised_statement=? WHERE id=?",
             (norm, memory.id),
         )
+        # Preserve production's in-transaction signed-write call, including its
+        # best-effort exception behavior. Recursion is a separate known issue.
+        try:
+            signed_write = import_module(f"{__package__}.signed_write")
+        except ModuleNotFoundError as exc:
+            if exc.name != f"{__package__}.signed_write":
+                raise
+            logging.getLogger(__name__).warning(
+                "signed_write unavailable; semantic memory stored unsigned"
+            )
+        else:
+            try:
+                signed_write.signed_write_semantic_memory(
+                    memory=memory, writer="hermes:seed_memory:store"
+                )
+            except Exception:
+                pass
         return memory.id
 
 
@@ -1173,6 +1212,21 @@ def save_program_memory(
             except sqlite3.OperationalError:
                 pass
             conn.execute(f"UPDATE program_memories SET {col}=? WHERE id=?", (val, memory.id))
+        try:
+            signed_write = import_module(f"{__package__}.signed_write")
+        except ModuleNotFoundError as exc:
+            if exc.name != f"{__package__}.signed_write":
+                raise
+            logging.getLogger(__name__).warning(
+                "signed_write unavailable; program memory stored unsigned"
+            )
+        else:
+            try:
+                signed_write.signed_write_program_memory(
+                    memory=memory, writer="hermes:seed_memory:store"
+                )
+            except Exception:
+                pass
         return memory.id
 
 

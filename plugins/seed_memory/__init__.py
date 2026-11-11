@@ -6,6 +6,7 @@ import atexit
 import json
 import hashlib
 import logging
+from importlib import import_module
 import os
 import re
 import random
@@ -119,6 +120,7 @@ def _session_lock(path: Path):
 class SeedMemoryProvider(MemoryProvider):
     def __init__(self) -> None:
         self._session_id = ""
+        self._profile = "seed_memory"
         self._hermes_home: Optional[Path] = None
         self._config: Dict[str, Any] = {}
         self._source_root: Optional[Path] = None
@@ -126,6 +128,7 @@ class SeedMemoryProvider(MemoryProvider):
         self._retrieval = None
         self._schema = None
         self._tagger = None
+        self._signed_write = None
         self._buffer: List[Dict[str, str]] = []
         self._lock = threading.RLock()
         self._last_recalled = 0
@@ -176,6 +179,7 @@ class SeedMemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs: Any) -> None:
         self._session_id = session_id or ""
+        self._profile = str(kwargs.get("profile") or self._profile)
         home_value = kwargs.get("hermes_home") or os.environ.get("HERMES_HOME")
         if not home_value:
             raise RuntimeError("seed_memory requires HERMES_HOME")
@@ -210,6 +214,17 @@ class SeedMemoryProvider(MemoryProvider):
         )
         self._store.configure(db_path)
         self._store.init_db()
+        # Production supplies the Merkle-signed writer as a separate private
+        # module. A source checkout without it persists unsigned audit rows.
+        try:
+            self._signed_write = import_module(f"{self._store.__package__}.signed_write")
+        except ModuleNotFoundError as exc:
+            if exc.name != f"{self._store.__package__}.signed_write":
+                raise
+            logger.warning("signed_write module unavailable; using unsigned seed audit fallback")
+            self._signed_write = None
+        if self._signed_write is not None:
+            self._signed_write.init_signed_write_path()
         self._retrieval.configure(model_path)
         self._llm_call = kwargs.get("llm_call") or self._agent_model_call
         configured_queue = self._config.get("queue_dir")
@@ -280,6 +295,16 @@ class SeedMemoryProvider(MemoryProvider):
     def _writes_enabled(self) -> bool:
         return bool(self._config.get("write_enabled", False))
 
+    def _write_legacy_seed(self, seed: Any) -> bool:
+        if self._signed_write is not None:
+            result = self._signed_write.signed_write_seed(
+                seed=seed, writer=f"hermes:seed_memory:extract:{self._session_id or 'unknown'}",
+                session_id=self._session_id, reason="legacy seed extraction",
+            )
+            return bool(result.success)
+        logger.warning("signed_write unavailable; legacy extraction uses unsigned fallback")
+        return self._store.save_seed(seed)
+
     @staticmethod
     def _seed_dict(seed: Any) -> Dict[str, Any]:
         return {
@@ -306,16 +331,41 @@ class SeedMemoryProvider(MemoryProvider):
             if not query:
                 return json.dumps({"error": "query is required"}, ensure_ascii=False)
             limit = min(20, max(1, int(args.get("limit", 5))))
-            seeds = self._retrieval.retrieve(query, top_k=limit)
+            writer = str(kwargs.get("writer") or self._profile)
+            session_id = str(kwargs.get("session_id") or "")
+            seeds = self._retrieval.retrieve(
+                query, top_k=limit, writer=writer, session_id=session_id,
+                reason="seed_search",
+            )
             return json.dumps(
                 {"count": len(seeds), "seeds": [self._seed_dict(seed) for seed in seeds]},
                 ensure_ascii=False,
             )
 
         if tool_name == "seed_add":
+            writer = f"hermes:seed_memory:tool:{self._session_id or 'unknown'}"
+            session_id = self._session_id or ""
             if not self._writes_enabled():
+                rejection_payload = {
+                    "summary": str(args.get("summary") or "").strip(),
+                    "participants": list(args.get("participants") or ["creator"]),
+                    "emotion_primary": str(args.get("emotion_primary") or "").strip(),
+                    "emotion_intensity": float(args.get("emotion_intensity", 0.5)),
+                    "emotion_secondary": list(args.get("emotion_secondary") or []),
+                    "emotion_note": str(args.get("emotion_note") or ""),
+                    "value_aligned": list(args.get("value_aligned") or []),
+                    "value_conflicted": list(args.get("value_conflicted") or []),
+                    "seeds_planted": list(args.get("seeds_planted") or []),
+                    "caused_by": list(args.get("caused_by") or []),
+                    "led_to": list(args.get("led_to") or []),
+                    "importance": float(args.get("importance", 0.5)),
+                }
+                self._record_gray_rejection(
+                    operation="seed_add", writer=writer, session_id=session_id,
+                    payload=rejection_payload, reason="write_disabled",
+                )
                 return json.dumps(
-                    {"error": "seed_memory is in read-only gray mode"},
+                    {"error": "seed_memory is in read-only gray mode", "rejection_recorded": True},
                     ensure_ascii=False,
                 )
 
@@ -340,6 +390,17 @@ class SeedMemoryProvider(MemoryProvider):
             )
             if not seed.summary or not seed.emotion.primary:
                 return json.dumps({"error": "summary and emotion_primary are required"}, ensure_ascii=False)
+            if self._signed_write is not None:
+                result = self._signed_write.signed_write_seed(
+                    seed=seed, writer=writer, session_id=session_id, reason="seed_add",
+                )
+                return json.dumps({
+                    "ok": result.success, "inserted": result.success,
+                    "seed": self._seed_dict(seed),
+                    "merkle_index": result.merkle_index, "merkle_hash": result.merkle_hash,
+                    "error": result.error,
+                }, ensure_ascii=False)
+            logger.warning("signed_write unavailable; seed_add uses unsigned fallback")
             inserted = self._store.save_seed(seed)
             return json.dumps(
                 {"ok": True, "inserted": inserted, "seed": self._seed_dict(seed)},
@@ -355,10 +416,13 @@ class SeedMemoryProvider(MemoryProvider):
         text = " ".join(str(value or "").replace("\x00", "").split())
         return text[:limit]
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(self, query: str, *, session_id: str = "", writer: str = "", reason: str = "prefetch") -> str:
         self._require_initialized()
         limit = min(10, max(1, int(self._config.get("prefetch_limit", 5))))
-        seeds = self._retrieval.retrieve(query, top_k=limit, record_access=False)
+        seeds = self._retrieval.retrieve(
+            query, top_k=limit, record_access=False,
+            writer=writer or "hermes:seed_memory:prefetch", session_id=session_id, reason=reason,
+        )
         self._last_recalled = len(seeds)
         fallback = not bool(self._retrieval.embedding_status().get("available", False))
         logger.info("prefetch recall_count=%d seed_ids=%s similarities=%s fallback=%s", len(seeds), [s.id for s in seeds], [getattr(s, "similarity", None) for s in seeds], fallback)
@@ -398,6 +462,25 @@ class SeedMemoryProvider(MemoryProvider):
                     )
         lines.append("</memory_context>")
         return "\n".join(lines)
+
+    def _record_gray_rejection(self, *, operation: str, writer: str, session_id: str,
+                               payload: dict, reason: str) -> None:
+        """Preserve production's auditable gray-mode rejection record."""
+        import hashlib
+        payload_hash = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+        ).hexdigest()[:16]
+        if self._signed_write is not None:
+            self._signed_write.record_gray_mode_rejection(
+                operation=operation, writer=writer, session_id=session_id,
+                payload=payload, reason=reason,
+            )
+        else:
+            logger.warning("signed_write unavailable; gray-mode rejection recorded without signature")
+            self._store.record_gray_mode_rejection_unsigned(
+                operation=operation, writer=writer, session_id=session_id,
+                payload_hash=payload_hash, reason=reason,
+            )
 
     def recall_status(self) -> RecallStatus:
         reason = None
@@ -723,8 +806,9 @@ class SeedMemoryProvider(MemoryProvider):
                         self._config["tagger_max_tokens"] = retry_limit
                         try:
                             seeds = self._extract_seeds_with_retry(
-                    messages, session_id, recent_seeds, payload.get("importance_override")
-                )
+                                messages, session_id, recent_seeds,
+                                payload.get("importance_override"),
+                            )
                         finally:
                             self._config["tagger_max_tokens"] = old_limit
                     logger.info("drain model returned path=%s seeds=%d partial=%s elapsed=%.3fs", path.name, len(seeds or []), getattr(_tagger, "LAST_PARTIAL", False), time.monotonic() - started)
@@ -736,7 +820,21 @@ class SeedMemoryProvider(MemoryProvider):
                                 continue
                             seeds, _dedup_stats = self._dedup_seeds(seeds)
                             if seeds:
-                                self._store.save_seeds(seeds)
+                                if self._signed_write is not None:
+                                    writer = f"hermes:seed_memory:worker:{session_id}"
+                                    for seed in seeds:
+                                        result = self._signed_write.signed_write_seed(
+                                            seed=seed, writer=writer,
+                                            session_id=session_id, reason="queue_drain",
+                                        )
+                                        if not result.success and result.error:
+                                            logger.warning(
+                                                "signed write failed for seed %s: %s",
+                                                seed.id, result.error,
+                                            )
+                                else:
+                                    logger.warning("signed_write unavailable; queue drain uses unsigned fallback")
+                                    self._store.save_seeds(seeds)
                             # Reverse-link led_to: the LLM can name causes but not
                             # consequences, so compute led_to from caused_by after
                             # the fact.  This is what makes the causal graph
@@ -868,6 +966,17 @@ class SeedMemoryProvider(MemoryProvider):
         self._launch_worker_if_needed()
         with self._lock:
             self._buffer.clear()
+
+    # Callback preserved for readers requiring signed access provenance.
+    def _seed_access_tracker(self, seed_id: str, **kwargs: Any) -> None:
+        if self._store is not None:
+            self._store.touch_seed(
+                seed_id, writer=str(kwargs.get("writer") or self._profile),
+                session_id=str(kwargs.get("session_id") or self._session_id or ""),
+                reason=str(kwargs.get("reason") or "retrieve"),
+                query_hash=str(kwargs.get("query_hash") or ""),
+                provenance=str(kwargs.get("provenance") or "retrieval:query"),
+            )
 
     # Safety-first empty hooks for lifecycle events not used in phase one.
     def on_turn_start(self, turn_number: int, message: str, **kwargs: Any) -> None:
