@@ -34,6 +34,9 @@ autonomy:
   model: null
   # 外置记忆插件名；null 表示使用 Hermes 当前的 memory.provider
   memory_provider: null
+  # 跨 profile 种子共享默认关闭：旧来源名单与文件未核验，暂停导出及 TEAM_RECALL 注入。
+  peer_share:
+    enabled: false
   # 是否在插件进程内跑常驻循环；false 表示由外部 timer/service 单次拉起
   in_process_loop: false
   # 运行数据目录：STOP_AUTONOMY / LAST_USER_ACTIVITY / PREEMPT_NOW 等标记都放这里

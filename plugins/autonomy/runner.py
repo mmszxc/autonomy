@@ -194,6 +194,7 @@ class Runner:
         event_log=None,
         budget_ledger=None,
         rotation_extra_keywords=None,
+        peer_share_enabled=False,
     ):
         self.db = db
         self.budget = budget
@@ -224,6 +225,7 @@ class Runner:
         self.phase1_enabled = self.journal_config is not None
         self.reflection_profile = reflection_profile
         self.reflection_profile_safe = bool(reflection_profile_safe)
+        self.peer_share_enabled = peer_share_enabled is True
         self.reflection_profile_reason = reflection_profile_reason
         self._last_reflection_usage = {}
         self.active_run_file = os.path.join(os.path.dirname(self.lock_path), "AUTONOMY_REMOTE_RUN")
@@ -452,6 +454,8 @@ class Runner:
         Degrades to an importance-only filter when the shareable column (P1-1)
         is absent, and never raises into the tick path.
         """
+        if not self.peer_share_enabled:
+            return {"exported": 0, "reason": "disabled"}
         if not self._learning_allowed():
             return {"exported": 0, "reason": "p0_observe_only"}
         path = self._seed_db_path()
@@ -497,6 +501,8 @@ class Runner:
 
     def _load_peer_shared_seeds(self):
         """Read the peer profile's shared top seeds (best 3 by importance)."""
+        if not self.peer_share_enabled:
+            return ""
         try:
             my_name = self._profile_name()
             shared_dir = str(self._SHARED_KNOWLEDGE_DIR)

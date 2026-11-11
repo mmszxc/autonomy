@@ -121,14 +121,16 @@ def test_config_example_yaml_key_order_and_chinese_comments():
     assert list(cfg.keys()) == [
         "model",
         "memory_provider",
+        "peer_share",
         "in_process_loop",
         "data_dir",
         "thought_log",
         "quiet_s",
         "limits",
     ]
+    assert cfg["peer_share"]["enabled"] is False
     assert list(cfg["limits"].keys()) == ["daily_tokens", "daily_calls", "daily_prompt_tokens", "circuit_threshold", "circuit_cooldown_s", "memory_max", "worker_timeout_s"]
-    for key in ("model", "memory_provider", "in_process_loop", "data_dir", "thought_log", "quiet_s", "limits"):
+    for key in ("model", "memory_provider", "peer_share", "in_process_loop", "data_dir", "thought_log", "quiet_s", "limits"):
         assert _comment_above(text, key), f"{key} 上方缺少中文注释"
     for key in ("daily_tokens", "daily_calls", "daily_prompt_tokens", "circuit_threshold", "circuit_cooldown_s", "memory_max", "worker_timeout_s"):
         assert _comment_above(text, key), f"limits.{key} 上方缺少中文注释"

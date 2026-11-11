@@ -180,6 +180,7 @@ def main(argv=None, *, hermes_home=None):
         event_log=event_log,
         budget_ledger=budget_ledger,
         rotation_extra_keywords=auto_cfg.get("rotation_extra_keywords", []),
+        peer_share_enabled=(auto_cfg.get("peer_share") or {}).get("enabled", False),
     )
 
     if a.resume_if_idle:
