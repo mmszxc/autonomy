@@ -92,7 +92,7 @@ def parse_thought_entries(path: str | Path, max_bytes: int = 4 * 1024 * 1024) ->
         match = _THOUGHT_HEADER.match(line.strip())
         if match:
             if current is not None:
-                current["body"] = "\\n".join(current.pop("_body", [])).strip()
+                current["body"] = "\n".join(current.pop("_body", [])).strip()
                 entries.append(current)
             current = match.groupdict()
             current["_body"] = []
@@ -102,7 +102,7 @@ def parse_thought_entries(path: str | Path, max_bytes: int = 4 * 1024 * 1024) ->
         if current is not None:
             current["_body"].append(line)
     if current is not None:
-        current["body"] = "\\n".join(current.pop("_body", [])).strip()
+        current["body"] = "\n".join(current.pop("_body", [])).strip()
         entries.append(current)
     return entries
 
@@ -203,7 +203,7 @@ def cmd_log(hermes_home: Optional[str | Path] = None, count: int = 3, full: bool
         body = entry.get("body", "")
         elapsed = re.search(r"elapsed[=:]([0-9.]+)", body)
         prefetch = re.search(r"count[=:]([0-9]+)", body)
-        reason = re.search(r"(?:结束原因|reason)[：:= ]+([^\\n]+)", body)
+        reason = re.search(r"(?:结束原因|reason)[：:= ]+([^\n]+)", body)
         seed_ids = re.findall(r"seed_id[=: ]+([A-Za-z0-9_.:-]+)", body)
         conclusion = next((body[pos:pos + 400] for marker in ("结论", "下一步", "未完成") if (pos := body.find(marker)) >= 0), body[-400:])
         entry.update({"local_time": _thought_local_time(entry.get("ts", "")), "elapsed": float(elapsed.group(1)) if elapsed else None, "prefetch_count": int(prefetch.group(1)) if prefetch else None, "end_reason": reason.group(1).strip() if reason else None, "result_summary": conclusion.strip(), "seed_ids": list(dict.fromkeys(seed_ids))})

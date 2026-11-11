@@ -160,7 +160,21 @@ class CliGateway:
             try:
                 if os.name == "nt": proc.terminate()
                 else: os.killpg(proc.pid, signal.SIGTERM)
-            except OSError: pass
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                if proc.poll() is None:
+                    try:
+                        if os.name == "nt": proc.kill()
+                        else: os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        return {"status": "stuck_run", "run_id": rid}
         return self.get_run(rid)
 
     def append_run_message(self, rid, content):

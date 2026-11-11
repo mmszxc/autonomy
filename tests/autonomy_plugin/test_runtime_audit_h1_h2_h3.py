@@ -40,7 +40,7 @@ def test_redactor_handles_common_credential_shapes():
     redacted = runner._redact_diagnostic(source)
     for secret in ('firstsecret', 'secondsecret', 'thirdsecret', 'fourthsecret', 'fifthsecret'):
         assert secret not in redacted
-    assert '<redacted>' in redacted
+    assert '[REDACTED]' in redacted
 
 
 def test_gateway_failed_event_and_partial_receipt_are_redacted(tmp_path, monkeypatch):
@@ -57,8 +57,8 @@ def test_gateway_failed_event_and_partial_receipt_are_redacted(tmp_path, monkeyp
     assert events(db, 'run_failed')
     assert secret not in str(events(db, 'run_failed'))
     assert secret not in (tmp_path / 'thoughts.log').read_text(encoding='utf-8')
-    assert '<redacted>' in str(events(db, 'run_failed'))
-    assert '<redacted>' in (tmp_path / 'thoughts.log').read_text(encoding='utf-8')
+    assert '[REDACTED]' in str(events(db, 'run_failed'))
+    assert '[REDACTED]' in (tmp_path / 'thoughts.log').read_text(encoding='utf-8')
 
 
 def test_exception_tick_event_and_partial_are_redacted(tmp_path):
@@ -71,7 +71,7 @@ def test_exception_tick_event_and_partial_are_redacted(tmp_path):
     assert result['status'] == 'failed'
     assert secret not in str(events(db, 'tick'))
     assert secret not in str(events(db, 'partial'))
-    assert '<redacted>' in str(events(db, 'tick'))
+    assert '[REDACTED]' in str(events(db, 'tick'))
 
 
 def test_busy_does_not_touch_existing_running_tick(tmp_path, monkeypatch):
@@ -115,10 +115,71 @@ def test_text_403_does_not_latch_auth_or_stop_next_tick(tmp_path, monkeypatch):
     monkeypatch.setattr(instance, '_extract_transcript', lambda *_: {})
     assert instance.tick()['status'] == 'failed'
     assert not (tmp_path / 'lock.auth_failed').exists()
-    assert events(db, 'auth_text_unverified')
+    assert events(db, 'run_failed')
+    assert not events(db, 'auth_suspect')
     instance.tick()
     assert gateway.calls == 2
     assert not (tmp_path / 'lock.auth_failed').exists()
+
+
+def test_stderr_auth_suspect_after_tool_progress_does_not_latch(tmp_path, monkeypatch):
+    class Gateway:
+        def start_run(self, *_): return {'run_id': 'remote-1'}
+        def get_run(self, *_):
+            return {'status': 'failed', 'stderr': '401 Unauthorized: invalid API key',
+                    'tool_calls': [{'name': 'search', 'args': {'q': 'x'}}]}
+    instance, db = make_runner(tmp_path, Gateway())
+    monkeypatch.setattr(instance, '_extract_transcript', lambda *_: {})
+    assert instance.tick()['status'] == 'failed'
+    assert events(db, 'auth_suspect')
+    assert not (tmp_path / 'lock.auth_failed').exists()
+    assert db.c.execute("SELECT value FROM kv WHERE key='auth_suspect_last_run'").fetchone() is None
+
+
+def test_cli_stderr_auth_requires_two_consecutive_zero_progress_ticks(tmp_path, monkeypatch):
+    class Gateway:
+        def __init__(self): self.calls = 0
+        def start_run(self, *_):
+            self.calls += 1
+            return {'run_id': 'remote-%d' % self.calls}
+        def get_run(self, *_):
+            return {'status': 'failed', 'stderr': '401 Unauthorized: invalid API key',
+                    'output': '', 'tool_calls': []}
+    gateway = Gateway()
+    instance, db = make_runner(tmp_path, gateway)
+    monkeypatch.setattr(instance, '_extract_transcript', lambda *_: {})
+    assert instance.tick()['status'] == 'failed'
+    assert events(db, 'auth_suspect')
+    assert not (tmp_path / 'lock.auth_failed').exists()
+    assert instance.tick()['status'] == 'failed'
+    assert (tmp_path / 'lock.auth_failed').read_text(encoding='utf-8') == 'stderr-confirmed'
+    assert instance.tick()['status'] == 'auth_failed'
+    assert gateway.calls == 2
+
+
+def test_model_output_auth_phrase_with_non_auth_stderr_is_not_auth(tmp_path, monkeypatch):
+    class Gateway:
+        def start_run(self, *_): return {'run_id': 'remote-1'}
+        def get_run(self, *_):
+            return {'status': 'failed', 'stderr': 'provider internal failure',
+                    'output': '403 Forbidden is an HTTP response code'}
+    instance, db = make_runner(tmp_path, Gateway())
+    monkeypatch.setattr(instance, '_extract_transcript', lambda *_: {})
+    assert instance.tick()['status'] == 'failed'
+    assert not (tmp_path / 'lock.auth_failed').exists()
+    assert not events(db, 'auth_suspect')
+
+
+def test_gateway_poll_failure_attempts_stop_before_exiting(tmp_path):
+    class Gateway:
+        def __init__(self): self.stopped = []
+        def start_run(self, *_): return {'run_id': 'remote-1'}
+        def get_run(self, *_): raise ConnectionError('gateway disconnected')
+        def stop_run(self, rid): self.stopped.append(rid)
+    gateway = Gateway()
+    instance, _ = make_runner(tmp_path, gateway)
+    assert instance.tick()['status'] == 'failed'
+    assert gateway.stopped == ['remote-1']
 
 
 def test_structured_gateway_401_latches_and_next_tick_short_circuits(tmp_path, monkeypatch):

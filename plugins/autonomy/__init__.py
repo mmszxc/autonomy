@@ -93,8 +93,9 @@ def _handle_slash_command(args_str: str = "", **kwargs: Any) -> str:
     return (
         f"状态: {res['state']} | 模式: {res['mode']} | "
         f"模型: {res['autonomy_model']} (主模型: {res['main_model']}) | "
-        f"预算: {res['budget']['tokens']}/{res['budget']['tokens_limit']} tokens | "
-        f"熔断: {res['circuit']['state']} ({res['circuit']['failures']}/{res['circuit']['threshold']})"
+        f"预算: {res['usage']['tokens']}/{res['usage']['tokens_limit']} tokens | "
+        f"熔断: {'open' if res['breaker']['open'] else 'closed'} "
+        f"({res['breaker']['failures']}/3)"
     )
 
 

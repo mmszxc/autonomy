@@ -4,13 +4,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def _redact_diagnostic(value):
-    """Remove common credential forms before persisting diagnostic material."""
-    text = str(value or "")
-    text = re.sub(r"(?i)\b(authorization\s*[:=]\s*bearer\s+)\S+", r"\1<redacted>", text)
-    text = re.sub(r"(?i)\b(bearer\s+)\S+", r"\1<redacted>", text)
-    text = re.sub(r"(?i)\b(api[_-]?key|access[_-]?token|token|secret|password)\b(\s*[=:]\s*|\s+)[\"']?[^\s,;\"']+", r"\1=<redacted>", text)
-    return text
+from .redaction import redact as _redact_diagnostic
 try:
     import fcntl
 except ImportError:
@@ -69,6 +63,7 @@ from .error_classifier import (
     should_circuit_count,
     E2_PROVIDER_EXHAUSTED,
     E_AUTH_FAILED,
+    E_UNCLASSIFIED,
     T2_LOOP_DETECTED,
     classify as classify_run,
 )
@@ -1128,7 +1123,7 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 str(self.hermes_home)[:400], str(sys.executable)[:400],
                 str(Path(__file__).resolve().parent)[:400], reason,
             )
-            self.db.append_event(run_id=run, kind="memory_prefetch", exit_reason="degraded", summary=diagnostic)
+            self.db.append_event(run_id=run, kind="memory_prefetch", exit_reason="degraded", summary=_redact_diagnostic(diagnostic))
             return "暂无可回顾的记忆。", []
         finally:
             # The plugin manager owns provider lifecycle. load_memory_provider_instance
@@ -1341,8 +1336,30 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             encoding="utf-8",
         )
 
+    def _auth_suspect(self, run):
+        """Require two consecutive, progress-free transport auth errors."""
+        if not self.db:
+            return False
+        previous = self.db.c.execute(
+            "SELECT value FROM kv WHERE key='auth_suspect_last_run'"
+        ).fetchone()
+        consecutive = previous is not None and previous[0] != run
+        self.db.c.execute(
+            "INSERT OR REPLACE INTO kv(key,value,updated_at) VALUES (?,?,?)",
+            ('auth_suspect_last_run', run, time.time()),
+        )
+        self.db.c.commit()
+        return consecutive
+
+    def _clear_auth_suspect(self):
+        if self.db:
+            self.db.c.execute("DELETE FROM kv WHERE key='auth_suspect_last_run'")
+            self.db.c.commit()
+
     def _finish_tick(self, status, summary=None):
         """Record this lock-owning tick's terminal state before returning."""
+        if status not in ('failed', 'auth_failed'):
+            self._clear_auth_suspect()
         if self.db:
             self.db.c.execute(
                 "update last_tick set status=?,finished_at=?,summary=? where id=1",
@@ -1567,38 +1584,55 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                         self._finish_tick("stuck_run")
                         return {"status": "stuck_run", "run_id": run, "remote_run_id": rid}
 
-                    state = self.gateway.get_run(rid)
+                    try:
+                        state = self.gateway.get_run(rid)
+                    except Exception:
+                        try:
+                            self.gateway.stop_run(rid)
+                        except Exception:
+                            logger.exception("failed to stop orphan gateway run %s", rid)
+                        raise
                     if state.get("status") in ("completed", "failed", "cancelled", "stopped"):
                         raw = state.get("output") or state.get("text") or state.get("content", "")
                         usage = self._account_terminal_call(run, receipt_goal_id, state)
                         budget_accounted = True
                         if state.get("status") == "failed":
-                            # Preserve CLI stderr/stdout before propagating the failure.
-                            diagnostic = (raw or state.get("stderr") or state.get("error") or "run failed")[-2000:]
-                            diagnostic = _redact_diagnostic(diagnostic)
+                            # Model output is untrusted narrative, never transport
+                            # evidence. Classify only stderr/error or HTTP status.
+                            diagnostic = _redact_diagnostic(
+                                (raw or state.get('stderr') or state.get('error') or 'run failed')[-2000:]
+                            )
+                            transport_text = _redact_diagnostic(
+                                str(state.get('stderr') or state.get('error') or '')[-2000:]
+                            )
                             elapsed = time.time() - started
-                            tools = state.get("tool_calls") or []
-                            self._record_partial(run, diagnostic, usage, elapsed, "failed", tools)
-                            # F1: structured HTTP status precedes text diagnostics.
+                            tools = state.get('tool_calls') or []
+                            self._record_partial(run, diagnostic, usage, elapsed, 'failed', tools)
                             _http_status = state.get('http_status')
                             if _http_status is None:
                                 _http_status = state.get('status_code')
                             if _http_status is not None:
                                 _error_kind, _, _flags = classify_run(
-                                    diagnostic, {'http_status': _http_status},
+                                    transport_text, {'http_status': _http_status},
                                 )
                             else:
-                                _error_kind, _flags = classify_error_text(diagnostic)
+                                _error_kind, _flags = classify_error_text(transport_text)
                             record_t3_hits(_flags, self.db)
                             # F5: prefer paired turns supplied by the gateway; the
                             # transcript fallback includes actual tool result previews.
                             _tool_calls = state.get('tool_calls') or []
                             _prior_calls = state.get('previous_tool_calls') or []
+                            _transcript = self._extract_transcript(started, time.time())
                             if not (_tool_calls and _prior_calls):
-                                _transcript = self._extract_transcript(started, time.time())
                                 _history = _transcript.get('tool_calls') or []
                                 if len(_history) >= 2:
                                     _prior_calls, _tool_calls = [_history[-2]], [_history[-1]]
+                            progress = bool(
+                                tools or _tool_calls or _prior_calls or
+                                _transcript.get('assistant_texts') or
+                                _transcript.get('tool_calls') or
+                                (raw and raw != state.get('stderr') and raw != state.get('error'))
+                            )
                             if _tool_calls and _prior_calls and _error_kind not in (E_AUTH_FAILED, E2_PROVIDER_EXHAUSTED):
                                 _loop_kind, _, _ = classify_run(
                                     diagnostic, {'status': 'completed'},
@@ -1624,6 +1658,8 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                             exc = RuntimeError(diagnostic)
                             exc._autonomy_error_kind = _error_kind  # F8: carry kind for circuit routing
                             exc._autonomy_http_status = _http_status
+                            exc._autonomy_transport_text = transport_text
+                            exc._autonomy_progress = progress
                             raise exc
                         break
                     time.sleep(self.poll_s)
@@ -1781,8 +1817,8 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 append_thought_log(
                     self.thought_log_path,
                     run_id=run,
-                    raw_text="【本轮预取记忆】count=%d chars=%d truncated=%s seed_ids=%s\n【遥测】elapsed=%.1f prompt=%s completion=%s total=%s\n【结束原因】ok%s\n%s" % (self._prefetch_meta["count"], self._prefetch_meta["chars"], self._prefetch_meta["truncated"], ",".join(memory_seed_ids) or "none", elapsed, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0), usage.get("total_tokens", 0), transcript_meta, transcript_text), 
-                    summary=summary,
+                    raw_text=_redact_diagnostic("【本轮预取记忆】count=%d chars=%d truncated=%s seed_ids=%s\n【遥测】elapsed=%.1f prompt=%s completion=%s total=%s\n【结束原因】ok%s\n%s" % (self._prefetch_meta["count"], self._prefetch_meta["chars"], self._prefetch_meta["truncated"], ",".join(memory_seed_ids) or "none", elapsed, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0), usage.get("total_tokens", 0), transcript_meta, transcript_text)),
+                    summary=_redact_diagnostic(summary),
                     mode=self.mode,
                     model=self.model_name,
                     usage=usage,
@@ -1805,6 +1841,9 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
             }
         except Exception as e:
             http_status = getattr(e, "status_code", None)
+            transport_text = getattr(e, '_autonomy_transport_text', None)
+            if transport_text is None:
+                transport_text = _redact_diagnostic(str(e)) if self.gateway else ''
             # F8: Circuit (threshold 3) counts unknown/code failures; provider,
             # budget and auth failures do not. GrayCircuit separately handles
             # consecutive gray-release failures (threshold 2).
@@ -1814,21 +1853,36 @@ print(json.dumps({"text":str(p.prefetch(query) or ""),"home":home,"executable":s
                 from .error_classifier import classify as _clf
                 _exc_error_kind, _, _ = _clf("", {"http_status": http_status})
             if _exc_error_kind is None:
-                _exc_error_kind, _flags = classify_error_text(str(e))
+                _exc_error_kind, _flags = classify_error_text(transport_text)
                 record_t3_hits(_flags, self.db)
+            auth_unconfirmed = False
             if _exc_error_kind == E_AUTH_FAILED:
                 verified_status = getattr(e, "_autonomy_http_status", http_status)
+                progress = getattr(e, '_autonomy_progress',
+                                   bool(self.gateway and http_status is None))
                 if verified_status in (401, 403):
+                    confirmed = True
+                    self._clear_auth_suspect()
+                elif transport_text and not progress:
+                    confirmed = self._auth_suspect(run)
+                else:
+                    confirmed = False
+                    self._clear_auth_suspect()
+                if confirmed:
                     # Operator changes credentials then explicitly removes this flag.
                     with open(self.lock_path + '.auth_failed', 'w', encoding='utf-8') as auth_flag:
-                        auth_flag.write(str(verified_status))
+                        auth_flag.write(str(verified_status or 'stderr-confirmed'))
                 else:
                     self.db.append_event(
-                        run_id=run, kind="auth_text_unverified",
+                        run_id=run, kind="auth_suspect",
                         exit_reason=E_AUTH_FAILED,
-                        summary="Auth error mentioned without verified HTTP 401/403; dispatch enabled",
+                        summary="Unconfirmed transport auth failure; progress=%s" % progress,
                     )
-            if should_circuit_count(_exc_error_kind):
+                    auth_unconfirmed = True
+                    _exc_error_kind = E_UNCLASSIFIED
+            else:
+                self._clear_auth_suspect()
+            if should_circuit_count(_exc_error_kind) and not auth_unconfirmed:
                 self.circuit.failure(http_status)
             reason = _redact_diagnostic(" ".join(str(e).split()))[:240]
             self.db.append_event(
