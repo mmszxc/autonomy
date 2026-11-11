@@ -746,9 +746,14 @@ def _json_list(value: Optional[str]) -> list:
     return json.loads(value) if value else []
 
 
-def _row_to_seed(row: sqlite3.Row) -> Seed:
-    from datetime import datetime
+def _parse_last_accessed(value: str) -> datetime:
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
 
+
+def _row_to_seed(row: sqlite3.Row) -> Seed:
     embedding = (
         np.frombuffer(row["embedding"], dtype=np.float32).copy()
         if row["embedding"] is not None
@@ -773,7 +778,7 @@ def _row_to_seed(row: sqlite3.Row) -> Seed:
         importance=row["importance"],
         embedding=embedding,
         access_count=row["access_count"],
-        last_accessed=datetime.fromisoformat(row["last_accessed"]) if row["last_accessed"] else None,
+        last_accessed=_parse_last_accessed(row["last_accessed"]) if row["last_accessed"] else None,
         shareable=int(row["shareable"] if row["shareable"] is not None else 1),
         decay_rate=row["decay_rate"] if row["decay_rate"] is not None else 0.05,
         provenance_ref=row["provenance_ref"] if "provenance_ref" in row.keys() else None,

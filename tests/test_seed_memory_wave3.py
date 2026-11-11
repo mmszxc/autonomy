@@ -36,6 +36,39 @@ def make_seed(identifier, *, ref=None, status="active", importance=0.6):
     )
 
 
+@pytest.fixture
+def mixed_last_accessed_db(seed_db):
+    iso_value = "2026-11-10T09:30:00+00:00"
+    epoch_value = 1794388936.3138785
+    iso_seed = make_seed("iso-seed")
+    epoch_seed = make_seed("epoch-seed")
+    epoch_seed.summary = "A distinct historical seed"
+    store.save_seeds([iso_seed, epoch_seed])
+    with sqlite3.connect(seed_db) as conn:
+        conn.execute(
+            "UPDATE seeds SET last_accessed = ? WHERE id = ?",
+            (iso_value, "iso-seed"),
+        )
+        conn.execute(
+            "UPDATE seeds SET last_accessed = ? WHERE id = ?",
+            (str(epoch_value), "epoch-seed"),
+        )
+    return iso_value, epoch_value
+
+
+def test_row_to_seed_accepts_mixed_last_accessed_formats(mixed_last_accessed_db):
+    iso_value, epoch_value = mixed_last_accessed_db
+
+    seeds = {seed.id: seed for seed in store.get_all_seeds()}
+
+    assert isinstance(seeds["iso-seed"], Seed)
+    assert seeds["iso-seed"].last_accessed == datetime.fromisoformat(iso_value)
+    assert isinstance(seeds["epoch-seed"], Seed)
+    assert seeds["epoch-seed"].last_accessed == datetime.fromtimestamp(
+        epoch_value, tz=timezone.utc
+    )
+
+
 def test_drain_accepts_both_session_and_timestamp_transcripts(tmp_path, monkeypatch):
     from types import ModuleType
 
