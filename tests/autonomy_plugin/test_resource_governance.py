@@ -1,7 +1,10 @@
 import os
 import json
+import os
 import signal
 from pathlib import Path
+
+import pytest
 
 import sys
 
@@ -57,26 +60,67 @@ def test_prefetch_process_group_is_platform_supported():
         assert signal.SIGKILL
 
 
-def test_completed_autonomy_turn_enqueues_standard_ended_session(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("fallback_raises", "expected_worker"),
+    [(False, "submit_failed_fallback_ok"), (True, "launch_failed")],
+)
+def test_completed_autonomy_turn_enqueues_standard_ended_session(
+    tmp_path, monkeypatch, fallback_raises, expected_worker
+):
     home = tmp_path / "profile"
     worker = home / "plugins" / "seed_memory" / "worker.py"
     worker.parent.mkdir(parents=True); worker.write_text("# worker", encoding="utf-8")
     r = _runner(); r.hermes_home = str(home)
     calls = []
+
+    class PosixOS:
+        name = "posix"
+
+        def __getattr__(self, name):
+            return getattr(os, name)
+
     class FakeProcess:
         pid = 123
-        def wait(self, timeout=None): return 0
+
+        def __init__(self, command):
+            self.args = command
+            self.returncode = 1 if command[0] == "systemd-run" else None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def communicate(self, input=None, timeout=None):
+            return "", ""
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            if fallback_raises:
+                raise TypeError("foreground Popen substitute failed")
+            self.returncode = 0
+            return self.returncode
+
     def fake_popen(*a, **kw):
-        calls.append((a, kw)); return FakeProcess()
+        calls.append((a, kw))
+        return FakeProcess(a[0])
+
+    monkeypatch.setattr(runner_module, "os", PosixOS())
     monkeypatch.setattr(runner_module.subprocess, "Popen", fake_popen)
     result = r._enqueue_completed_turn("run1", {"title": "visible"}, "assistant output")
     queued = home / "seed_data" / "seed_queue" / "session_autonomy_run1.json"
     assert result["queued"] is True and queued.is_file()
+    assert result["worker"] == expected_worker
     payload = json.loads(queued.read_text(encoding="utf-8"))
     assert payload["status"] == "ended"
     assert payload["messages"][0]["role"] == "user"
     assert payload["messages"][1] == {"role": "assistant", "content": "assistant output"}
-    assert calls and calls[0][0][0][-1] == "--once"
+    commands = [call[0][0] for call in calls]
+    assert commands[0][0] == "systemd-run"
+    assert commands[1][-1] == "--once"
 
 
 def test_memory_max_compatibility_hook_does_not_apply_rlimit_as(monkeypatch):

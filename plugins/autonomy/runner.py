@@ -808,6 +808,7 @@ class Runner:
         worker = Path(self.hermes_home) / "plugins" / "seed_memory" / "worker.py"
         if not worker.is_file():
             return {"queued": False, "reason": "worker_missing"}
+        target = queue_dir / ("session_autonomy_" + run_id + ".json")
         try:
             queue_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
             user_visible = summary.get("raw_text") if isinstance(summary, dict) else ""
@@ -823,7 +824,6 @@ class Runner:
                     {"role": "assistant", "content": _slice_head_tail(str(assistant_text or ""), 3000, 11000)},
                 ],
             }
-            target = queue_dir / ("session_autonomy_" + run_id + ".json")
             tmp = target.with_name(target.name + ".%d.tmp" % os.getpid())
             tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
             os.chmod(tmp, 0o600); os.replace(tmp, target); os.chmod(target, 0o600)
@@ -852,7 +852,7 @@ class Runner:
                     except FileNotFoundError:
                         submit_failed = True
                         logger.warning("systemd-run submit_failed=unavailable; falling back to foreground seed worker")
-                    except (OSError, subprocess.TimeoutExpired) as exc:
+                    except Exception as exc:
                         submit_failed = True
                         logger.warning("systemd-run submit_failed=%s; falling back to foreground seed worker", type(exc).__name__)
                     else:
@@ -879,6 +879,17 @@ class Runner:
             worker_state = "submit_failed_fallback_ok" if submit_failed and returncode == 0 else ("ok" if returncode == 0 else "exit_%s" % returncode)
             return {"queued": True, "path": str(target), "worker": worker_state, "submit_failed": submit_failed, "elapsed_s": round(time.monotonic() - started, 3)}
         except Exception as exc:
+            if os.path.exists(target):
+                logger.warning(
+                    "seed queue persisted despite worker launch failure type=%s path=%s",
+                    type(exc).__name__, target,
+                )
+                return {
+                    "queued": True,
+                    "path": str(target),
+                    "worker": "launch_failed",
+                    "reason": type(exc).__name__,
+                }
             return {"queued": False, "reason": type(exc).__name__}
 
     def _bound_prefetch_text(self, text):
