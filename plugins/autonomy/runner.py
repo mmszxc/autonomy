@@ -1,16 +1,7 @@
 import os, uuid, json, hashlib, threading, time, signal, re, subprocess, sys, statistics
 from datetime import datetime, timezone
 import logging
-import shutil
 logger = logging.getLogger(__name__)
-
-
-def _worker_python_executable():
-    """Use the OS Python for seed workers, not Hermes' embedded runtime."""
-    system_python = Path('/usr/bin/python3')
-    if system_python.is_file():
-        return str(system_python)
-    return shutil.which('python3') or sys.executable
 
 
 from .redaction import redact as _redact_diagnostic
@@ -855,7 +846,7 @@ class Runner:
                     # A RuntimeMaxSec cleanup and a second tick can share one
                     # second; use a microsecond stamp plus random suffix instead.
                     unit = "hermes-seed-worker-%s-%d-%s" % (profile, time.time_ns() // 1000, uuid.uuid4().hex[:8])
-                    command = ["systemd-run", "--user", "--collect", "--quiet", "--unit", unit, "--property=RuntimeMaxSec=900s", "--property=StandardOutput=append:%s" % worker_log, "--property=StandardError=append:%s" % worker_log, "--setenv=HERMES_HOME=%s" % self.hermes_home, "--setenv=PYTHONWARNINGS=ignore::UserWarning:multiprocessing.resource_tracker", "--working-directory=%s" % worker.parent.parent, _worker_python_executable(), str(worker), "--once"]
+                    command = ["systemd-run", "--user", "--collect", "--quiet", "--unit", unit, "--property=RuntimeMaxSec=900s", "--property=StandardOutput=append:%s" % worker_log, "--property=StandardError=append:%s" % worker_log, "--setenv=HERMES_HOME=%s" % self.hermes_home, "--setenv=PYTHONWARNINGS=ignore::UserWarning:multiprocessing.resource_tracker", "--working-directory=%s" % worker.parent.parent, sys.executable, str(worker), "--once"]
                     try:
                         result = subprocess.run(command, capture_output=True, text=True, timeout=10)
                     except FileNotFoundError:
@@ -873,7 +864,7 @@ class Runner:
             log_handle = open(worker_log, "ab", buffering=0)
             kwargs = {"cwd": str(worker.parent.parent), "env": env, "stdin": subprocess.DEVNULL, "stdout": log_handle, "stderr": log_handle}
             if os.name != "nt": kwargs["start_new_session"] = True
-            proc = subprocess.Popen([_worker_python_executable(), str(worker), "--once"], **kwargs)
+            proc = subprocess.Popen([sys.executable, str(worker), "--once"], **kwargs)
             try:
                 returncode = proc.wait(timeout=getattr(self, "worker_timeout_s", 360))
             except subprocess.TimeoutExpired:

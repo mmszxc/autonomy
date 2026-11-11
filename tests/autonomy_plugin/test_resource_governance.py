@@ -69,7 +69,6 @@ def test_completed_autonomy_turn_enqueues_standard_ended_session(tmp_path, monke
     def fake_popen(*a, **kw):
         calls.append((a, kw)); return FakeProcess()
     monkeypatch.setattr(runner_module.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(runner_module, "_worker_python_executable", lambda: "/usr/bin/python3")
     result = r._enqueue_completed_turn("run1", {"title": "visible"}, "assistant output")
     queued = home / "seed_data" / "seed_queue" / "session_autonomy_run1.json"
     assert result["queued"] is True and queued.is_file()
@@ -78,7 +77,6 @@ def test_completed_autonomy_turn_enqueues_standard_ended_session(tmp_path, monke
     assert payload["messages"][0]["role"] == "user"
     assert payload["messages"][1] == {"role": "assistant", "content": "assistant output"}
     assert calls and calls[0][0][0][-1] == "--once"
-    assert calls[0][0][0][0] == "/usr/bin/python3"
 
 
 def test_memory_max_compatibility_hook_does_not_apply_rlimit_as(monkeypatch):
