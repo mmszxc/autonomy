@@ -6,11 +6,23 @@ import os
 from pathlib import Path
 import sqlite3
 import sys
+import types
 from types import SimpleNamespace
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins" / "seed_memory" / "seed_src"))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(ROOT / "plugins"))
+sys.path.append(str(ROOT / "plugins" / "seed_memory" / "seed_src"))
+if "agent.memory_provider" not in sys.modules:
+    agent_module = types.ModuleType("agent")
+    memory_provider_module = types.ModuleType("agent.memory_provider")
+    memory_provider_module.MemoryProvider = type("MemoryProvider", (), {})
+    memory_provider_module.RecallStatus = type("RecallStatus", (), {})
+    agent_module.memory_provider = memory_provider_module
+    sys.modules.setdefault("agent", agent_module)
+    sys.modules["agent.memory_provider"] = memory_provider_module
+
 from hermes.memory import retrieval, store
 from hermes.memory.schema import Emotion, Seed, SeedAccessLog
 
@@ -265,7 +277,23 @@ def test_touch_unsigned_fallback_persists_and_warns(seed_db, monkeypatch, caplog
     assert module == "hermes.memory.signed_write"
 
 
-def test_prefetch_preserves_production_access_tracking(seed_db, monkeypatch):
+def test_retrieval_fallback_preserves_access_context(seed_db):
+    store.save_seeds([make_seed("fallback-context")])
+
+    results = retrieval.retrieve(
+        "", top_k=1, writer="caller:writer", session_id="session:fallback",
+        reason="caller-reason",
+    )
+
+    assert [seed.id for seed in results] == ["fallback-context"]
+    with sqlite3.connect(seed_db) as conn:
+        audit = conn.execute(
+            "SELECT writer, session_id, reason FROM seed_access_log"
+        ).fetchone()
+    assert audit == ("caller:writer", "session:fallback", "caller-reason")
+
+
+def test_prefetch_records_audit_without_mutating_seed_access(seed_db, monkeypatch):
     from seed_memory import SeedMemoryProvider
 
     seed = make_seed("prefetch", ref="event:1")
@@ -282,13 +310,14 @@ def test_prefetch_preserves_production_access_tracking(seed_db, monkeypatch):
         count, last_real_access = conn.execute(
             "SELECT access_count, last_real_access FROM seeds WHERE id=?", (seed.id,)
         ).fetchone()
-        writer, session = conn.execute(
-            "SELECT writer, session_id FROM seed_access_log"
-        ).fetchone()
-    assert count >= 1
-    assert last_real_access is not None
-    assert writer == "hermes:seed_memory:prefetch"
-    assert session == "session:prefetch"
+        access_logs = conn.execute(
+            "SELECT writer, session_id, reason FROM seed_access_log"
+        ).fetchall()
+    assert count == 0
+    assert last_real_access is None
+    assert access_logs == [
+        ("hermes:seed_memory:prefetch", "session:prefetch", "prefetch")
+    ]
 
 
 def test_production_hash_dedup_ignores_ref_and_never_updates(seed_db):

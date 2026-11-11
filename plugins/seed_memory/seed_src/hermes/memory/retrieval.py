@@ -128,7 +128,7 @@ def _connect_ro() -> sqlite3.Connection:
     # has itself been imported.
     from .store import DB_PATH
 
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro&immutable=1", uri=True)
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -245,18 +245,25 @@ def retrieve_program_evidence(
             conn.close()
 
 
-def _fallback(limit: int, *, record_access: bool = True) -> List[Seed]:
+def _fallback(
+    limit: int,
+    *,
+    record_access: bool = True,
+    writer: str = "",
+    session_id: str = "",
+    reason: str = "fallback",
+) -> List[Seed]:
     seeds = get_ranked_seeds(limit)
     if record_access:
         provenance = json.dumps({
             "chain": [{"layer": "retrieve", "stage": "fallback",
-                       "writer": "hermes:retrieval:fallback"}],
+                       "writer": writer or "hermes:retrieval:fallback"}],
             "trigger": "fallback",
         }, ensure_ascii=False)
         for seed in seeds:
             touch_seed(
-                seed.id, writer="hermes:retrieval:fallback",
-                reason="fallback", provenance=provenance,
+                seed.id, writer=writer or "hermes:retrieval:fallback",
+                session_id=session_id, reason=reason, provenance=provenance,
             )
     return seeds
 
@@ -351,7 +358,14 @@ def retrieve(
 
     used_fallback = not emb_ranked and not fts_ranked
     if used_fallback:
-        return _rerank_with_ext_hook(_fallback(top_k, record_access=record_access), query)
+        fallback = _fallback(
+            top_k,
+            record_access=record_access,
+            writer=writer,
+            session_id=session_id,
+            reason=reason,
+        )
+        return _rerank_with_ext_hook(fallback, query)
     else:
         scores: Dict[str, float] = {}
         candidates: Dict[str, Seed] = {}

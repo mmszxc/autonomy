@@ -618,21 +618,24 @@ def touch_seed(
     """
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
-    with _connect() as conn:
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(seeds)")}
-        sets = ["access_count=access_count+1"]
-        params = []
-        if "last_accessed" in columns:
-            sets.append("last_accessed=?")
-            params.append(now_iso)
-        if "last_real_access" in columns:
-            sets.append("last_real_access=?")
-            params.append(now_iso)
-        params.append(seed_id)
-        conn.execute(
-            f"UPDATE seeds SET {', '.join(sets)} WHERE id=?",
-            tuple(params),
-        )
+    if reason == "prefetch":
+        writer = "hermes:seed_memory:prefetch"
+    else:
+        with _connect() as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(seeds)")}
+            sets = ["access_count=access_count+1"]
+            params = []
+            if "last_accessed" in columns:
+                sets.append("last_accessed=?")
+                params.append(now_iso)
+            if "last_real_access" in columns:
+                sets.append("last_real_access=?")
+                params.append(now_iso)
+            params.append(seed_id)
+            conn.execute(
+                f"UPDATE seeds SET {', '.join(sets)} WHERE id=?",
+                tuple(params),
+            )
 
     # Production profiles retain their Merkle-signed writer. Source checkouts
     # without that optional module still persist an unsigned audit record.
